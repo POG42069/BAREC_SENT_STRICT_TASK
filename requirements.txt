@@ -1,0 +1,10 @@
+torch
+transformers
+camel-tools
+scikit-learn
+pandas
+numpy
+tqdm
+sentencepiece
+protobuf
+accelerate

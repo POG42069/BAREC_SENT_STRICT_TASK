@@ -1,0 +1,10 @@
+{
+  "dataset_id": "CAMeL-Lab/BAREC-Shared-Task-2026-sent",
+  "splits": {
+    "train": "train.csv",
+    "validation": "dev.csv",
+    "test": "test.csv"
+  },
+  "stored_dataset": "raw Hugging Face CSV without D3Tok",
+  "d3tok_runtime": "train.py builds D3Tok in memory with camel_tools MLEDisambiguator calima-msa-r13 + MorphologicalTokenizer d3tok split=True"
+}
