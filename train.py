@@ -25,7 +25,7 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 class Configuration:
     BATCH_SIZE: int = 16
     LEARNING_RATE: float = 2e-5
-    EPOCHS: int = 3
+    EPOCHS: int = 5
     OPTIMIZER: str = "AdamW"
     EARLY_STOPPING_PATIENCE: int = 2
     MAX_LENGTH: int = 256
@@ -43,8 +43,10 @@ class Configuration:
     BASE_MODELS: Tuple[str, ...] = (
         "aubmindlab/bert-base-arabertv2",
         "aubmindlab/araelectra-base-discriminator",
+        "UBC-NLP/MARBERT",
+        "CAMeL-Lab/bert-base-arabic-camelbert-msa",
     )
-    LOSS_FUNCTIONS: Tuple[str, ...] = ("CE", "MSE")
+    LOSS_FUNCTIONS: Tuple[str, ...] = ("CE", "MSE", "COR")
     NUM_LABELS: int = 19
     SEED: int = 42
     USE_D3TOK: bool = True
