@@ -294,7 +294,7 @@ def logits_to_predictions(loss_type: str, logits: torch.Tensor, cfg: Configurati
 # =============================================================================
 
 
-def evaluate(model: ReadabilityModel, dataloader: DataLoader, loss_type: str, cfg: Configuration) -> Dict[str, float]:
+def evaluate(model: nn.Module, dataloader: DataLoader, loss_type: str, cfg: Configuration) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_rows = 0
@@ -322,7 +322,7 @@ def evaluate(model: ReadabilityModel, dataloader: DataLoader, loss_type: str, cf
     }
 
 
-def predict(model: ReadabilityModel, dataloader: DataLoader, loss_type: str, cfg: Configuration) -> pd.DataFrame:
+def predict(model: nn.Module, dataloader: DataLoader, loss_type: str, cfg: Configuration) -> pd.DataFrame:
     model.eval()
     rows = []
     with torch.no_grad():
@@ -343,13 +343,14 @@ def predict(model: ReadabilityModel, dataloader: DataLoader, loss_type: str, cfg
     return pd.DataFrame(rows)
 
 
-def save_checkpoint(model: ReadabilityModel, tokenizer, checkpoint_dir: Path, metadata: Dict[str, str]) -> None:
+def save_checkpoint(model: nn.Module, tokenizer, checkpoint_dir: Path, metadata: Dict[str, str]) -> None:
     ensure_dir(checkpoint_dir)
-    torch.save({"state_dict": model.state_dict(), "metadata": metadata}, checkpoint_dir / "model.pt")
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    torch.save({"state_dict": base_model.state_dict(), "metadata": metadata}, checkpoint_dir / "model.pt")
     tokenizer.save_pretrained(checkpoint_dir / "tokenizer")
 
 
-def load_checkpoint(model: ReadabilityModel, checkpoint_dir: Path, device: str) -> bool:
+def load_checkpoint(model: nn.Module, checkpoint_dir: Path, device: str) -> bool:
     checkpoint_path = checkpoint_dir / "model.pt"
     if not checkpoint_path.exists():
         return False
@@ -389,7 +390,13 @@ def train_one_model(
 
     model = ReadabilityModel(model_name, loss_type, cfg.NUM_LABELS, class_weights).to(cfg.DEVICE)
 
-    if not load_checkpoint(model, checkpoint_dir, cfg.DEVICE):
+    is_loaded = load_checkpoint(model, checkpoint_dir, cfg.DEVICE)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training!")
+        model = nn.DataParallel(model)
+
+    if not is_loaded:
         if cfg.OPTIMIZER != "AdamW":
             raise ValueError("This implementation supports OPTIMIZER='AdamW'.")
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE)
@@ -411,6 +418,8 @@ def train_one_model(
                 optimizer.zero_grad(set_to_none=True)
                 outputs = model(**inputs)
                 loss = outputs["loss"]
+                if isinstance(model, nn.DataParallel):
+                    loss = loss.mean()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -430,7 +439,8 @@ def train_one_model(
             if metrics["loss"] < best_dev_loss:
                 best_dev_loss = metrics["loss"]
                 patience = 0
-                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                base_model = model.module if isinstance(model, nn.DataParallel) else model
+                best_state = {key: value.detach().cpu().clone() for key, value in base_model.state_dict().items()}
             else:
                 patience += 1
                 if patience >= cfg.EARLY_STOPPING_PATIENCE:
@@ -438,7 +448,8 @@ def train_one_model(
                     break
 
         if best_state is not None:
-            model.load_state_dict(best_state)
+            base_model = model.module if isinstance(model, nn.DataParallel) else model
+            base_model.load_state_dict(best_state)
         save_checkpoint(model, tokenizer, checkpoint_dir, {"model_name": model_name, "loss_type": loss_type})
     else:
         print(f"Loaded checkpoint: {checkpoint_dir}")
