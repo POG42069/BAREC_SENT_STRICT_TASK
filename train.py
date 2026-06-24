@@ -43,10 +43,8 @@ class Configuration:
     BASE_MODELS: Tuple[str, ...] = (
         "aubmindlab/bert-base-arabertv2",
         "aubmindlab/araelectra-base-discriminator",
-        "UBC-NLP/MARBERT",
-        "CAMeL-Lab/bert-base-arabic-camelbert-msa",
     )
-    LOSS_FUNCTIONS: Tuple[str, ...] = ("CE", "MSE", "COR")
+    LOSS_FUNCTIONS: Tuple[str, ...] = ("CE", "MSE")
     NUM_LABELS: int = 19
     SEED: int = 42
     USE_D3TOK: bool = True
