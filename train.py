@@ -496,7 +496,7 @@ class Ensembler:
 
         sentence_rows = []
         for sentence_id, group in all_predictions.groupby("ID", sort=False):
-            sentence_rows.append({"id": sentence_id, "label": self._combine_sentence_group(group)})
+            sentence_rows.append({"Sentence ID": sentence_id, "label": self._combine_sentence_group(group)})
         sentence_predictions = pd.DataFrame(sentence_rows)
         sentence_predictions["label"] = sentence_predictions["label"].astype(int).clip(1, self.num_labels)
         return sentence_predictions
@@ -507,7 +507,7 @@ def write_submission(predictions: pd.DataFrame, output_dir: str) -> Path:
     submission_path = output_path / "prediction"
     zip_path = Path("prediction.zip")
 
-    predictions[["id", "label"]].to_csv(submission_path, sep="\t", index=False)
+    predictions[["Sentence ID", "label"]].to_csv(submission_path, sep="\t", index=False)
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
