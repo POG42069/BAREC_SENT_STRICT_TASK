@@ -25,7 +25,7 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 class Configuration:
     BATCH_SIZE: int = 16
     LEARNING_RATE: float = 2e-5
-    EPOCHS: int = 5
+    EPOCHS: int = 4
     OPTIMIZER: str = "AdamW"
     EARLY_STOPPING_PATIENCE: int = 2
     MAX_LENGTH: int = 256
