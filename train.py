@@ -507,7 +507,7 @@ def write_submission(predictions: pd.DataFrame, output_dir: str) -> Path:
     submission_path = output_path / "prediction"
     zip_path = Path("prediction.zip")
 
-    predictions[["Sentence ID", "label"]].to_csv(submission_path, sep="\t", index=False)
+    predictions[["Sentence ID", "label"]].to_csv(submission_path, index=False)
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
