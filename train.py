@@ -28,7 +28,7 @@ class Configuration:
     EPOCHS: int = 3
     OPTIMIZER: str = "AdamW"
     EARLY_STOPPING_PATIENCE: int = 2
-    MAX_LENGTH: int = 512
+    MAX_LENGTH: int = 256
     DATA_PATHS: Dict[str, str] = field(
         default_factory=lambda: {
             "train": "data/barec-corpus-v1/train.csv",
@@ -49,7 +49,7 @@ class Configuration:
     SEED: int = 42
     USE_D3TOK: bool = True
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    NUM_WORKERS: int = 0
+    NUM_WORKERS: int = 2
     WARMUP_RATIO: float = 0.1
     STATIC_MSE_CONFIDENCE: float = 1.0
 
@@ -398,6 +398,7 @@ def train_one_model(
         if cfg.OPTIMIZER != "AdamW":
             raise ValueError("This implementation supports OPTIMIZER='AdamW'.")
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE)
+        scaler = torch.cuda.amp.GradScaler()
         total_steps = len(train_loader) * cfg.EPOCHS
         warmup_steps = int(total_steps * cfg.WARMUP_RATIO)
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
@@ -414,13 +415,18 @@ def train_one_model(
             for batch in progress:
                 inputs = batch_to_device(batch, cfg.DEVICE)
                 optimizer.zero_grad(set_to_none=True)
-                outputs = model(**inputs)
-                loss = outputs["loss"]
-                if isinstance(model, nn.DataParallel):
-                    loss = loss.mean()
-                loss.backward()
+                
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = model(**inputs)
+                    loss = outputs["loss"]
+                    if isinstance(model, nn.DataParallel):
+                        loss = loss.mean()
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
 
                 batch_size = inputs["input_ids"].size(0)
