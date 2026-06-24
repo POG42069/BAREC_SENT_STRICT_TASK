@@ -116,6 +116,7 @@ def clean_text(text: str) -> str:
 
 
 def build_d3_tokenizer():
+    #  khởi tạo và thiết lập công cụ tách từ tiếng Ả Rập
     try:
         from camel_tools.disambig.mle import MLEDisambiguator
         from camel_tools.tokenizers.morphological import MorphologicalTokenizer
