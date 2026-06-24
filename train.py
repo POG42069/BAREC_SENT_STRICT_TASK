@@ -527,7 +527,11 @@ def main() -> None:
     print(f"Class weights: {class_weights.detach().cpu().numpy().round(4).tolist()}")
 
     model_predictions: List[pd.DataFrame] = []
-    for model_name, loss_type in CFG.MODEL_LOSS_COMBINATIONS:
+    combinations = CFG.MODEL_LOSS_COMBINATIONS
+    print(f"\n==============================================")
+    print(f"Bắt đầu huấn luyện {len(combinations)} tổ hợp mô hình...")
+    print(f"==============================================\n")
+    for model_name, loss_type in combinations:
         preds = train_one_model(model_name, loss_type, train_df, dev_df, test_df, class_weights, CFG)
         model_predictions.append(preds)
 
