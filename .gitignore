@@ -1,12 +1,26 @@
 __pycache__/
-*.py[cod]
-.pytest_cache/
+*.pyc
+.ipynb_checkpoints/
+
+.env
 .venv/
 venv/
-env/
 
 outputs/
-prediction.zip
+submission/
+checkpoints/
+wandb/
+runs/
+
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+*.csv
+*.tsv
+*.parquet
+*.zip
 
 .DS_Store
-Thumbs.db

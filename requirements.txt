@@ -1,10 +1,13 @@
 torch
 transformers
-camel-tools
+tokenizers
+accelerate
+datasets
 scikit-learn
 pandas
 numpy
 tqdm
 sentencepiece
 protobuf
-accelerate
+safetensors
+camel-tools
