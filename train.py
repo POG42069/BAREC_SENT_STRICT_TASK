@@ -305,6 +305,8 @@ def evaluate(model: nn.Module, dataloader: DataLoader, loss_type: str, cfg: Conf
             inputs = batch_to_device(batch, cfg.DEVICE)
             outputs = model(**inputs)
             loss = outputs["loss"]
+            if isinstance(model, nn.DataParallel):
+                loss = loss.mean()
             batch_size = len(labels)
             total_loss += float(loss.detach().cpu()) * batch_size
             total_rows += batch_size
