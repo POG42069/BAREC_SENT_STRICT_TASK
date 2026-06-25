@@ -99,9 +99,11 @@ VALID_LOSSES = {"ce", "mse", "cor"}
 
 ENSEMBLE_COMBOS = [
     ("arabertv2", "ce"),
-    ("araelectra", "ce"),
-    ("marbert", "cor"),
+    ("arabertv2", "cor"),
+    ("araelectra", "mse"),
+    ("camelbert", "ce"),
     ("camelbert", "mse"),
+    ("marbert", "cor"),
 ]
 
 
