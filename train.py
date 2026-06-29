@@ -709,8 +709,9 @@ def train_one_combo(
     combo_name = f"{model_key}_{loss_type}"
     checkpoint_dir = Path(OUTPUT_DIR) / "checkpoints" / combo_name
     prediction_dir = ensure_dir(Path(OUTPUT_DIR) / "predictions")
+    resume_path = checkpoint_dir / "resume_state.pt"
 
-    if checkpoint_dir.exists() and (checkpoint_dir / "model_state.pt").exists() and not RETRAIN_IF_EXISTS:
+    if checkpoint_dir.exists() and (checkpoint_dir / "model_state.pt").exists() and not RETRAIN_IF_EXISTS and not resume_path.exists():
         log(f"[{combo_name}] Existing checkpoint found; skipping training.", rank)
         model, tokenizer = load_model_checkpoint(checkpoint_dir, model_key, loss_type, class_weights, device)
     else:
@@ -735,7 +736,6 @@ def train_one_combo(
         best_qwk = -1.0
         bad_epochs = 0
         start_epoch = 0
-        resume_path = checkpoint_dir / "resume_state.pt"
         if resume_path.exists():
             log(f"[{combo_name}] Resuming training from {resume_path}", rank)
             checkpoint = torch.load(resume_path, map_location=device)
@@ -816,6 +816,8 @@ def train_one_combo(
                 break
 
         distributed_barrier(world_size)
+        if is_rank_zero(rank) and resume_path.exists():
+            resume_path.unlink()
         model_for_load = model.module if isinstance(model, DDP) else model
         state_path = checkpoint_dir / "model_state.pt"
         if state_path.exists():
