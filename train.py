@@ -473,9 +473,11 @@ class ReadabilityModel(nn.Module):
         self.loss_type = loss_type
         self.encoder = AutoModel.from_pretrained(checkpoint_name)
         hidden_size = self.encoder.config.hidden_size
-        output_size = NUM_LABELS if loss_type == "ce" else 1 if loss_type == "mse" else NUM_LABELS - 1
+        output_size = NUM_LABELS if loss_type == "ce" else 1
         self.dropout = nn.Dropout(getattr(self.encoder.config, "hidden_dropout_prob", 0.1))
-        self.head = nn.Linear(hidden_size, output_size)
+        self.head = nn.Linear(hidden_size, output_size, bias=(loss_type != "cor"))
+        if loss_type == "cor":
+            self.coral_bias = nn.Parameter(torch.zeros(NUM_LABELS - 1))
         self.register_buffer(
             "class_weights",
             class_weights.clone().detach().float() if class_weights is not None else torch.ones(NUM_LABELS),
@@ -500,7 +502,10 @@ class ReadabilityModel(nn.Module):
             model_inputs["token_type_ids"] = token_type_ids
         outputs = self.encoder(**model_inputs)
         pooled = self.dropout(self.pool(outputs))
-        logits = self.head(pooled)
+        if self.loss_type == "cor":
+            logits = self.head(pooled) + self.coral_bias
+        else:
+            logits = self.head(pooled)
         result = {"logits": logits}
         if labels is None:
             return result
