@@ -109,6 +109,14 @@ def clean_text(text: str) -> str:
     text = text.replace("ؤ", "و").replace("ئ", "ي")
     text = text.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
     text = text.replace("–", "-").replace("—", "-")
+    
+    # 5 Advanced Arabert NLP techniques
+    text = text.translate(str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')) # 1. Number normalization
+    text = re.sub(r'https?://\S+|www\.\S+', '[URL]', text)           # 2. URLs
+    text = re.sub(r'@[A-Za-z0-9_]+', '[USER]', text)                 # 3. Mentions
+    text = re.sub(r'([ا-ي])\1{2,}', r'\1\1', text)                    # 4. Character repetitions
+    text = re.sub(r'(\S)(/)(\S)', r'\1 \2 \3', text)                 # 5. Slash spacing
+    
     text = REDUNDANT_PUNCT_RE.sub(r"\1", text)
     text = re.sub(r"([؟?!.,،؛:])", r" \1 ", text)
     text = EXTRA_SPACES_RE.sub(" ", text)
