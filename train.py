@@ -734,7 +734,21 @@ def train_one_combo(
 
         best_qwk = -1.0
         bad_epochs = 0
-        for epoch in range(EPOCHS):
+        start_epoch = 0
+        resume_path = checkpoint_dir / "resume_state.pt"
+        if resume_path.exists():
+            log(f"[{combo_name}] Resuming training from {resume_path}", rank)
+            checkpoint = torch.load(resume_path, map_location=device)
+            model_to_load = model.module if isinstance(model, DDP) else model
+            model_to_load.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            start_epoch = checkpoint["epoch"] + 1
+            best_qwk = checkpoint["best_qwk"]
+            bad_epochs = checkpoint["bad_epochs"]
+
+        for epoch in range(start_epoch, EPOCHS):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             model.train()
@@ -784,6 +798,17 @@ def train_one_combo(
                 else:
                     bad_epochs += 1
                 stop_now = bad_epochs >= EARLY_STOPPING_PATIENCE
+                
+                resume_state = {
+                    "epoch": epoch,
+                    "model_state_dict": (model.module if isinstance(model, DDP) else model).state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "best_qwk": best_qwk,
+                    "bad_epochs": bad_epochs,
+                }
+                torch.save(resume_state, resume_path)
             stop_now = broadcast_bool(stop_now, rank, world_size)
             distributed_barrier(world_size)
             if stop_now:
