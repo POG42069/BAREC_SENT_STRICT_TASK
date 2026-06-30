@@ -50,7 +50,13 @@ TRAIN_PATH = "data/barec-corpus-v1/train.csv"
 DEV_PATH = "data/barec-corpus-v1/dev.csv"
 TEST_PATH = "data/barec-corpus-v1/test.csv"
 
-OUTPUT_DIR = "/content/drive/MyDrive/BAREC_Outputs"
+import os
+if os.path.exists("/content/drive/MyDrive"):
+    OUTPUT_DIR = "/content/drive/MyDrive/BAREC_Outputs"
+elif os.path.exists("/kaggle/working"):
+    OUTPUT_DIR = "/kaggle/working/BAREC_Outputs"
+else:
+    OUTPUT_DIR = "./outputs"
 SUBMISSION_DIR = "./submission"
 
 ID_COLUMN = "Sentence ID"
