@@ -50,7 +50,7 @@ TRAIN_PATH = "data/barec-corpus-v1/train.csv"
 DEV_PATH = "data/barec-corpus-v1/dev.csv"
 TEST_PATH = "data/barec-corpus-v1/test.csv"
 
-OUTPUT_DIR = "./outputs"
+OUTPUT_DIR = "/content/drive/MyDrive/BAREC_Outputs"
 SUBMISSION_DIR = "./submission"
 
 ID_COLUMN = "Sentence ID"
