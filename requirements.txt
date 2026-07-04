@@ -8,3 +8,5 @@ tqdm
 sentencepiece
 protobuf
 accelerate
+safetensors
+coral-pytorch

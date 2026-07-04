@@ -36,6 +36,11 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
+try:
+    from coral_pytorch.losses import corn_loss
+except ImportError:  # pragma: no cover - optional dependency checked at runtime.
+    corn_loss = None
+
 
 # ============================================================
 # CONFIGURATION
@@ -71,7 +76,7 @@ EPOCHS = 5
 LEARNING_RATE = 2e-5
 PER_GPU_BATCH_SIZE = 8
 GRADIENT_ACCUMULATION_STEPS = 1
-MAX_LENGTH = 256
+MAX_LENGTH = 512
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
 EARLY_STOPPING_PATIENCE = 2
@@ -95,10 +100,10 @@ MAX_TEST_ROWS: Optional[int] = None
 
 # Checkpoints were verified on Hugging Face model hub on 2026-06-24.
 MODEL_REGISTRY = {
-    "arabertv2": "aubmindlab/bert-base-arabertv02",
+    "arabertv2": "CAMeL-Lab/readability-arabertv2-d3tok-CE",
     "araelectra": "aubmindlab/araelectra-base-discriminator",
-    "marbert": "UBC-NLP/MARBERT",
-    "camelbert": "CAMeL-Lab/bert-base-arabic-camelbert-mix",
+    "marbert": "UBC-NLP/mARBERTv2",
+    "camelbert": "CAMeL-Lab/bert-base-arabic-camelbert-msa",
 }
 
 VALID_LOSSES = {"ce", "mse", "cor"}
@@ -248,8 +253,8 @@ def apply_d3tok(text: str) -> str:
             from camel_tools.disambig.mle import MLEDisambiguator
             from camel_tools.tokenizers.morphological import MorphologicalTokenizer
 
-            disambiguator = MLEDisambiguator.pretrained()
-            _D3TOK_TOKENIZER = MorphologicalTokenizer(disambiguator, scheme="d3tok")
+            disambiguator = MLEDisambiguator.pretrained("calima-msa-r13")
+            _D3TOK_TOKENIZER = MorphologicalTokenizer(disambiguator, scheme="d3tok", split=True)
             _D3TOK_AVAILABLE = True
         except Exception as exc:  # pragma: no cover - depends on optional package.
             warnings.warn(
@@ -259,7 +264,13 @@ def apply_d3tok(text: str) -> str:
             _D3TOK_AVAILABLE = False
             return text
     try:
-        return " ".join(_D3TOK_TOKENIZER.tokenize(text.split()))
+        return " ".join(_D3TOK_TOKENIZER.tokenize(text))
+    except TypeError:
+        try:
+            return " ".join(_D3TOK_TOKENIZER.tokenize(text.split()))
+        except Exception as exc:  # pragma: no cover - tokenizer runtime fallback.
+            warnings.warn(f"D3TOK failed for one sample; using cleaned text. Reason: {exc}")
+            return text
     except Exception as exc:  # pragma: no cover - tokenizer runtime fallback.
         warnings.warn(f"D3TOK failed for one sample; using cleaned text. Reason: {exc}")
         return text
@@ -353,16 +364,15 @@ def compute_class_weights(labels: list[int], num_labels: int) -> torch.Tensor:
     Compute inverse-frequency class weights used by !MSA.
 
     Formula: w_j = n_samples / (n_classes * n_samples_in_class_j).
-    Missing classes receive weight 1.0 to avoid division by zero. We clip very
-    large weights for stability on tiny/debug subsets.
+    Missing classes receive weight 0.0, matching the original inverse-frequency
+    formula and leaving absent classes without loss contribution.
     """
     counts = np.bincount([label - MIN_LABEL for label in labels], minlength=num_labels)
     total = len(labels)
-    weights = np.ones(num_labels, dtype=np.float32)
+    weights = np.zeros(num_labels, dtype=np.float32)
     for index, count in enumerate(counts):
         if count > 0:
             weights[index] = total / float(num_labels * count)
-    weights = np.clip(weights, 0.05, 10.0)
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -525,12 +535,10 @@ class ReadabilityModel(nn.Module):
             weights = sample_weights if USE_CLASS_WEIGHTS else torch.ones_like(targets)
             result["loss"] = (weights * (preds - targets) ** 2).mean()
         elif self.loss_type == "cor":
-            thresholds = torch.arange(MIN_LABEL + 1, MAX_LABEL + 1, device=labels.device)
-            ordinal_targets = (labels.unsqueeze(1) >= thresholds.unsqueeze(0)).float()
-            loss_matrix = F.binary_cross_entropy_with_logits(logits, ordinal_targets, reduction="none")
-            if USE_CLASS_WEIGHTS and sample_weights is not None:
-                loss_matrix = loss_matrix * sample_weights.unsqueeze(1)
-            result["loss"] = loss_matrix.mean()
+            if corn_loss is None:
+                raise ImportError("Install coral-pytorch to train COR models: pip install coral-pytorch")
+            targets = label_indices if label_indices is not None else labels - MIN_LABEL
+            result["loss"] = corn_loss(logits, targets, num_classes=NUM_LABELS)
         else:
             raise ValueError(f"Unsupported loss type: {self.loss_type}")
         return result
@@ -545,13 +553,21 @@ class ReadabilityModel(nn.Module):
         if self.loss_type == "mse":
             raw_score = logits.squeeze(-1)
             rounded = torch.round(raw_score).clamp(MIN_LABEL, MAX_LABEL)
-            confidence = 1.0 / (1.0 + torch.abs(raw_score - rounded))
+            confidence = torch.exp(-torch.abs(raw_score - rounded))
             return rounded, raw_score, confidence
-        probs = torch.sigmoid(logits)
-        pred_label = MIN_LABEL + (probs > 0.5).sum(dim=-1)
-        pred_label = pred_label.clamp(MIN_LABEL, MAX_LABEL).float()
-        pred_score = MIN_LABEL + probs.sum(dim=-1)
-        confidence = (torch.abs(probs - 0.5) * 2.0).mean(dim=-1)
+        cumulative_probs = torch.sigmoid(logits)
+        batch_size = cumulative_probs.size(0)
+        class_probs = torch.zeros(batch_size, NUM_LABELS, device=logits.device, dtype=logits.dtype)
+        class_probs[:, 0] = 1.0 - cumulative_probs[:, 0]
+        class_probs[:, 1:-1] = cumulative_probs[:, :-1] - cumulative_probs[:, 1:]
+        class_probs[:, -1] = cumulative_probs[:, -1]
+        class_probs = class_probs.clamp_min(1e-7)
+        class_probs = class_probs / class_probs.sum(dim=1, keepdim=True).clamp_min(1e-7)
+
+        levels = torch.arange(MIN_LABEL, MAX_LABEL + 1, device=logits.device, dtype=torch.float32)
+        pred_score = (class_probs * levels.unsqueeze(0)).sum(dim=1)
+        pred_label = class_probs.argmax(dim=1).float() + MIN_LABEL
+        confidence = class_probs.max(dim=1).values
         return pred_label, pred_score, confidence
 
 
@@ -858,7 +874,8 @@ def predict_one_combo(*args: Any, **kwargs: Any) -> Tuple[Optional[pd.DataFrame]
 def post_process_predictions(predictions: Sequence[float], fallback_label: int) -> np.ndarray:
     values = np.asarray(predictions, dtype=float)
     values = np.nan_to_num(values, nan=float(fallback_label))
-    return clamp_labels(values)
+    values = np.floor(values).astype(int)
+    return np.clip(values, MIN_LABEL, MAX_LABEL)
 
 
 def confidence_weighted_ensemble(
@@ -874,21 +891,32 @@ def confidence_weighted_ensemble(
     if not prediction_frames:
         raise ValueError("No prediction frames were provided for ensembling.")
     base_ids = prediction_frames[0]["Sentence ID"].astype(str).tolist()
+    label_stack = []
     score_stack = []
     confidence_stack = []
     for frame in prediction_frames:
         if frame["Sentence ID"].astype(str).tolist() != base_ids:
             raise ValueError("Prediction frames have different sample ordering or IDs.")
+        label_stack.append(frame["pred_label"].astype(float).to_numpy())
         score_stack.append(frame["pred_score"].astype(float).to_numpy())
         confidence_stack.append(frame["confidence"].astype(float).to_numpy())
+    labels = np.vstack(label_stack)
     scores = np.vstack(score_stack)
     confidences = np.vstack(confidence_stack)
+    high_mask = np.isin(labels, [16, 17])
     if USE_CONFIDENCE_WEIGHTED_ENSEMBLE:
         confidences = np.clip(np.nan_to_num(confidences, nan=0.0), 1e-6, None)
         ensemble_score = np.sum(scores * confidences, axis=0) / np.sum(confidences, axis=0)
     else:
         ensemble_score = np.nanmean(scores, axis=0)
     final_pred = post_process_predictions(ensemble_score, fallback_label)
+    for index in range(labels.shape[1]):
+        unique_labels = sorted(set(labels[:, index].astype(int).tolist()))
+        if len(unique_labels) == 2 and abs(unique_labels[0] - unique_labels[1]) == 1:
+            final_pred[index] = unique_labels[1]
+        high_labels = labels[:, index][high_mask[:, index]].astype(int)
+        if high_labels.size:
+            final_pred[index] = int(high_labels.max())
     return pd.DataFrame(
         {
             "Sentence ID": base_ids,
