@@ -526,13 +526,15 @@ class ReadabilityModel(nn.Module):
         if self.loss_type == "mse":
             raw_score = logits.squeeze(-1)
             rounded = torch.round(raw_score).clamp(MIN_LABEL, MAX_LABEL)
-            confidence = 1.0 / (1.0 + torch.abs(raw_score - rounded))
+            confidence = torch.exp(-torch.abs(raw_score - rounded))
             return rounded, raw_score, confidence
         probs = torch.sigmoid(logits)
         pred_label = MIN_LABEL + (probs > 0.5).sum(dim=-1)
         pred_label = pred_label.clamp(MIN_LABEL, MAX_LABEL).float()
         pred_score = MIN_LABEL + probs.sum(dim=-1)
-        confidence = (torch.abs(probs - 0.5) * 2.0).mean(dim=-1)
+        prob_diffs = torch.diff(probs, dim=1, prepend=torch.ones_like(probs[:, :1]))
+        prob_diffs = torch.cat([1 - probs[:, :1], prob_diffs], dim=1)
+        confidence = torch.max(prob_diffs, dim=1)[0]
         return pred_label, pred_score, confidence
 
 
@@ -820,28 +822,28 @@ def confidence_weighted_ensemble(
     fallback_label: int,
 ) -> pd.DataFrame:
     """
-    Ensemble model scores with confidence weights.
+    Ensemble discrete model predictions with confidence weights.
 
     If confidence weighting is disabled, this becomes a simple arithmetic mean
-    over predicted scores.
+    over predicted labels.
     """
     if not prediction_frames:
         raise ValueError("No prediction frames were provided for ensembling.")
     base_ids = prediction_frames[0]["Sentence ID"].astype(str).tolist()
-    score_stack = []
+    label_stack = []
     confidence_stack = []
     for frame in prediction_frames:
         if frame["Sentence ID"].astype(str).tolist() != base_ids:
             raise ValueError("Prediction frames have different sample ordering or IDs.")
-        score_stack.append(frame["pred_score"].astype(float).to_numpy())
+        label_stack.append(frame["pred_label"].astype(float).to_numpy())
         confidence_stack.append(frame["confidence"].astype(float).to_numpy())
-    scores = np.vstack(score_stack)
+    labels = np.vstack(label_stack)
     confidences = np.vstack(confidence_stack)
     if USE_CONFIDENCE_WEIGHTED_ENSEMBLE:
         confidences = np.clip(np.nan_to_num(confidences, nan=0.0), 1e-6, None)
-        ensemble_score = np.sum(scores * confidences, axis=0) / np.sum(confidences, axis=0)
+        ensemble_score = np.sum(labels * confidences, axis=0) / np.sum(confidences, axis=0)
     else:
-        ensemble_score = np.nanmean(scores, axis=0)
+        ensemble_score = np.nanmean(labels, axis=0)
     final_pred = post_process_predictions(ensemble_score, fallback_label)
     return pd.DataFrame(
         {
