@@ -11,3 +11,4 @@ sentencepiece
 protobuf
 safetensors
 camel-tools
+coral-pytorch

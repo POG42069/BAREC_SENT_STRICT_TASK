@@ -29,6 +29,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
+from coral_pytorch.dataset import corn_label_from_logits
+from coral_pytorch.losses import corn_loss
 from sklearn.metrics import accuracy_score, cohen_kappa_score, mean_absolute_error
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
@@ -63,9 +65,9 @@ MAX_LABEL = 19
 
 EPOCHS = 5
 LEARNING_RATE = 2e-5
-PER_GPU_BATCH_SIZE = 8
+PER_GPU_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
-MAX_LENGTH = 256
+MAX_LENGTH = 512
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
 EARLY_STOPPING_PATIENCE = 2
@@ -87,12 +89,21 @@ MAX_TRAIN_ROWS: Optional[int] = None
 MAX_DEV_ROWS: Optional[int] = None
 MAX_TEST_ROWS: Optional[int] = None
 
-# Checkpoints were verified on Hugging Face model hub on 2026-06-24.
+# Checkpoints follow the reference notebooks for the best 87.5 QWK ensemble.
 MODEL_REGISTRY = {
-    "arabertv2": "aubmindlab/bert-base-arabertv02",
+    "arabertv2": "CAMeL-Lab/readability-arabertv2-d3tok-CE",
     "araelectra": "aubmindlab/araelectra-base-discriminator",
-    "marbert": "UBC-NLP/MARBERT",
-    "camelbert": "CAMeL-Lab/bert-base-arabic-camelbert-mix",
+    "marbert": "UBC-NLP/mARBERTv2",
+    "camelbert": "CAMeL-Lab/bert-base-arabic-camelbert-msa",
+}
+
+MODEL_LOSS_REGISTRY = {
+    ("arabertv2", "ce"): "CAMeL-Lab/readability-arabertv2-d3tok-CE",
+    ("arabertv2", "cor"): "CAMeL-Lab/readability-arabertv2-d3tok-reg",
+    ("araelectra", "mse"): "aubmindlab/araelectra-base-discriminator",
+    ("camelbert", "ce"): "CAMeL-Lab/bert-base-arabic-camelbert-msa",
+    ("camelbert", "mse"): "CAMeL-Lab/bert-base-arabic-camelbert-msa",
+    ("marbert", "cor"): "UBC-NLP/mARBERTv2",
 }
 
 VALID_LOSSES = {"ce", "mse", "cor"}
@@ -119,6 +130,10 @@ def is_rank_zero(rank: int) -> bool:
 def log(message: str, rank: int = 0) -> None:
     if is_rank_zero(rank):
         print(message, flush=True)
+
+
+def get_checkpoint_name(model_key: str, loss_type: str) -> str:
+    return MODEL_LOSS_REGISTRY.get((model_key, loss_type), MODEL_REGISTRY[model_key])
 
 
 def set_seed(seed: int) -> None:
@@ -386,6 +401,7 @@ def validate_config_and_data(
             raise ValueError(f"Unknown model key in ENSEMBLE_COMBOS: {model_key}")
         if loss_type not in VALID_LOSSES:
             raise ValueError(f"Unknown loss type in ENSEMBLE_COMBOS: {loss_type}")
+        get_checkpoint_name(model_key, loss_type)
     for split_name, df, cols in [
         ("train", train_df, train_cols),
         ("dev", dev_df, dev_cols),
@@ -506,12 +522,7 @@ class ReadabilityModel(nn.Module):
             weights = sample_weights if USE_CLASS_WEIGHTS else torch.ones_like(targets)
             result["loss"] = (weights * (preds - targets) ** 2).mean()
         elif self.loss_type == "cor":
-            thresholds = torch.arange(MIN_LABEL + 1, MAX_LABEL + 1, device=labels.device)
-            ordinal_targets = (labels.unsqueeze(1) >= thresholds.unsqueeze(0)).float()
-            loss_matrix = F.binary_cross_entropy_with_logits(logits, ordinal_targets, reduction="none")
-            if USE_CLASS_WEIGHTS and sample_weights is not None:
-                loss_matrix = loss_matrix * sample_weights.unsqueeze(1)
-            result["loss"] = loss_matrix.mean()
+            result["loss"] = corn_loss(logits, label_indices, num_classes=NUM_LABELS)
         else:
             raise ValueError(f"Unsupported loss type: {self.loss_type}")
         return result
@@ -529,7 +540,7 @@ class ReadabilityModel(nn.Module):
             confidence = torch.exp(-torch.abs(raw_score - rounded))
             return rounded, raw_score, confidence
         probs = torch.sigmoid(logits)
-        pred_label = MIN_LABEL + (probs > 0.5).sum(dim=-1)
+        pred_label = corn_label_from_logits(logits).float() + MIN_LABEL
         pred_label = pred_label.clamp(MIN_LABEL, MAX_LABEL).float()
         pred_score = MIN_LABEL + probs.sum(dim=-1)
         prob_diffs = torch.diff(probs, dim=1, prepend=torch.ones_like(probs[:, :1]))
@@ -550,14 +561,33 @@ def save_model_checkpoint(
     model_to_save = model.module if isinstance(model, DDP) else model
     torch.save(model_to_save.state_dict(), checkpoint_dir / "model_state.pt")
     tokenizer.save_pretrained(checkpoint_dir)
+    checkpoint_name = get_checkpoint_name(model_key, loss_type)
     metadata = {
         "model_key": model_key,
-        "checkpoint_name": MODEL_REGISTRY[model_key],
+        "checkpoint_name": checkpoint_name,
         "loss_type": loss_type,
         "best_qwk": best_qwk,
         "num_labels": NUM_LABELS,
+        "max_length": MAX_LENGTH,
     }
     (checkpoint_dir / "model_meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def checkpoint_matches_config(checkpoint_dir: Path, model_key: str, loss_type: str) -> bool:
+    metadata_path = checkpoint_dir / "model_meta.json"
+    if not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return (
+        metadata.get("model_key") == model_key
+        and metadata.get("loss_type") == loss_type
+        and metadata.get("checkpoint_name") == get_checkpoint_name(model_key, loss_type)
+        and metadata.get("num_labels") == NUM_LABELS
+        and metadata.get("max_length") == MAX_LENGTH
+    )
 
 
 def load_model_checkpoint(
@@ -567,9 +597,10 @@ def load_model_checkpoint(
     class_weights: torch.Tensor,
     device: torch.device,
 ) -> Tuple[ReadabilityModel, Any]:
-    tokenizer_source = checkpoint_dir if (checkpoint_dir / "tokenizer_config.json").exists() else MODEL_REGISTRY[model_key]
+    checkpoint_name = get_checkpoint_name(model_key, loss_type)
+    tokenizer_source = checkpoint_dir if (checkpoint_dir / "tokenizer_config.json").exists() else checkpoint_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
-    model = ReadabilityModel(MODEL_REGISTRY[model_key], loss_type, class_weights)
+    model = ReadabilityModel(checkpoint_name, loss_type, class_weights)
     state_path = checkpoint_dir / "model_state.pt"
     if state_path.exists():
         model.load_state_dict(torch.load(state_path, map_location=device))
@@ -699,12 +730,20 @@ def train_one_combo(
     checkpoint_dir = Path(OUTPUT_DIR) / "checkpoints" / combo_name
     prediction_dir = ensure_dir(Path(OUTPUT_DIR) / "predictions")
 
-    if checkpoint_dir.exists() and (checkpoint_dir / "model_state.pt").exists() and not RETRAIN_IF_EXISTS:
+    checkpoint_is_reusable = (
+        checkpoint_dir.exists()
+        and (checkpoint_dir / "model_state.pt").exists()
+        and checkpoint_matches_config(checkpoint_dir, model_key, loss_type)
+    )
+    if checkpoint_is_reusable and not RETRAIN_IF_EXISTS:
         log(f"[{combo_name}] Existing checkpoint found; skipping training.", rank)
         model, tokenizer = load_model_checkpoint(checkpoint_dir, model_key, loss_type, class_weights, device)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_REGISTRY[model_key])
-        model = ReadabilityModel(MODEL_REGISTRY[model_key], loss_type, class_weights).to(device)
+        if checkpoint_dir.exists() and (checkpoint_dir / "model_state.pt").exists() and not checkpoint_is_reusable:
+            log(f"[{combo_name}] Existing checkpoint does not match current config; retraining.", rank)
+        checkpoint_name = get_checkpoint_name(model_key, loss_type)
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_name)
+        model = ReadabilityModel(checkpoint_name, loss_type, class_weights).to(device)
         if world_size > 1:
             model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
