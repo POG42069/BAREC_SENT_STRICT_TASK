@@ -1,26 +1,43 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .ipynb_checkpoints/
 
-.env
+# Virtual environments and local secrets
 .venv/
 venv/
+env/
+.env
+.env.*
 
+# Runtime artifacts (the repository intentionally keeps data/ tracked)
 outputs/
-submission/
 checkpoints/
+cache/
+tmp/
+submission/
 wandb/
-runs/
+*.log
 
-*.bin
+# Model/checkpoint files
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 
-*.csv
-*.tsv
-*.parquet
-*.zip
+# Submission files created outside outputs/
+prediction
+prediction.zip
 
+# Alternative local dataset directories; do not add data/ here
+datasets/
+
+# OS/editor files
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/

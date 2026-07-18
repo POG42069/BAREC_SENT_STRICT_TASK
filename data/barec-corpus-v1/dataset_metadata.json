@@ -1,10 +1,99 @@
 {
   "dataset_id": "CAMeL-Lab/BAREC-Shared-Task-2026-sent",
-  "splits": {
-    "train": "train.csv",
-    "validation": "dev.csv",
-    "test": "test.csv"
+  "official_url": "https://huggingface.co/datasets/CAMeL-Lab/BAREC-Shared-Task-2026-sent",
+  "official_revision": "5de96756ba123fe6b02c2728c74f06f43fc9d503",
+  "license": "CC-BY-SA-4.0",
+  "storage": {
+    "official": "Parquet",
+    "local": "UTF-8 CSV",
+    "note": "The local CSV files preserve the ordered schema and every cell value from the pinned official Parquet files."
   },
-  "stored_dataset": "raw Hugging Face CSV without D3Tok",
-  "d3tok_runtime": "train.py builds D3Tok in memory with camel_tools MLEDisambiguator calima-msa-r13 + MorphologicalTokenizer d3tok split=True"
+  "splits": {
+    "train": {
+      "local_file": "train.csv",
+      "official_file": "data/train-00000-of-00001.parquet",
+      "rows": 54845,
+      "columns": 15,
+      "canonical_sha256": "40f5d8299610bdc3e7688a7c1376b1ef078d05266cf053b551c6dfefb91f553a",
+      "duplicate_ids": 0,
+      "empty_or_missing_cells": 0
+    },
+    "validation": {
+      "local_file": "dev.csv",
+      "official_file": "data/validation-00000-of-00001.parquet",
+      "rows": 7310,
+      "columns": 15,
+      "canonical_sha256": "5380060472fb84e7b27998c0bd81d225c8e2f91da0d07319d192fe3cc7c34323",
+      "duplicate_ids": 0,
+      "empty_or_missing_cells": 0
+    },
+    "test": {
+      "local_file": "test.csv",
+      "official_file": "data/test-00000-of-00001.parquet",
+      "rows": 7286,
+      "columns": 15,
+      "canonical_sha256": "d387c308235b6a8f0646b4703ff8de860b0093f87f076239eff7fb9440fc4476",
+      "duplicate_ids": 0,
+      "empty_or_missing_cells": 0
+    }
+  },
+  "ordered_schema": [
+    "ID",
+    "Sentence",
+    "Word_Count",
+    "Readability_Level",
+    "Readability_Level_19",
+    "Readability_Level_7",
+    "Readability_Level_5",
+    "Readability_Level_3",
+    "Annotator",
+    "Document",
+    "Source",
+    "Book",
+    "Author",
+    "Domain",
+    "Text_Class"
+  ],
+  "target": {
+    "column": "Readability_Level_19",
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 19,
+    "invalid_values": 0
+  },
+  "audit": {
+    "verified_on": "2026-07-18",
+    "official_revision_pinned": true,
+    "ordered_schema_match": true,
+    "row_order_match": true,
+    "total_rows": 69441,
+    "total_cells_compared": 1041615,
+    "full_cell_mismatches": 0,
+    "status": "exact_match",
+    "comparison_method": "Read each local CSV as UTF-8 strings while preserving empty strings; read the corresponding official Parquet file at the pinned revision; convert each non-null Parquet scalar to its string representation; then compare ordered columns, shape, row order, and every cell.",
+    "cross_split_overlaps": {
+      "ids": {
+        "train_validation": 0,
+        "train_test": 0,
+        "validation_test": 0
+      },
+      "documents": {
+        "train_validation": 0,
+        "train_test": 0,
+        "validation_test": 0
+      },
+      "sentence_texts": {
+        "train_validation": 177,
+        "train_test": 244,
+        "validation_test": 61,
+        "note": "These sentence-text overlaps are also present in the pinned official dataset; they are not local conversion mismatches."
+      }
+    }
+  },
+  "canonical_checksum": {
+    "algorithm_id": "csv-rfc4180-jsonl-sha256-v1",
+    "line_ending_independent": true,
+    "includes_header": true,
+    "algorithm": "Decode the CSV as UTF-8 (accept an optional BOM), parse it with an RFC 4180 CSV reader, and keep every field as a string. For each parsed row, including the header, emit Python json.dumps(row, ensure_ascii=False, separators=(',', ':')) followed by one LF byte. Concatenate the UTF-8 encoded records in source order and compute lowercase SHA-256 over the resulting bytes."
+  }
 }
