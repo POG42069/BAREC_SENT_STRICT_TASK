@@ -235,7 +235,9 @@ AutoModel AraBERTv2 encoder
 
 Classification head 19 lớp của checkpoint không được sử dụng. Regression head
 trả tensor `[batch_size]` và model tối ưu MSE trên nhãn float. Raw score không
-được round trong loss.
+được round trong loss. BERT pooler cũng không được khởi tạo vì baseline lấy CLS
+trực tiếp từ `last_hidden_state`; cách này tránh giữ hai tham số pooler không nối
+với loss và bảo đảm DDP có gradient cho mọi tham số trainable.
 
 AdamW dùng parameter group riêng cho encoder/head, loại bias và LayerNorm khỏi
 weight decay, linear warmup, gradient clipping và gradient accumulation. CUDA
@@ -393,7 +395,10 @@ python -c "import torch; print(torch.cuda.device_count())"
 
 Kiểm tra hai process dùng cùng code/cache, không để nhiều rank cùng preprocess
 hoặc ghi output, và xem log rank đầu tiên phát sinh lỗi. Chạy smoke test trước;
-không full-train để che một lỗi khởi tạo DDP.
+không full-train để che một lỗi khởi tạo DDP. Nếu log báo
+`Expected to have finished reduction ... parameters that were not used`, hãy
+`git pull origin Khangtest` để lấy bản đã loại BERT pooler rồi chạy lại; cache
+D3Tok đã hoàn thành vẫn có thể tái sử dụng.
 
 ### `torch.cuda.is_available()` là `False`
 

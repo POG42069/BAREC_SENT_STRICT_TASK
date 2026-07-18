@@ -13,6 +13,7 @@ import contextlib
 import csv
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import logging
 import math
@@ -120,7 +121,9 @@ class Config:
     # Smoke-test limits. These do not affect a normal run.
     SMOKE_TRAIN_SAMPLES: int = 32
     SMOKE_EVAL_SAMPLES: int = 16
-    SMOKE_MAX_TRAIN_STEPS: int = 2
+    # Four micro-batches cover two accumulation windows and let DDP surface
+    # reducer-state errors that only appear on the following forward pass.
+    SMOKE_MAX_TRAIN_STEPS: int = 4
 
     def resolve(self, value: str | Path) -> Path:
         """Resolve a configured path relative to ``train.py``."""
@@ -277,12 +280,27 @@ def initialize_distributed(config: Config) -> DistributedContext:
             if device.type == "cuda" and dist.is_nccl_available() and os.name != "nt"
             else "gloo"
         )
-        dist.init_process_group(
-            backend=backend,
-            init_method="env://",
+        init_arguments: dict[str, Any] = {
+            "backend": backend,
+            "init_method": "env://",
             # Rank 0 may build the first D3Tok cache while its peer waits.
-            timeout=timedelta(minutes=config.DDP_TIMEOUT_MINUTES),
-        )
+            "timeout": timedelta(minutes=config.DDP_TIMEOUT_MINUTES),
+        }
+        supports_device_id = False
+        if backend == "nccl" and device.type == "cuda":
+            try:
+                supports_device_id = (
+                    "device_id"
+                    in inspect.signature(dist.init_process_group).parameters
+                )
+            except (TypeError, ValueError):
+                # Older/wrapped PyTorch callables may not expose a signature.
+                supports_device_id = False
+        if supports_device_id:
+            # Bind NCCL to LOCAL_RANK explicitly instead of asking it to infer a
+            # device from the global rank (which also emits a hang warning).
+            init_arguments["device_id"] = device
+        dist.init_process_group(**init_arguments)
         rank = dist.get_rank()
         world_size = dist.get_world_size()
     else:
@@ -304,7 +322,10 @@ def distributed_barrier(context: DistributedContext) -> None:
     """Synchronize ranks when DDP is active."""
 
     if context.distributed:
-        dist.barrier()
+        if context.backend == "nccl" and context.device.type == "cuda":
+            dist.barrier(device_ids=[context.local_rank])
+        else:
+            dist.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +1059,25 @@ class ArabicReadabilityRegressor(nn.Module):
 
     def __init__(self, model_name: str, dropout: float) -> None:
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(model_name)
+        # The regression head consumes raw CLS from last_hidden_state.  A
+        # BertModel pooler would therefore be trainable but disconnected from
+        # the loss, which makes DDP fail on the following iteration when
+        # find_unused_parameters=False.  Do not instantiate those two unused
+        # pooler tensors in the first place.
+        self.encoder = AutoModel.from_pretrained(
+            model_name,
+            add_pooling_layer=False,
+        )
+        trainable_pooler_parameters = [
+            name
+            for name, parameter in self.encoder.named_parameters()
+            if parameter.requires_grad and "pooler" in name.lower()
+        ]
+        if trainable_pooler_parameters:
+            raise RuntimeError(
+                "The CLS regressor must not retain trainable encoder-pooler "
+                f"parameters: {trainable_pooler_parameters}"
+            )
         hidden_size = int(self.encoder.config.hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.regression_head = nn.Linear(hidden_size, 1)
@@ -1141,6 +1180,20 @@ def autocast_context(enabled: bool) -> contextlib.AbstractContextManager[Any]:
     return contextlib.nullcontext()
 
 
+def scaled_optimizer_step(
+    scaler: Any,
+    optimizer: torch.optim.Optimizer,
+) -> tuple[bool, float, float]:
+    """Run a scaled optimizer update and report whether AMP skipped it."""
+
+    scale_before = float(scaler.get_scale())
+    scaler.step(optimizer)
+    scaler.update()
+    scale_after = float(scaler.get_scale())
+    optimizer_stepped = not scaler.is_enabled() or scale_after >= scale_before
+    return optimizer_stepped, scale_before, scale_after
+
+
 def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
     """Pass only encoder tensors from a collated batch into the model."""
 
@@ -1156,7 +1209,6 @@ def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
     return predictions
 
 
-@torch.no_grad()
 def run_regression_shape_check(
     model: ArabicReadabilityRegressor,
     tokenizer: Any,
@@ -1164,7 +1216,7 @@ def run_regression_shape_check(
     device: torch.device,
     max_length: int,
 ) -> None:
-    """Verify that a real batch of size one retains shape ``[1]``."""
+    """Verify batch-one output shape and gradient connectivity before DDP."""
 
     encoded = tokenizer(
         text,
@@ -1174,13 +1226,29 @@ def run_regression_shape_check(
     )
     encoded = {key: value.to(device) for key, value in encoded.items()}
     was_training = model.training
-    model.eval()
-    output = model(**encoded)
-    model.train(was_training)
-    if output.shape != torch.Size([1]):
-        raise AssertionError(
-            f"Batch-size-one regression output must have shape [1], got {tuple(output.shape)}"
-        )
+    model.train()
+    model.zero_grad(set_to_none=True)
+    try:
+        output = model(**encoded)
+        if output.shape != torch.Size([1]):
+            raise AssertionError(
+                "Batch-size-one regression output must have shape [1], "
+                f"got {tuple(output.shape)}"
+            )
+        output.sum().backward()
+        disconnected = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        if disconnected:
+            raise AssertionError(
+                "Trainable model parameters are disconnected from the regression "
+                f"loss: {disconnected}"
+            )
+    finally:
+        model.zero_grad(set_to_none=True)
+        model.train(was_training)
 
 
 # ---------------------------------------------------------------------------
@@ -1746,11 +1814,20 @@ def train_one_epoch(
         if is_update_step:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            optimizer_stepped, scale_before, scale_after = scaled_optimizer_step(
+                scaler, optimizer
+            )
+            if optimizer_stepped:
+                scheduler.step()
+                global_step += 1
+            elif context.is_main:
+                LOGGER.warning(
+                    "AMP overflow: optimizer and scheduler update skipped; "
+                    "GradScaler %.0f -> %.0f.",
+                    scale_before,
+                    scale_after,
+                )
             optimizer.zero_grad(set_to_none=True)
-            global_step += 1
 
         if context.is_main:
             encoder_lr, head_lr = learning_rates(optimizer)
