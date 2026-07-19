@@ -1,10 +1,11 @@
-torch
-transformers
-camel-tools
-scikit-learn
-pandas
-numpy
-tqdm
-sentencepiece
-protobuf
-accelerate
+# PyTorch is intentionally not pinned here. Kaggle already provides a
+# CUDA-enabled build; replacing it can break the T4 x2 runtime.
+numpy>=2.0,<3
+pandas>=2.2,<3.1
+transformers>=4.43.4,<5
+scikit-learn>=1.5,<2
+tqdm>=4.66,<5
+camel-tools==1.6.0
+sentencepiece>=0.2,<0.3
+safetensors>=0.4,<1
+pyarrow>=16,<24
