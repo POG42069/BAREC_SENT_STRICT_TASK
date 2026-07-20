@@ -90,6 +90,7 @@ lưu bản CSV không thay đổi yêu cầu attribution/share-alike của dữ 
 ```text
 .
 ├── train.py
+├── train_blind.py
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
@@ -129,6 +130,45 @@ làm mất khả năng sử dụng hai T4.
 Lệnh `camel_data -i light` cài morphology database và MLE disambiguator cần cho
 `calima-msa-r13`. Nếu cấu hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng thử
 chuẩn bị resource khi thiếu; cài thủ công trước vẫn là cách dễ chẩn đoán nhất.
+
+### Chạy Blind Test 2026 riêng tư
+
+`train_blind.py` tải đúng dataset sentence-level riêng tư, huấn luyện bằng Train,
+chọn checkpoint bằng Dev rồi chỉ dùng Blind Test để inference. Script loại mọi
+cột giống label trước khi gọi pipeline, nên Blind không thể tham gia loss,
+checkpoint selection hoặc metric.
+
+Trên Kaggle, mở **Add-ons → Secrets**, tạo Secret tên `HF_TOKEN`, dán token do
+ban tổ chức cấp và bật quyền truy cập cho notebook. Không dán token vào source,
+cell notebook, tham số dòng lệnh, `Config`, Git hoặc output log. Sau đó chạy:
+
+```bash
+# Chỉ kiểm tra token, quyền truy cập và schema; chưa train.
+python train_blind.py --download-only
+
+# Kiểm tra pipeline trên tập con; ZIP này KHÔNG dùng để nộp.
+python train_blind.py --smoke-test
+
+# Full Train/Dev rồi inference toàn bộ Blind Test.
+python train_blind.py
+```
+
+Trong cell Kaggle, gọi các lệnh trên bằng `!python ...` (process riêng); không
+dùng `%run train_blind.py` trong chính notebook kernel.
+
+Khi có hai T4, script tự launch hai DDP worker giống `train.py`. Dữ liệu Blind
+thô và cache D3Tok được đặt trong `/kaggle/temp` (hoặc thư mục temp của hệ điều
+hành), không nằm trong repository hay `/kaggle/working`. Kết quả cần tải về là:
+
+```text
+outputs/blind/prediction.zip
+```
+
+Nếu ban tổ chức cập nhật dataset trong cùng phiên, dùng
+`python train_blind.py --refresh-blind`. Luôn giữ Kaggle Notebook ở chế độ
+private; không commit/publish dữ liệu Blind, cache, log chứa mẫu dữ liệu hoặc
+token. `eval.py` chỉ dành cho Open Test có gold label, không dùng nó để đánh giá
+Blind Test.
 
 ## 5. Cài và chạy local
 
@@ -303,7 +343,7 @@ resume; script fail fast nếu cặp artifact này không đầy đủ.
 Kiểm tra cú pháp:
 
 ```bash
-python -m py_compile train.py
+python -m py_compile train.py train_blind.py
 ```
 
 Smoke test thật (mẫu nhỏ, D3Tok/checkpoint thật, output riêng):
