@@ -1,0 +1,15 @@
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+data/**/*.csv text eol=lf
+
+*.zip binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.safetensors binary
+*.parquet binary
