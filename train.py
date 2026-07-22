@@ -34,7 +34,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import (
+    AutoModel,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+)
 
 try:
     from coral_pytorch.losses import corn_loss
@@ -98,9 +103,16 @@ MAX_TRAIN_ROWS: Optional[int] = None
 MAX_DEV_ROWS: Optional[int] = None
 MAX_TEST_ROWS: Optional[int] = None
 
-# Checkpoints were verified on Hugging Face model hub on 2026-06-24.
+# Checkpoints were verified on Hugging Face model hub on 2026-07-22.
+PRETRAINED_REGRESSION_CHECKPOINTS = {
+    # The official BAREC regression checkpoint was trained on zero-based
+    # labels (0..18). The rest of this pipeline uses the submitted 1..19
+    # scale, so its scalar output receives a fixed +1 offset.
+    "CAMeL-Lab/readability-arabertv2-d3tok-reg": 1.0,
+}
+
 MODEL_REGISTRY = {
-    "arabertv2": "CAMeL-Lab/readability-arabertv2-d3tok-CE",
+    "arabertv2_reg": "CAMeL-Lab/readability-arabertv2-d3tok-reg",
     "araelectra": "aubmindlab/araelectra-base-discriminator",
     "marbert": "UBC-NLP/mARBERTv2",
     "camelbert": "CAMeL-Lab/bert-base-arabic-camelbert-msa",
@@ -109,8 +121,10 @@ MODEL_REGISTRY = {
 VALID_LOSSES = {"ce", "mse", "cor"}
 
 ENSEMBLE_COMBOS = [
-    ("arabertv2", "ce"),
-    ("arabertv2", "cor"),
+    # MSE preserves and continues fine-tuning the checkpoint's trained scalar
+    # regression head; COR reuses its readability-aware encoder.
+    ("arabertv2_reg", "mse"),
+    ("arabertv2_reg", "cor"),
     ("araelectra", "mse"),
     ("camelbert", "ce"),
     ("camelbert", "mse"),
@@ -487,11 +501,33 @@ class ReadabilityModel(nn.Module):
         super().__init__()
         self.checkpoint_name = checkpoint_name
         self.loss_type = loss_type
-        self.encoder = AutoModel.from_pretrained(checkpoint_name)
-        hidden_size = self.encoder.config.hidden_size
-        output_size = NUM_LABELS if loss_type == "ce" else 1
-        self.dropout = nn.Dropout(getattr(self.encoder.config, "hidden_dropout_prob", 0.1))
-        self.head = nn.Linear(hidden_size, output_size, bias=(loss_type != "cor"))
+        self.regression_output_offset = 0.0
+
+        if loss_type == "mse" and checkpoint_name in PRETRAINED_REGRESSION_CHECKPOINTS:
+            # AutoModel would silently discard the task-specific regression
+            # head. Load the complete sequence-classification checkpoint, then
+            # retain its encoder, pooler, dropout, and trained scalar head.
+            pretrained_model = AutoModelForSequenceClassification.from_pretrained(checkpoint_name)
+            if int(pretrained_model.config.num_labels) != 1:
+                raise ValueError(
+                    f"Expected a one-output regression checkpoint, but {checkpoint_name} "
+                    f"declares num_labels={pretrained_model.config.num_labels}."
+                )
+            pretrained_head = getattr(pretrained_model, "classifier", None)
+            if not isinstance(pretrained_head, nn.Linear) or pretrained_head.out_features != 1:
+                raise TypeError(
+                    f"{checkpoint_name} does not expose the expected one-output linear classifier head."
+                )
+            self.encoder = pretrained_model.base_model
+            self.dropout = pretrained_model.dropout
+            self.head = pretrained_head
+            self.regression_output_offset = PRETRAINED_REGRESSION_CHECKPOINTS[checkpoint_name]
+        else:
+            self.encoder = AutoModel.from_pretrained(checkpoint_name)
+            hidden_size = self.encoder.config.hidden_size
+            output_size = NUM_LABELS if loss_type == "ce" else 1
+            self.dropout = nn.Dropout(getattr(self.encoder.config, "hidden_dropout_prob", 0.1))
+            self.head = nn.Linear(hidden_size, output_size, bias=(loss_type != "cor"))
         if loss_type == "cor":
             self.coral_bias = nn.Parameter(torch.zeros(NUM_LABELS - 1))
         self.register_buffer(
@@ -522,6 +558,8 @@ class ReadabilityModel(nn.Module):
             logits = self.head(pooled) + self.coral_bias
         else:
             logits = self.head(pooled)
+            if self.loss_type == "mse":
+                logits = logits + self.regression_output_offset
         result = {"logits": logits}
         if labels is None:
             return result
@@ -589,6 +627,14 @@ def save_model_checkpoint(
         "loss_type": loss_type,
         "best_qwk": best_qwk,
         "num_labels": NUM_LABELS,
+        "pretrained_regression_head": (
+            loss_type == "mse" and MODEL_REGISTRY[model_key] in PRETRAINED_REGRESSION_CHECKPOINTS
+        ),
+        "regression_output_offset": (
+            PRETRAINED_REGRESSION_CHECKPOINTS.get(MODEL_REGISTRY[model_key], 0.0)
+            if loss_type == "mse"
+            else 0.0
+        ),
     }
     (checkpoint_dir / "model_meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
