@@ -213,6 +213,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng cho encoder/head mới |
 | Training | `NUM_EPOCHS=5`, `EARLY_STOPPING_PATIENCE=2` | Giới hạn epoch và số epoch Dev QWK không cải thiện |
 | Multitask | `AUXILIARY_7/5/3_LOSS_WEIGHT=0.30/0.20/0.10` | Trọng số CE cố định cho ba auxiliary head |
+| Calibration | `USE_DEV_AFFINE_CALIBRATION=True` | Fit scale/bias trên Dev rồi áp dụng cố định cho Test/Blind |
 | Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
@@ -349,6 +350,19 @@ Chỉ Train DataLoader thực hiện backward. Sau mỗi epoch, Dev được gat
 Prediction cho metric được tính bằng `np.rint`, clip vào `[1, 19]`, rồi chuyển
 sang integer. Checkpoint có QWK cao nhất được chọn; nếu QWK hòa, MAE thấp hơn
 thắng. Early stopping chỉ dựa trên Dev, không nhìn Test.
+
+Sau khi tải lại best checkpoint, pipeline chạy Dev thêm một lần và tìm affine
+calibration hai tham số:
+
+```text
+calibrated_score = scale * raw_score + bias
+```
+
+Grid search chỉ nhìn Dev, luôn chứa identity `(scale=1, bias=0)` và chỉ chấp
+nhận calibration nếu Dev QWK tăng ít nhất `0.001`. Hai tham số sau đó được cố
+định khi dự đoán Open Test hoặc Blind Test; Test/Blind không tham gia chọn tham
+số. Báo cáo được lưu tại `outputs/logs/dev_affine_calibration.json`, còn
+diagnostics giữ cả `raw_prediction` và `calibrated_prediction`.
 
 Checkpoint resume lưu model hiện tại, optimizer, scheduler, scaler, epoch/global
 step, best QWK/MAE, config và RNG state. Đặt `RESUME_FROM_CHECKPOINT` tới

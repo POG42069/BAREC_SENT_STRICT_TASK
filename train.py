@@ -114,6 +114,14 @@ class Config:
     AUXILIARY_7_LOSS_WEIGHT: float = 0.30
     AUXILIARY_5_LOSS_WEIGHT: float = 0.20
     AUXILIARY_3_LOSS_WEIGHT: float = 0.10
+    USE_DEV_AFFINE_CALIBRATION: bool = True
+    CALIBRATION_SCALE_MIN: float = 0.80
+    CALIBRATION_SCALE_MAX: float = 1.20
+    CALIBRATION_SCALE_STEP: float = 0.01
+    CALIBRATION_BIAS_MIN: float = -1.00
+    CALIBRATION_BIAS_MAX: float = 1.00
+    CALIBRATION_BIAS_STEP: float = 0.025
+    CALIBRATION_MIN_QWK_GAIN: float = 0.001
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
@@ -1607,6 +1615,21 @@ class EvaluationOutput:
     final_predictions: np.ndarray
     labels: Optional[np.ndarray]
     metrics: Optional[dict[str, float]]
+    calibrated_predictions: Optional[np.ndarray] = None
+    uncalibrated_metrics: Optional[dict[str, float]] = None
+
+
+@dataclass(frozen=True)
+class AffineCalibration:
+    """Dev-fitted affine transform and its accepted metric improvement."""
+
+    applied: bool
+    scale: float
+    bias: float
+    dev_qwk_before: float
+    dev_qwk_after: float
+    dev_mae_before: float
+    dev_mae_after: float
 
 
 def round_and_clip(raw_predictions: Sequence[float], config: Config) -> np.ndarray:
@@ -1639,6 +1662,159 @@ def calculate_metrics(
         "exact_accuracy": float(np.mean(final == truth)),
         "adjacent_accuracy": float(np.mean(np.abs(final - truth) <= 1)),
     }
+
+
+def inclusive_float_grid(
+    minimum: float,
+    maximum: float,
+    step: float,
+    *,
+    include: Sequence[float] = (),
+) -> np.ndarray:
+    """Build a stable inclusive float grid and force important candidates."""
+
+    if not all(math.isfinite(value) for value in (minimum, maximum, step)):
+        raise ValueError("Calibration grid values must be finite")
+    if maximum < minimum or step <= 0.0:
+        raise ValueError("Calibration grid requires maximum >= minimum and step > 0")
+    count = int(math.floor((maximum - minimum) / step + 1e-9))
+    values = minimum + step * np.arange(count + 1, dtype=np.float64)
+    if values[-1] < maximum - 1e-9:
+        values = np.append(values, maximum)
+    forced = [
+        float(value)
+        for value in include
+        if minimum <= float(value) <= maximum
+    ]
+    if forced:
+        values = np.concatenate((values, np.asarray(forced, dtype=np.float64)))
+    return np.unique(np.round(values, decimals=12))
+
+
+def fit_dev_affine_calibration(
+    labels: Sequence[float],
+    raw_predictions: Sequence[float],
+    config: Config,
+) -> AffineCalibration:
+    """Grid-search scale/bias on Dev only, with identity as the safe fallback."""
+
+    truth = np.asarray(labels, dtype=np.int64)
+    raw = np.asarray(raw_predictions, dtype=np.float64)
+    if truth.ndim != 1 or raw.ndim != 1 or len(truth) != len(raw) or len(truth) == 0:
+        raise ValueError("Dev calibration requires aligned non-empty 1D arrays")
+    if not np.isfinite(raw).all():
+        raise ValueError("Dev calibration received non-finite raw predictions")
+
+    baseline_metrics = calculate_metrics(truth, raw, config)
+    baseline_qwk = float(baseline_metrics["qwk"])
+    baseline_selection_qwk = baseline_qwk if math.isfinite(baseline_qwk) else -math.inf
+    best_scale = 1.0
+    best_bias = 0.0
+    best_qwk = baseline_selection_qwk
+    best_mae = float(baseline_metrics["mae"])
+    best_identity_distance = 0.0
+    label_values = list(range(config.MIN_LABEL, config.MAX_LABEL + 1))
+
+    scales = inclusive_float_grid(
+        config.CALIBRATION_SCALE_MIN,
+        config.CALIBRATION_SCALE_MAX,
+        config.CALIBRATION_SCALE_STEP,
+        include=(1.0,),
+    )
+    biases = inclusive_float_grid(
+        config.CALIBRATION_BIAS_MIN,
+        config.CALIBRATION_BIAS_MAX,
+        config.CALIBRATION_BIAS_STEP,
+        include=(0.0,),
+    )
+    for scale in scales:
+        scaled = float(scale) * raw
+        for bias in biases:
+            final = round_and_clip(scaled + float(bias), config)
+            qwk = float(
+                cohen_kappa_score(
+                    truth,
+                    final,
+                    weights="quadratic",
+                    labels=label_values,
+                )
+            )
+            selection_qwk = qwk if math.isfinite(qwk) else -math.inf
+            mae = float(np.mean(np.abs(final - truth)))
+            identity_distance = abs(float(scale) - 1.0) + abs(float(bias))
+            qwk_better = selection_qwk > best_qwk + 1e-12
+            qwk_tied = abs(selection_qwk - best_qwk) <= 1e-12
+            mae_better = mae < best_mae - 1e-12
+            mae_tied = abs(mae - best_mae) <= 1e-12
+            identity_better = identity_distance < best_identity_distance - 1e-12
+            if (
+                qwk_better
+                or (qwk_tied and mae_better)
+                or (qwk_tied and mae_tied and identity_better)
+            ):
+                best_scale = float(scale)
+                best_bias = float(bias)
+                best_qwk = selection_qwk
+                best_mae = mae
+                best_identity_distance = identity_distance
+
+    qwk_gain = best_qwk - baseline_selection_qwk
+    applied = (
+        math.isfinite(best_qwk)
+        and qwk_gain >= config.CALIBRATION_MIN_QWK_GAIN
+        and (
+            not math.isclose(best_scale, 1.0, abs_tol=1e-12)
+            or not math.isclose(best_bias, 0.0, abs_tol=1e-12)
+        )
+    )
+    if not applied:
+        return AffineCalibration(
+            applied=False,
+            scale=1.0,
+            bias=0.0,
+            dev_qwk_before=baseline_qwk,
+            dev_qwk_after=baseline_qwk,
+            dev_mae_before=float(baseline_metrics["mae"]),
+            dev_mae_after=float(baseline_metrics["mae"]),
+        )
+    return AffineCalibration(
+        applied=True,
+        scale=best_scale,
+        bias=best_bias,
+        dev_qwk_before=baseline_qwk,
+        dev_qwk_after=best_qwk,
+        dev_mae_before=float(baseline_metrics["mae"]),
+        dev_mae_after=best_mae,
+    )
+
+
+def apply_affine_calibration(
+    output: EvaluationOutput,
+    calibration: AffineCalibration,
+    config: Config,
+) -> EvaluationOutput:
+    """Apply fixed Dev parameters without changing stored model-raw scores."""
+
+    calibrated = (
+        calibration.scale * np.asarray(output.raw_predictions, dtype=np.float64)
+        + calibration.bias
+    )
+    final = round_and_clip(calibrated, config)
+    metrics = (
+        calculate_metrics(output.labels, calibrated, config)
+        if output.labels is not None
+        else None
+    )
+    return EvaluationOutput(
+        ids=output.ids,
+        indices=output.indices,
+        raw_predictions=output.raw_predictions,
+        final_predictions=final,
+        labels=output.labels,
+        metrics=metrics,
+        calibrated_predictions=calibrated,
+        uncalibrated_metrics=output.metrics,
+    )
 
 
 def merge_evaluation_payloads(
@@ -2390,8 +2566,10 @@ def write_diagnostics(output: EvaluationOutput, config: Config) -> Path:
     data: dict[str, Any] = {
         "Sentence ID": output.ids,
         "raw_prediction": output.raw_predictions,
-        "Prediction": output.final_predictions,
     }
+    if output.calibrated_predictions is not None:
+        data["calibrated_prediction"] = output.calibrated_predictions
+    data["Prediction"] = output.final_predictions
     if output.labels is not None:
         data["gold_label"] = output.labels.astype(np.int64)
     path = (
@@ -2684,6 +2862,65 @@ def train_select_and_predict(
     unwrap_model(model).load_state_dict(best_state, strict=True)
     distributed_barrier(context)
 
+    calibration_payload: Optional[dict[str, Any]] = None
+    if config.USE_DEV_AFFINE_CALIBRATION:
+        calibration_dev_output = evaluate_model(
+            model,
+            dev_loader,
+            len(dev_frame),
+            config,
+            context,
+            description="Dev affine calibration",
+        )
+        if context.is_main:
+            if (
+                calibration_dev_output is None
+                or calibration_dev_output.labels is None
+            ):
+                raise RuntimeError(
+                    "Labeled Dev predictions are required for affine calibration"
+                )
+            calibration = fit_dev_affine_calibration(
+                calibration_dev_output.labels,
+                calibration_dev_output.raw_predictions,
+                config,
+            )
+            calibration_payload = asdict(calibration)
+    elif context.is_main:
+        calibration_payload = asdict(
+            AffineCalibration(
+                applied=False,
+                scale=1.0,
+                bias=0.0,
+                dev_qwk_before=best_qwk,
+                dev_qwk_after=best_qwk,
+                dev_mae_before=best_mae,
+                dev_mae_after=best_mae,
+            )
+        )
+    calibration_payload = broadcast_object(calibration_payload, context)
+    if not isinstance(calibration_payload, dict):
+        raise RuntimeError("Failed to broadcast Dev affine calibration")
+    calibration = AffineCalibration(**calibration_payload)
+    if context.is_main:
+        calibration_path = (
+            config.resolve(config.OUTPUT_DIR)
+            / "logs"
+            / "dev_affine_calibration.json"
+        )
+        atomic_json_dump(calibration_payload, calibration_path)
+        LOGGER.info(
+            "Dev affine calibration: applied=%s scale=%.4f bias=%.4f "
+            "qwk=%.6f->%.6f mae=%.6f->%.6f",
+            calibration.applied,
+            calibration.scale,
+            calibration.bias,
+            calibration.dev_qwk_before,
+            calibration.dev_qwk_after,
+            calibration.dev_mae_before,
+            calibration.dev_mae_after,
+        )
+
     test_output = evaluate_model(
         model,
         test_loader,
@@ -2695,6 +2932,7 @@ def train_select_and_predict(
     if context.is_main:
         if test_output is None:
             raise RuntimeError("Rank 0 did not receive Test predictions")
+        test_output = apply_affine_calibration(test_output, calibration, config)
         expected_ids = test_frame.sort_values("_original_index")["_id"].astype(str).tolist()
         if test_output.ids != expected_ids:
             raise RuntimeError("Test predictions are not in the original ID order")
@@ -2702,7 +2940,12 @@ def train_select_and_predict(
         LOGGER.info("Test diagnostics: %s", diagnostics_path)
         if test_output.metrics is not None:
             LOGGER.info(
-                "Open-Test metrics (diagnostic only; never used for selection): %s",
+                "Open-Test uncalibrated metrics (diagnostic only): %s",
+                test_output.uncalibrated_metrics,
+            )
+            LOGGER.info(
+                "Open-Test calibrated metrics (diagnostic only; never used for "
+                "selection/calibration): %s",
                 test_output.metrics,
             )
         create_submission(test_output.ids, test_output.final_predictions, config)
@@ -2809,6 +3052,26 @@ def validate_config(config: Config) -> None:
             "Auxiliary loss weights must be finite and non-negative: "
             f"{invalid_auxiliary_weights}"
         )
+    calibration_values = {
+        "CALIBRATION_SCALE_MIN": config.CALIBRATION_SCALE_MIN,
+        "CALIBRATION_SCALE_MAX": config.CALIBRATION_SCALE_MAX,
+        "CALIBRATION_SCALE_STEP": config.CALIBRATION_SCALE_STEP,
+        "CALIBRATION_BIAS_MIN": config.CALIBRATION_BIAS_MIN,
+        "CALIBRATION_BIAS_MAX": config.CALIBRATION_BIAS_MAX,
+        "CALIBRATION_BIAS_STEP": config.CALIBRATION_BIAS_STEP,
+        "CALIBRATION_MIN_QWK_GAIN": config.CALIBRATION_MIN_QWK_GAIN,
+    }
+    if any(not math.isfinite(value) for value in calibration_values.values()):
+        raise ValueError(f"Calibration settings must be finite: {calibration_values}")
+    if (
+        config.CALIBRATION_SCALE_MIN <= 0.0
+        or config.CALIBRATION_SCALE_MAX < config.CALIBRATION_SCALE_MIN
+        or config.CALIBRATION_SCALE_STEP <= 0.0
+        or config.CALIBRATION_BIAS_MAX < config.CALIBRATION_BIAS_MIN
+        or config.CALIBRATION_BIAS_STEP <= 0.0
+        or config.CALIBRATION_MIN_QWK_GAIN < 0.0
+    ):
+        raise ValueError(f"Invalid Dev calibration settings: {calibration_values}")
     if config.PREPROCESS_NUM_WORKERS != 1:
         raise ValueError(
             "BERT D3Tok requires PREPROCESS_NUM_WORKERS=1 to avoid duplicating "
