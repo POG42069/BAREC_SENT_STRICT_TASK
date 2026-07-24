@@ -114,6 +114,13 @@ class Config:
     AUXILIARY_7_LOSS_WEIGHT: float = 0.30
     AUXILIARY_5_LOSS_WEIGHT: float = 0.20
     AUXILIARY_3_LOSS_WEIGHT: float = 0.10
+    AUXILIARY_LOSS_EPOCH_MULTIPLIERS: tuple[float, ...] = (
+        1.00,
+        0.50,
+        0.25,
+        0.00,
+        0.00,
+    )
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
@@ -2095,10 +2102,22 @@ def learning_rates(optimizer: torch.optim.Optimizer) -> tuple[float, float]:
 MULTITASK_LOSS_KEYS = ("total", "mse_19", "ce_7", "ce_5", "ce_3")
 
 
+def auxiliary_loss_multiplier(config: Config, epoch: int) -> float:
+    """Return the configured coarse-task multiplier for a zero-based epoch."""
+
+    if epoch < 0:
+        raise ValueError("Epoch cannot be negative")
+    schedule = config.AUXILIARY_LOSS_EPOCH_MULTIPLIERS
+    if not schedule:
+        raise ValueError("AUXILIARY_LOSS_EPOCH_MULTIPLIERS cannot be empty")
+    return float(schedule[min(epoch, len(schedule) - 1)])
+
+
 def calculate_multitask_losses(
     outputs: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
     config: Config,
+    auxiliary_multiplier: float,
 ) -> dict[str, torch.Tensor]:
     """Combine primary 19-level MSE with parallel coarse CE objectives."""
 
@@ -2121,9 +2140,12 @@ def calculate_multitask_losses(
     }
     losses["total"] = (
         losses["mse_19"]
-        + config.AUXILIARY_7_LOSS_WEIGHT * losses["ce_7"]
-        + config.AUXILIARY_5_LOSS_WEIGHT * losses["ce_5"]
-        + config.AUXILIARY_3_LOSS_WEIGHT * losses["ce_3"]
+        + auxiliary_multiplier
+        * (
+            config.AUXILIARY_7_LOSS_WEIGHT * losses["ce_7"]
+            + config.AUXILIARY_5_LOSS_WEIGHT * losses["ce_5"]
+            + config.AUXILIARY_3_LOSS_WEIGHT * losses["ce_3"]
+        )
     )
     return losses
 
@@ -2149,6 +2171,15 @@ def train_one_epoch(
     loss_totals = {key: 0.0 for key in MULTITASK_LOSS_KEYS}
     total_examples = 0
     start = time.perf_counter()
+    current_auxiliary_multiplier = auxiliary_loss_multiplier(config, epoch)
+    if context.is_main:
+        LOGGER.info(
+            "Epoch %d effective auxiliary lambdas: CE7=%.4f CE5=%.4f CE3=%.4f",
+            epoch + 1,
+            config.AUXILIARY_7_LOSS_WEIGHT * current_auxiliary_multiplier,
+            config.AUXILIARY_5_LOSS_WEIGHT * current_auxiliary_multiplier,
+            config.AUXILIARY_3_LOSS_WEIGHT * current_auxiliary_multiplier,
+        )
     effective_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
     progress = tqdm(
         total=effective_steps,
@@ -2172,7 +2203,12 @@ def train_one_epoch(
         with synchronization:
             with autocast_context(amp_enabled):
                 outputs = model_outputs(model, batch)
-                losses = calculate_multitask_losses(outputs, batch, config)
+                losses = calculate_multitask_losses(
+                    outputs,
+                    batch,
+                    config,
+                    current_auxiliary_multiplier,
+                )
                 raw_loss = losses["total"]
                 window_start = (
                     step // config.GRADIENT_ACCUMULATION_STEPS
@@ -2507,10 +2543,14 @@ def train_select_and_predict(
         LOGGER.info("Effective global batch size: %d", effective_batch)
         LOGGER.info("FP16 enabled: %s", amp_enabled)
         LOGGER.info(
-            "Multitask loss: MSE19 + %.2f*CE7 + %.2f*CE5 + %.2f*CE3",
+            "Initial multitask loss: MSE19 + %.2f*CE7 + %.2f*CE5 + %.2f*CE3",
             config.AUXILIARY_7_LOSS_WEIGHT,
             config.AUXILIARY_5_LOSS_WEIGHT,
             config.AUXILIARY_3_LOSS_WEIGHT,
+        )
+        LOGGER.info(
+            "Auxiliary epoch multipliers: %s",
+            config.AUXILIARY_LOSS_EPOCH_MULTIPLIERS,
         )
 
     start_epoch = 0
@@ -2610,6 +2650,19 @@ def train_select_and_predict(
                 "train_ce_7": train_losses["ce_7"],
                 "train_ce_5": train_losses["ce_5"],
                 "train_ce_3": train_losses["ce_3"],
+                "auxiliary_multiplier": auxiliary_loss_multiplier(config, epoch),
+                "lambda_7": (
+                    config.AUXILIARY_7_LOSS_WEIGHT
+                    * auxiliary_loss_multiplier(config, epoch)
+                ),
+                "lambda_5": (
+                    config.AUXILIARY_5_LOSS_WEIGHT
+                    * auxiliary_loss_multiplier(config, epoch)
+                ),
+                "lambda_3": (
+                    config.AUXILIARY_3_LOSS_WEIGHT
+                    * auxiliary_loss_multiplier(config, epoch)
+                ),
                 "dev_mse": metrics["mse"],
                 "dev_mae": metrics["mae"],
                 "dev_qwk": metrics["qwk"],
@@ -2808,6 +2861,25 @@ def validate_config(config: Config) -> None:
         raise ValueError(
             "Auxiliary loss weights must be finite and non-negative: "
             f"{invalid_auxiliary_weights}"
+        )
+    auxiliary_schedule = config.AUXILIARY_LOSS_EPOCH_MULTIPLIERS
+    if not auxiliary_schedule:
+        raise ValueError("AUXILIARY_LOSS_EPOCH_MULTIPLIERS cannot be empty")
+    if any(
+        not math.isfinite(multiplier) or multiplier < 0.0
+        for multiplier in auxiliary_schedule
+    ):
+        raise ValueError(
+            "Auxiliary epoch multipliers must be finite and non-negative: "
+            f"{auxiliary_schedule}"
+        )
+    if any(
+        later > earlier
+        for earlier, later in zip(auxiliary_schedule, auxiliary_schedule[1:])
+    ):
+        raise ValueError(
+            "Auxiliary epoch multipliers must be monotonically non-increasing: "
+            f"{auxiliary_schedule}"
         )
     if config.PREPROCESS_NUM_WORKERS != 1:
         raise ValueError(

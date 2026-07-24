@@ -212,7 +212,8 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng cho encoder/head mới |
 | Training | `NUM_EPOCHS=5`, `EARLY_STOPPING_PATIENCE=2` | Giới hạn epoch và số epoch Dev QWK không cải thiện |
-| Multitask | `AUXILIARY_7/5/3_LOSS_WEIGHT=0.30/0.20/0.10` | Trọng số CE cho ba auxiliary head |
+| Multitask | `AUXILIARY_7/5/3_LOSS_WEIGHT=0.30/0.20/0.10` | Trọng số CE khởi đầu cho ba auxiliary head |
+| Lambda decay | `AUXILIARY_LOSS_EPOCH_MULTIPLIERS=(1,0.5,0.25,0,0)` | Giảm ảnh hưởng coarse task theo epoch |
 | Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
@@ -291,12 +292,23 @@ Classification head 19 lớp của checkpoint CE không được sử dụng. Pi
 CLS từ encoder và tối ưu objective song song:
 
 ```text
-loss = MSE19 + 0.30 * CE7 + 0.20 * CE5 + 0.10 * CE3
+loss(epoch) = MSE19
+            + multiplier(epoch) * (0.30 * CE7 + 0.20 * CE5 + 0.10 * CE3)
 ```
 
 Các nhãn 7/5/3 được kiểm tra rồi suy ra theo ánh xạ chính thức từ nhãn 19.
 Regression 19 mức vẫn là đầu ra duy nhất dùng để tính QWK và tạo submission;
 raw score không được round trong loss.
+
+Lịch lambda mặc định:
+
+```text
+Epoch 1: 0.300 / 0.200 / 0.100
+Epoch 2: 0.150 / 0.100 / 0.050
+Epoch 3: 0.075 / 0.050 / 0.025
+Epoch 4: 0.000 / 0.000 / 0.000
+Epoch 5: 0.000 / 0.000 / 0.000
+```
 
 AdamW dùng parameter group riêng cho encoder/head, loại bias và LayerNorm khỏi
 weight decay, linear warmup, gradient clipping và gradient accumulation. CUDA
