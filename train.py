@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BAREC 2026 sentence-level Strict Track regression baseline.
+"""BAREC 2026 sentence-level Strict Track multitask regression baseline.
 
 The complete workflow lives in this file: validation, Arabic D3Tok
 preprocessing, distributed fine-tuning, model selection, inference, and
@@ -38,6 +38,7 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import cohen_kappa_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -100,7 +101,7 @@ class Config:
     PREPROCESS_NUM_WORKERS: int = 1
 
     # Training.
-    NUM_EPOCHS: int = 8
+    NUM_EPOCHS: int = 5
     PER_DEVICE_BATCH_SIZE: int = 8
     EVAL_BATCH_SIZE: int = 16
     GRADIENT_ACCUMULATION_STEPS: int = 2
@@ -109,7 +110,10 @@ class Config:
     WEIGHT_DECAY: float = 0.01
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
-    EARLY_STOPPING_PATIENCE: int = 3
+    EARLY_STOPPING_PATIENCE: int = 2
+    AUXILIARY_7_LOSS_WEIGHT: float = 0.30
+    AUXILIARY_5_LOSS_WEIGHT: float = 0.20
+    AUXILIARY_3_LOSS_WEIGHT: float = 0.10
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
@@ -346,6 +350,96 @@ ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
 DOCUMENT_ALIASES = ("Document", "document")
+AUXILIARY_LEVELS = (7, 5, 3)
+AUXILIARY_LABEL_COLUMNS = {
+    7: "Readability_Level_7",
+    5: "Readability_Level_5",
+    3: "Readability_Level_3",
+}
+# Inclusive upper boundaries for the official nested 19 -> 7 -> 5 -> 3
+# readability-level collapses.
+AUXILIARY_LEVEL_BOUNDARIES = {
+    7: (4, 7, 9, 11, 13, 15, 19),
+    5: (7, 11, 13, 15, 19),
+    3: (11, 13, 19),
+}
+
+
+def collapse_readability_labels(
+    labels_19: Sequence[int] | np.ndarray,
+    target_levels: int,
+) -> np.ndarray:
+    """Collapse 19-level labels into the official nested coarse label space."""
+
+    if target_levels not in AUXILIARY_LEVEL_BOUNDARIES:
+        raise ValueError(f"Unsupported auxiliary label space: {target_levels}")
+    labels = np.asarray(labels_19, dtype=np.int64)
+    if labels.ndim != 1:
+        raise ValueError("Readability labels must be a one-dimensional sequence")
+    if ((labels < 1) | (labels > 19)).any():
+        raise ValueError("Readability labels must be inside 1..19 before collapsing")
+    boundaries = np.asarray(
+        AUXILIARY_LEVEL_BOUNDARIES[target_levels],
+        dtype=np.int64,
+    )
+    return np.searchsorted(boundaries, labels, side="left") + 1
+
+
+def validate_and_attach_auxiliary_labels(
+    frame: pd.DataFrame,
+    labels_19: np.ndarray,
+    split_name: str,
+) -> None:
+    """Validate supplied coarse labels and attach deterministic internal targets."""
+
+    for target_levels in AUXILIARY_LEVELS:
+        derived = collapse_readability_labels(labels_19, target_levels)
+        source_column = AUXILIARY_LABEL_COLUMNS[target_levels]
+        if source_column in frame.columns:
+            source = frame[source_column]
+            if source.isna().any():
+                rows = frame.index[source.isna()].tolist()[:10]
+                raise ValueError(
+                    f"{split_name}: missing {target_levels}-level labels at rows {rows}"
+                )
+            numeric = pd.to_numeric(source, errors="coerce")
+            values = numeric.to_numpy(dtype=float)
+            invalid = (
+                numeric.isna().to_numpy()
+                | ~np.isfinite(values)
+                | ~np.isclose(values, np.rint(values))
+            )
+            if invalid.any():
+                rows = np.flatnonzero(invalid)[:10].tolist()
+                raise ValueError(
+                    f"{split_name}: invalid {target_levels}-level labels at rows {rows}"
+                )
+            supplied = np.rint(values).astype(np.int64)
+            mismatch = supplied != derived
+            if mismatch.any():
+                rows = np.flatnonzero(mismatch)[:10].tolist()
+                raise ValueError(
+                    f"{split_name}: {source_column} disagrees with the official "
+                    f"19-to-{target_levels} mapping at rows {rows}"
+                )
+        frame[f"_label_{target_levels}"] = derived
+
+
+def run_auxiliary_label_checks() -> None:
+    """Verify all official hierarchy boundaries before loading real data."""
+
+    labels = np.arange(1, 20, dtype=np.int64)
+    expected = {
+        7: [1, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 7, 7],
+        5: [1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 5, 5, 5],
+        3: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3],
+    }
+    for target_levels, expected_labels in expected.items():
+        actual = collapse_readability_labels(labels, target_levels)
+        if actual.tolist() != expected_labels:
+            raise AssertionError(
+                f"Incorrect official 19-to-{target_levels} label collapse"
+            )
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -445,6 +539,8 @@ def load_split(
         )
 
     frame["_label"] = np.nan
+    for target_levels in AUXILIARY_LEVELS:
+        frame[f"_label_{target_levels}"] = np.nan
     if label_column is not None:
         label_source = frame[label_column]
         if not require_label and label_source.isna().all():
@@ -471,6 +567,7 @@ def load_split(
                     f"{config.MAX_LABEL}]: {bad}"
                 )
             frame["_label"] = labels
+            validate_and_attach_auxiliary_labels(frame, labels, split_name)
 
     if document_column is not None:
         frame["_document"] = frame[document_column].map(
@@ -1038,7 +1135,7 @@ def preprocess_split_cached(
 
 
 class BARECDataset(Dataset[dict[str, Any]]):
-    """Tokenize cached D3Tok sentences lazily while retaining IDs and row indices."""
+    """Tokenize D3Tok text and retain primary/coarse multitask targets."""
 
     def __init__(self, frame: pd.DataFrame, tokenizer: Any, max_length: int) -> None:
         self.texts = frame["_processed_text"].astype(str).tolist()
@@ -1047,6 +1144,16 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.has_labels = bool(frame.attrs.get("has_labels", False))
         self.labels = (
             frame["_label"].astype(float).tolist() if self.has_labels else None
+        )
+        self.auxiliary_labels = (
+            {
+                target_levels: (
+                    frame[f"_label_{target_levels}"].astype(int).sub(1).tolist()
+                )
+                for target_levels in AUXILIARY_LEVELS
+            }
+            if self.has_labels
+            else None
         )
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -1066,6 +1173,11 @@ class BARECDataset(Dataset[dict[str, Any]]):
         item["original_index"] = self.indices[index]
         if self.labels is not None:
             item["label"] = self.labels[index]
+            assert self.auxiliary_labels is not None
+            for target_levels in AUXILIARY_LEVELS:
+                item[f"label_{target_levels}"] = self.auxiliary_labels[target_levels][
+                    index
+                ]
         return item
 
 
@@ -1081,23 +1193,38 @@ class BARECCollator:
         indices: list[int] = []
         labels: list[float] = []
         labels_present = "label" in features[0]
+        auxiliary_labels: dict[int, list[int]] = {
+            target_levels: [] for target_levels in AUXILIARY_LEVELS
+        }
+        metadata_keys = {"sample_id", "original_index", "label"} | {
+            f"label_{target_levels}" for target_levels in AUXILIARY_LEVELS
+        }
         for feature in features:
             model_features.append(
                 {
                     key: value
                     for key, value in feature.items()
-                    if key not in {"sample_id", "original_index", "label"}
+                    if key not in metadata_keys
                 }
             )
             sample_ids.append(str(feature["sample_id"]))
             indices.append(int(feature["original_index"]))
             if labels_present:
                 labels.append(float(feature["label"]))
+                for target_levels in AUXILIARY_LEVELS:
+                    auxiliary_labels[target_levels].append(
+                        int(feature[f"label_{target_levels}"])
+                    )
         batch = dict(self.tokenizer.pad(model_features, padding=True, return_tensors="pt"))
         batch["sample_ids"] = sample_ids
         batch["original_indices"] = torch.tensor(indices, dtype=torch.long)
         if labels_present:
             batch["labels"] = torch.tensor(labels, dtype=torch.float32)
+            for target_levels in AUXILIARY_LEVELS:
+                batch[f"labels_{target_levels}"] = torch.tensor(
+                    auxiliary_labels[target_levels],
+                    dtype=torch.long,
+                )
         return batch
 
 
@@ -1212,18 +1339,18 @@ def run_sampler_checks() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Regression model and optimization
+# 6. Parallel multitask model and optimization
 # ---------------------------------------------------------------------------
 
 
-class ArabicReadabilityRegressor(nn.Module):
-    """AraBERT encoder with a dropout and scalar sentence-regression head."""
+class ArabicReadabilityMultiTaskModel(nn.Module):
+    """Shared AraBERT encoder with parallel 19/7/5/3 readability heads."""
 
     def __init__(self, model_name: str, dropout: float) -> None:
         super().__init__()
-        # The checkpoint's 19-class head is intentionally replaced by a scalar
-        # regression head. Raw CLS is used, so do not instantiate an unused
-        # BERT pooler when DDP expects every trainable parameter to receive grad.
+        # The checkpoint's original 19-class CE head is replaced by a scalar
+        # 19-level regressor plus three coarse CE heads. Raw CLS is shared by
+        # every task, so no unused BERT pooler is instantiated under DDP.
         self.encoder = AutoModel.from_pretrained(
             model_name,
             add_pooling_layer=False,
@@ -1241,14 +1368,20 @@ class ArabicReadabilityRegressor(nn.Module):
         hidden_size = int(self.encoder.config.hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.regression_head = nn.Linear(hidden_size, 1)
+        self.auxiliary_heads = nn.ModuleDict(
+            {
+                str(target_levels): nn.Linear(hidden_size, target_levels)
+                for target_levels in AUXILIARY_LEVELS
+            }
+        )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         token_type_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Return one unrounded readability score per input sentence."""
+    ) -> dict[str, torch.Tensor]:
+        """Return the scalar score and parallel coarse-class logits."""
 
         encoder_arguments: dict[str, torch.Tensor] = {
             "input_ids": input_ids,
@@ -1258,14 +1391,26 @@ class ArabicReadabilityRegressor(nn.Module):
             encoder_arguments["token_type_ids"] = token_type_ids
         outputs = self.encoder(**encoder_arguments)
         cls_embedding = outputs.last_hidden_state[:, 0, :]
-        return self.regression_head(self.dropout(cls_embedding)).squeeze(-1)
+        shared_features = self.dropout(cls_embedding)
+        task_outputs = {
+            "regression": self.regression_head(shared_features).squeeze(-1)
+        }
+        task_outputs.update(
+            {
+                f"logits_{target_levels}": self.auxiliary_heads[
+                    str(target_levels)
+                ](shared_features)
+                for target_levels in AUXILIARY_LEVELS
+            }
+        )
+        return task_outputs
 
 
-def unwrap_model(model: nn.Module) -> ArabicReadabilityRegressor:
+def unwrap_model(model: nn.Module) -> ArabicReadabilityMultiTaskModel:
     """Return the underlying model whether or not DDP wraps it."""
 
     unwrapped = model.module if isinstance(model, DDP) else model
-    if not isinstance(unwrapped, ArabicReadabilityRegressor):
+    if not isinstance(unwrapped, ArabicReadabilityMultiTaskModel):
         raise TypeError(f"Unexpected model type: {type(unwrapped)}")
     return unwrapped
 
@@ -1292,7 +1437,7 @@ def create_optimizer(model: nn.Module, config: Config) -> AdamW:
     base = unwrap_model(model)
     encoder_decay, encoder_no_decay = split_decay_parameters(base.encoder)
     head_decay, head_no_decay = split_decay_parameters(
-        nn.ModuleList([base.dropout, base.regression_head])
+        nn.ModuleList([base.dropout, base.regression_head, base.auxiliary_heads])
     )
     groups = [
         {
@@ -1354,14 +1499,41 @@ def scaled_optimizer_step(
     return optimizer_stepped, scale_before, scale_after
 
 
-def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
-    """Pass only encoder tensors from a collated batch into the model."""
+def model_outputs(
+    model: nn.Module,
+    batch: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Run every parallel head and validate its batch/class dimensions."""
 
-    predictions = model(
+    outputs = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         token_type_ids=batch.get("token_type_ids"),
     )
+    if not isinstance(outputs, dict):
+        raise TypeError(f"Multitask model must return a dict, got {type(outputs)}")
+    batch_size = batch["input_ids"].shape[0]
+    expected_shapes = {
+        "regression": (batch_size,),
+        **{
+            f"logits_{target_levels}": (batch_size, target_levels)
+            for target_levels in AUXILIARY_LEVELS
+        },
+    }
+    for key, expected_shape in expected_shapes.items():
+        if key not in outputs or tuple(outputs[key].shape) != expected_shape:
+            actual = None if key not in outputs else tuple(outputs[key].shape)
+            raise AssertionError(
+                f"Multitask output {key!r} must have shape {expected_shape}, "
+                f"got {actual}"
+            )
+    return outputs
+
+
+def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
+    """Return only the primary scalar score for evaluation/submission."""
+
+    predictions = model_outputs(model, batch)["regression"]
     if predictions.ndim != 1 or predictions.shape[0] != batch["input_ids"].shape[0]:
         raise AssertionError(
             f"Regression output must have shape [batch_size], got {tuple(predictions.shape)}"
@@ -1369,14 +1541,14 @@ def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
     return predictions
 
 
-def run_regression_shape_check(
-    model: ArabicReadabilityRegressor,
+def run_multitask_shape_check(
+    model: ArabicReadabilityMultiTaskModel,
     tokenizer: Any,
     text: str,
     device: torch.device,
     max_length: int,
 ) -> None:
-    """Verify batch-one output shape and gradient connectivity before DDP."""
+    """Verify all head shapes and gradient connectivity before DDP."""
 
     encoded = tokenizer(
         text,
@@ -1389,13 +1561,22 @@ def run_regression_shape_check(
     model.train()
     model.zero_grad(set_to_none=True)
     try:
-        output = model(**encoded)
-        if output.shape != torch.Size([1]):
-            raise AssertionError(
-                "Batch-size-one regression output must have shape [1], "
-                f"got {tuple(output.shape)}"
-            )
-        output.sum().backward()
+        outputs = model(**encoded)
+        expected_shapes = {
+            "regression": torch.Size([1]),
+            **{
+                f"logits_{target_levels}": torch.Size([1, target_levels])
+                for target_levels in AUXILIARY_LEVELS
+            },
+        }
+        for key, expected_shape in expected_shapes.items():
+            if key not in outputs or outputs[key].shape != expected_shape:
+                actual = None if key not in outputs else tuple(outputs[key].shape)
+                raise AssertionError(
+                    f"Batch-size-one output {key!r} must have shape "
+                    f"{tuple(expected_shape)}, got {actual}"
+                )
+        sum(output.sum() for output in outputs.values()).backward()
         disconnected = [
             name
             for name, parameter in model.named_parameters()
@@ -1403,7 +1584,7 @@ def run_regression_shape_check(
         ]
         if disconnected:
             raise AssertionError(
-                "Trainable model parameters are disconnected from the regression "
+                "Trainable model parameters are disconnected from the multitask "
                 f"loss: {disconnected}"
             )
     finally:
@@ -1911,6 +2092,42 @@ def learning_rates(optimizer: torch.optim.Optimizer) -> tuple[float, float]:
     return encoder_lr, head_lr
 
 
+MULTITASK_LOSS_KEYS = ("total", "mse_19", "ce_7", "ce_5", "ce_3")
+
+
+def calculate_multitask_losses(
+    outputs: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    config: Config,
+) -> dict[str, torch.Tensor]:
+    """Combine primary 19-level MSE with parallel coarse CE objectives."""
+
+    required_batch_keys = {
+        "labels",
+        *(f"labels_{target_levels}" for target_levels in AUXILIARY_LEVELS),
+    }
+    missing = sorted(required_batch_keys.difference(batch))
+    if missing:
+        raise KeyError(f"Training batch is missing multitask targets: {missing}")
+    losses = {
+        "mse_19": F.mse_loss(outputs["regression"], batch["labels"]),
+        **{
+            f"ce_{target_levels}": F.cross_entropy(
+                outputs[f"logits_{target_levels}"],
+                batch[f"labels_{target_levels}"],
+            )
+            for target_levels in AUXILIARY_LEVELS
+        },
+    }
+    losses["total"] = (
+        losses["mse_19"]
+        + config.AUXILIARY_7_LOSS_WEIGHT * losses["ce_7"]
+        + config.AUXILIARY_5_LOSS_WEIGHT * losses["ce_5"]
+        + config.AUXILIARY_3_LOSS_WEIGHT * losses["ce_3"]
+    )
+    return losses
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
@@ -1923,14 +2140,13 @@ def train_one_epoch(
     global_step: int,
     *,
     max_steps: Optional[int],
-) -> tuple[float, int]:
+) -> tuple[dict[str, float], int]:
     """Train exactly one epoch on Train; Dev/Test never call this function."""
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss_function = nn.MSELoss()
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
-    total_loss = 0.0
+    loss_totals = {key: 0.0 for key in MULTITASK_LOSS_KEYS}
     total_examples = 0
     start = time.perf_counter()
     effective_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
@@ -1955,8 +2171,9 @@ def train_one_epoch(
         )
         with synchronization:
             with autocast_context(amp_enabled):
-                predictions = model_forward(model, batch)
-                raw_loss = loss_function(predictions, batch["labels"])
+                outputs = model_outputs(model, batch)
+                losses = calculate_multitask_losses(outputs, batch, config)
+                raw_loss = losses["total"]
                 window_start = (
                     step // config.GRADIENT_ACCUMULATION_STEPS
                 ) * config.GRADIENT_ACCUMULATION_STEPS
@@ -1968,7 +2185,8 @@ def train_one_epoch(
             scaler.scale(scaled_loss).backward()
 
         batch_size = int(batch["labels"].shape[0])
-        total_loss += float(raw_loss.detach().item()) * batch_size
+        for key in MULTITASK_LOSS_KEYS:
+            loss_totals[key] += float(losses[key].detach().item()) * batch_size
         total_examples += batch_size
 
         if is_update_step:
@@ -2004,7 +2222,9 @@ def train_one_epoch(
             ):
                 progress.set_postfix(
                     loss=f"{raw_loss.item():.4f}",
-                    avg=f"{total_loss / max(total_examples, 1):.4f}",
+                    avg=f"{loss_totals['total'] / max(total_examples, 1):.4f}",
+                    mse=f"{losses['mse_19'].item():.4f}",
+                    ce7=f"{losses['ce_7'].item():.4f}",
                     enc_lr=f"{encoder_lr:.2e}",
                     head_lr=f"{head_lr:.2e}",
                     accum=f"{(step % config.GRADIENT_ACCUMULATION_STEPS) + 1}/"
@@ -2015,12 +2235,18 @@ def train_one_epoch(
     progress.close()
 
     totals = torch.tensor(
-        [total_loss, float(total_examples)], dtype=torch.float64, device=context.device
+        [*(loss_totals[key] for key in MULTITASK_LOSS_KEYS), float(total_examples)],
+        dtype=torch.float64,
+        device=context.device,
     )
     if context.distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-    mean_loss = float(totals[0].item() / max(totals[1].item(), 1.0))
-    return mean_loss, global_step
+    global_examples = max(totals[-1].item(), 1.0)
+    mean_losses = {
+        key: float(totals[index].item() / global_examples)
+        for index, key in enumerate(MULTITASK_LOSS_KEYS)
+    }
+    return mean_losses, global_step
 
 
 def write_training_history(history: Sequence[Mapping[str, Any]], config: Config) -> None:
@@ -2233,9 +2459,9 @@ def train_select_and_predict(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
-    base_model = ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
+    base_model = ArabicReadabilityMultiTaskModel(config.MODEL_NAME, config.DROPOUT)
     base_model.to(context.device)
-    run_regression_shape_check(
+    run_multitask_shape_check(
         base_model,
         tokenizer,
         str(train_frame.iloc[0]["_processed_text"]),
@@ -2280,6 +2506,12 @@ def train_select_and_predict(
         LOGGER.info("Gradient accumulation steps: %d", config.GRADIENT_ACCUMULATION_STEPS)
         LOGGER.info("Effective global batch size: %d", effective_batch)
         LOGGER.info("FP16 enabled: %s", amp_enabled)
+        LOGGER.info(
+            "Multitask loss: MSE19 + %.2f*CE7 + %.2f*CE5 + %.2f*CE3",
+            config.AUXILIARY_7_LOSS_WEIGHT,
+            config.AUXILIARY_5_LOSS_WEIGHT,
+            config.AUXILIARY_3_LOSS_WEIGHT,
+        )
 
     start_epoch = 0
     global_step = 0
@@ -2322,7 +2554,7 @@ def train_select_and_predict(
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
         epoch_start = time.perf_counter()
-        train_loss, global_step = train_one_epoch(
+        train_losses, global_step = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -2373,7 +2605,11 @@ def train_select_and_predict(
             history_row = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
-                "train_loss": train_loss,
+                "train_loss": train_losses["total"],
+                "train_mse_19": train_losses["mse_19"],
+                "train_ce_7": train_losses["ce_7"],
+                "train_ce_5": train_losses["ce_5"],
+                "train_ce_3": train_losses["ce_3"],
                 "dev_mse": metrics["mse"],
                 "dev_mae": metrics["mae"],
                 "dev_qwk": metrics["qwk"],
@@ -2385,10 +2621,15 @@ def train_select_and_predict(
             history.append(history_row)
             write_training_history(history, config)
             LOGGER.info(
-                "Epoch %d | train_loss=%.6f dev_mse=%.6f dev_mae=%.6f "
+                "Epoch %d | train_loss=%.6f mse19=%.6f ce7=%.6f ce5=%.6f "
+                "ce3=%.6f dev_mse=%.6f dev_mae=%.6f "
                 "dev_qwk=%s exact=%.4f adjacent=%.4f time=%.1fs best=%s",
                 epoch + 1,
-                train_loss,
+                train_losses["total"],
+                train_losses["mse_19"],
+                train_losses["ce_7"],
+                train_losses["ce_5"],
+                train_losses["ce_3"],
                 metrics["mse"],
                 metrics["mae"],
                 f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
@@ -2474,6 +2715,7 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
     prepare_output_directories(config, context)
     if context.is_main:
         run_submission_validator_checks(config)
+        run_auxiliary_label_checks()
     distributed_barrier(context)
     train_path = config.resolve(config.TRAIN_PATH)
     dev_path = config.resolve(config.DEV_PATH)
@@ -2552,6 +2794,21 @@ def validate_config(config: Config) -> None:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
     if config.SAMPLER_ALPHA < 0.0:
         raise ValueError("SAMPLER_ALPHA cannot be negative")
+    auxiliary_weights = {
+        "AUXILIARY_7_LOSS_WEIGHT": config.AUXILIARY_7_LOSS_WEIGHT,
+        "AUXILIARY_5_LOSS_WEIGHT": config.AUXILIARY_5_LOSS_WEIGHT,
+        "AUXILIARY_3_LOSS_WEIGHT": config.AUXILIARY_3_LOSS_WEIGHT,
+    }
+    invalid_auxiliary_weights = {
+        name: value
+        for name, value in auxiliary_weights.items()
+        if not math.isfinite(value) or value < 0.0
+    }
+    if invalid_auxiliary_weights:
+        raise ValueError(
+            "Auxiliary loss weights must be finite and non-negative: "
+            f"{invalid_auxiliary_weights}"
+        )
     if config.PREPROCESS_NUM_WORKERS != 1:
         raise ValueError(
             "BERT D3Tok requires PREPROCESS_NUM_WORKERS=1 to avoid duplicating "

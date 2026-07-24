@@ -9,7 +9,8 @@ python train.py
 ```
 
 Pipeline sử dụng BERT-disambiguated D3Tok của CAMeL Tools, encoder AraBERTv2 từ
-checkpoint CE và một regression head một chiều. Khi Kaggle cung
+checkpoint CE, một regression head 19 mức và ba auxiliary classification head
+7/5/3 mức chạy song song. Khi Kaggle cung
 cấp hai GPU T4, script tự khởi chạy PyTorch DDP;
 không cần gọi `torchrun` thủ công.
 
@@ -210,6 +211,8 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng cho encoder/head mới |
+| Training | `NUM_EPOCHS=5`, `EARLY_STOPPING_PATIENCE=2` | Giới hạn epoch và số epoch Dev QWK không cải thiện |
+| Multitask | `AUXILIARY_7/5/3_LOSS_WEIGHT=0.30/0.20/0.10` | Trọng số CE cho ba auxiliary head |
 | Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
@@ -278,13 +281,22 @@ lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn
 AutoModel AraBERTv2 encoder từ checkpoint CE
 → last_hidden_state[:, 0, :] (CLS)
 → Dropout
-→ Linear(hidden_size, 1)
-→ raw readability score
+├→ Linear(hidden_size, 1) → raw readability score 19 mức
+├→ Linear(hidden_size, 7) → CE7
+├→ Linear(hidden_size, 5) → CE5
+└→ Linear(hidden_size, 3) → CE3
 ```
 
 Classification head 19 lớp của checkpoint CE không được sử dụng. Pipeline lấy
-CLS từ encoder, thêm dropout và một scalar regression head mới, rồi tối ưu MSE
-trực tiếp trên nhãn float `1..19`. Raw score không được round trong loss.
+CLS từ encoder và tối ưu objective song song:
+
+```text
+loss = MSE19 + 0.30 * CE7 + 0.20 * CE5 + 0.10 * CE3
+```
+
+Các nhãn 7/5/3 được kiểm tra rồi suy ra theo ánh xạ chính thức từ nhãn 19.
+Regression 19 mức vẫn là đầu ra duy nhất dùng để tính QWK và tạo submission;
+raw score không được round trong loss.
 
 AdamW dùng parameter group riêng cho encoder/head, loại bias và LayerNorm khỏi
 weight decay, linear warmup, gradient clipping và gradient accumulation. CUDA
