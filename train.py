@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""BAREC 2026 sentence-level Strict Track regression baseline.
+"""BAREC 2026 sentence-level Strict Track two-stage regression baseline.
 
 The complete workflow lives in this file: validation, Arabic D3Tok
-preprocessing, distributed fine-tuning, model selection, inference, and
-submission validation.  Edit :class:`Config` and run ``python train.py``.
+preprocessing, MSE training, QWK-oriented fine-tuning, model selection,
+inference, and submission validation. Edit :class:`Config` and run
+``python train.py``.
 """
 
 from __future__ import annotations
@@ -40,7 +41,9 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import cohen_kappa_score
+from torch.distributed.nn.functional import all_reduce as autograd_all_reduce
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
@@ -71,7 +74,6 @@ class Config:
     DEV_PATH: str = "data/barec-corpus-v1/dev.csv"
     TEST_PATH: str = "data/barec-corpus-v1/test.csv"
     OUTPUT_DIR: str = "outputs"
-    CHECKPOINT_DIR: str = "outputs/checkpoints"
     CACHE_DIR: str = "cache"
     SUBMISSION_DIR: str = "outputs"
 
@@ -112,6 +114,20 @@ class Config:
     LOG_EVERY_N_STEPS: int = 50
     RESUME_FROM_CHECKPOINT: Optional[str] = None
 
+    # Stage 2: QWK-oriented fine-tuning of the unchanged scalar regressor.
+    QWK_FINETUNE_ENABLED: bool = True
+    QWK_FINETUNE_NUM_EPOCHS: int = 2
+    QWK_FINETUNE_PER_DEVICE_BATCH_SIZE: int = 16
+    QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS: int = 1
+    QWK_FINETUNE_ENCODER_LR: float = 4e-6
+    QWK_FINETUNE_HEAD_LR: float = 2e-5
+    QWK_FINETUNE_WARMUP_RATIO: float = 0.05
+    QWK_FINETUNE_MSE_WEIGHT: float = 0.05
+    QWK_FINETUNE_USE_WEIGHTED_SAMPLER: bool = False
+    SOFT_QWK_TEMPERATURE: float = 1.0
+    SOFT_QWK_EPSILON: float = 1e-8
+    QWK_FINETUNE_RESUME_FROM_CHECKPOINT: Optional[str] = None
+
     # Labels and submission.
     MIN_LABEL: int = 1
     MAX_LABEL: int = 19
@@ -135,7 +151,6 @@ class Config:
         """Apply small, isolated settings while retaining the real pipeline."""
 
         self.OUTPUT_DIR = "outputs/smoke"
-        self.CHECKPOINT_DIR = "outputs/smoke/checkpoints"
         self.SUBMISSION_DIR = "outputs/smoke"
         self.CACHE_DIR = "cache/smoke"
         self.NUM_EPOCHS = 1
@@ -148,6 +163,10 @@ class Config:
         self.EARLY_STOPPING_PATIENCE = 1
         self.LOG_EVERY_N_STEPS = 1
         self.RESUME_FROM_CHECKPOINT = None
+        self.QWK_FINETUNE_NUM_EPOCHS = 1
+        self.QWK_FINETUNE_PER_DEVICE_BATCH_SIZE = 2
+        self.QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS = 1
+        self.QWK_FINETUNE_RESUME_FROM_CHECKPOINT = None
 
 
 # ---------------------------------------------------------------------------
@@ -1126,10 +1145,20 @@ def split_decay_parameters(module: nn.Module) -> tuple[list[nn.Parameter], list[
     return decay, no_decay
 
 
-def create_optimizer(model: nn.Module, config: Config) -> AdamW:
+def create_optimizer(
+    model: nn.Module,
+    config: Config,
+    *,
+    encoder_lr: Optional[float] = None,
+    head_lr: Optional[float] = None,
+) -> AdamW:
     """Create AdamW groups with independent encoder/head learning rates."""
 
     base = unwrap_model(model)
+    resolved_encoder_lr = config.ENCODER_LR if encoder_lr is None else float(encoder_lr)
+    resolved_head_lr = config.HEAD_LR if head_lr is None else float(head_lr)
+    if resolved_encoder_lr <= 0.0 or resolved_head_lr <= 0.0:
+        raise ValueError("Optimizer learning rates must be positive")
     encoder_decay, encoder_no_decay = split_decay_parameters(base.encoder)
     head_decay, head_no_decay = split_decay_parameters(
         nn.ModuleList([base.dropout, base.regression_head])
@@ -1137,25 +1166,25 @@ def create_optimizer(model: nn.Module, config: Config) -> AdamW:
     groups = [
         {
             "params": encoder_decay,
-            "lr": config.ENCODER_LR,
+            "lr": resolved_encoder_lr,
             "weight_decay": config.WEIGHT_DECAY,
             "group_name": "encoder_decay",
         },
         {
             "params": encoder_no_decay,
-            "lr": config.ENCODER_LR,
+            "lr": resolved_encoder_lr,
             "weight_decay": 0.0,
             "group_name": "encoder_no_decay",
         },
         {
             "params": head_decay,
-            "lr": config.HEAD_LR,
+            "lr": resolved_head_lr,
             "weight_decay": config.WEIGHT_DECAY,
             "group_name": "head_decay",
         },
         {
             "params": head_no_decay,
-            "lr": config.HEAD_LR,
+            "lr": resolved_head_lr,
             "weight_decay": 0.0,
             "group_name": "head_no_decay",
         },
@@ -1252,7 +1281,214 @@ def run_regression_shape_check(
 
 
 # ---------------------------------------------------------------------------
-# 7. Metrics and distributed evaluation
+# 7. Differentiable QWK fine-tuning objective
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SoftQWKOutput:
+    """Differentiable QWK loss and diagnostics for one global physical batch."""
+
+    loss: torch.Tensor
+    used_fallback: bool
+    fallback_reason: Optional[str]
+    n_samples: int
+    n_gold_classes: int
+    observed_disagreement: float
+    expected_disagreement: float
+
+
+@dataclass(frozen=True)
+class QWKFinetuneLossOutput:
+    """Stage-2 total loss with its SoftQWK and MSE components."""
+
+    total: torch.Tensor
+    soft_qwk: SoftQWKOutput
+    mse: torch.Tensor
+
+
+def _soft_qwk_targets(
+    labels: Any,
+    scores: torch.Tensor,
+    *,
+    distributed: bool,
+) -> torch.Tensor:
+    """Validate labels on every rank before any differentiable collective."""
+
+    raw = torch.as_tensor(labels, device=scores.device)
+    shape_valid = raw.shape == scores.shape
+    if shape_valid:
+        raw_float = raw.float()
+        rounded = raw_float.round()
+        values_valid = bool(
+            torch.isfinite(raw_float).all().item()
+            and torch.isclose(raw_float, rounded, rtol=0.0, atol=1e-6).all().item()
+            and (rounded >= 1).all().item()
+            and (rounded <= 19).all().item()
+        )
+    else:
+        rounded = torch.empty_like(scores, dtype=torch.float32)
+        values_valid = False
+
+    use_distributed = (
+        distributed
+        and dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+    validity = torch.tensor(
+        1 if shape_valid and values_valid else 0,
+        dtype=torch.int32,
+        device=scores.device,
+    )
+    if use_distributed:
+        dist.all_reduce(validity, op=dist.ReduceOp.MIN)
+    if int(validity.item()) != 1:
+        raise ValueError(
+            "SoftQWK labels must match score shape and contain integer values in [1, 19]"
+        )
+    return rounded.to(dtype=torch.long)
+
+
+def _soft_qwk_sufficient_statistics(
+    scores: torch.Tensor,
+    labels19: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the observed matrix and marginals from scalar regression scores."""
+
+    scores32 = scores.float()
+    centers = torch.arange(1, 20, dtype=torch.float32, device=scores.device)
+    logits = -torch.square(scores32.unsqueeze(-1) - centers) / float(temperature)
+    probabilities = torch.softmax(logits, dim=-1)
+    gold = F.one_hot(labels19 - 1, num_classes=19).to(dtype=torch.float32)
+    observed = gold.transpose(0, 1) @ probabilities
+    true_histogram = gold.sum(dim=0)
+    predicted_histogram = probabilities.sum(dim=0)
+    return observed, true_histogram, predicted_histogram
+
+
+def soft_qwk_loss(
+    scores: torch.Tensor,
+    labels: Any,
+    *,
+    temperature: float = 1.0,
+    distributed: bool = True,
+    eps: float = 1e-8,
+) -> SoftQWKOutput:
+    """Return differentiable ``1 - SoftQWK`` over the global physical batch."""
+
+    if scores.ndim != 1:
+        raise ValueError(f"scores must have shape [batch], got {tuple(scores.shape)}")
+    if scores.numel() == 0:
+        raise ValueError("scores must not be empty")
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("temperature must be finite and positive")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be finite and positive")
+
+    targets = _soft_qwk_targets(labels, scores, distributed=distributed)
+    use_distributed = (
+        distributed
+        and dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+    device_type = scores.device.type
+    autocast_device = device_type if device_type in {"cuda", "cpu", "xpu"} else "cpu"
+    with torch.autocast(device_type=autocast_device, enabled=False):
+        observed, true_histogram, predicted_histogram = (
+            _soft_qwk_sufficient_statistics(scores, targets, temperature)
+        )
+        packed = torch.cat(
+            (observed.reshape(-1), true_histogram, predicted_histogram),
+            dim=0,
+        )
+        if use_distributed:
+            packed = autograd_all_reduce(packed, op=dist.ReduceOp.SUM)
+        if not bool(torch.isfinite(packed).all().item()):
+            raise ValueError("scores produced non-finite SoftQWK statistics")
+
+        observed_count = 19 * 19
+        global_observed = packed[:observed_count].reshape(19, 19)
+        global_true = packed[observed_count : observed_count + 19]
+        global_predicted = packed[observed_count + 19 :]
+        n_samples_tensor = global_true.sum()
+        if float(n_samples_tensor.detach().item()) <= 0.0:
+            raise ValueError("SoftQWK global batch is empty")
+
+        indices = torch.arange(19, dtype=torch.float32, device=scores.device)
+        weights = torch.square(indices[:, None] - indices[None, :]) / float(18**2)
+        expected = torch.outer(global_true, global_predicted) / n_samples_tensor
+        observed_disagreement_tensor = (weights * global_observed).sum()
+        expected_disagreement_tensor = (weights * expected).sum()
+
+        n_samples = int(round(float(n_samples_tensor.detach().cpu().item())))
+        n_gold_classes = int((global_true.detach() > 0).sum().cpu().item())
+        observed_disagreement = float(
+            observed_disagreement_tensor.detach().cpu().item()
+        )
+        expected_disagreement = float(
+            expected_disagreement_tensor.detach().cpu().item()
+        )
+
+        fallback_reason: Optional[str] = None
+        if n_gold_classes <= 1:
+            fallback_reason = "single_gold_class"
+        elif (
+            not math.isfinite(expected_disagreement)
+            or expected_disagreement <= float(eps)
+        ):
+            fallback_reason = "expected_disagreement_too_small"
+
+        if fallback_reason is not None:
+            loss = scores.float().sum() * 0.0
+        else:
+            loss = observed_disagreement_tensor / expected_disagreement_tensor.clamp_min(
+                float(eps)
+            )
+
+    return SoftQWKOutput(
+        loss=loss,
+        used_fallback=fallback_reason is not None,
+        fallback_reason=fallback_reason,
+        n_samples=n_samples,
+        n_gold_classes=n_gold_classes,
+        observed_disagreement=observed_disagreement,
+        expected_disagreement=expected_disagreement,
+    )
+
+
+def qwk_finetune_loss(
+    scores: torch.Tensor,
+    labels: Any,
+    *,
+    mse_weight: float = 0.05,
+    temperature: float = 1.0,
+    distributed: bool = True,
+    eps: float = 1e-8,
+) -> QWKFinetuneLossOutput:
+    """Combine global SoftQWK with a small raw-score MSE calibration anchor."""
+
+    if not math.isfinite(mse_weight) or mse_weight < 0.0:
+        raise ValueError("mse_weight must be finite and non-negative")
+    soft_qwk = soft_qwk_loss(
+        scores,
+        labels,
+        temperature=temperature,
+        distributed=distributed,
+        eps=eps,
+    )
+    target_float = torch.as_tensor(labels, device=scores.device).float()
+    mse = F.mse_loss(scores.float(), target_float)
+    total = soft_qwk.loss + float(mse_weight) * mse
+    if not bool(torch.isfinite(total.detach()).item()):
+        raise ValueError("QWK fine-tuning loss is non-finite")
+    return QWKFinetuneLossOutput(total=total, soft_qwk=soft_qwk, mse=mse)
+
+
+# ---------------------------------------------------------------------------
+# 8. Metrics and distributed evaluation
 # ---------------------------------------------------------------------------
 
 
@@ -1298,6 +1534,39 @@ def calculate_metrics(
         "exact_accuracy": float(np.mean(final == truth)),
         "adjacent_accuracy": float(np.mean(np.abs(final - truth) <= 1)),
     }
+
+
+def is_better_checkpoint(
+    candidate_qwk: float,
+    candidate_mae: float,
+    best_qwk: float,
+    best_mae: float,
+    *,
+    has_selected_model: bool = True,
+) -> bool:
+    """Select higher finite QWK, then lower finite MAE; exact ties keep the incumbent."""
+
+    if not has_selected_model:
+        return True
+    if not math.isfinite(candidate_qwk):
+        return False
+    candidate_score = candidate_qwk if math.isfinite(candidate_qwk) else -math.inf
+    incumbent_score = best_qwk if math.isfinite(best_qwk) else -math.inf
+    if candidate_score > incumbent_score + 1e-12:
+        return True
+    qwk_tied = (
+        abs(candidate_score - incumbent_score) <= 1e-12
+        if math.isfinite(candidate_score) and math.isfinite(incumbent_score)
+        else candidate_score == incumbent_score
+    )
+    return bool(
+        qwk_tied
+        and math.isfinite(candidate_mae)
+        and (
+            not math.isfinite(best_mae)
+            or candidate_mae < best_mae - 1e-12
+        )
+    )
 
 
 def merge_evaluation_payloads(
@@ -1498,6 +1767,14 @@ def load_torch_file(path: Path, device: torch.device) -> Any:
         return torch.load(path, map_location=device)
 
 
+def stage_output_directory(config: Config, stage_name: str) -> Path:
+    """Return an isolated artifact root for one training stage."""
+
+    if stage_name not in {"stage1", "stage2"}:
+        raise ValueError(f"Unsupported stage name: {stage_name!r}")
+    return config.resolve(config.OUTPUT_DIR) / stage_name
+
+
 def cpu_model_state(model: nn.Module) -> dict[str, torch.Tensor]:
     """Copy an unwrapped model state to CPU for portable checkpoints."""
 
@@ -1555,16 +1832,25 @@ def save_best_model(
     tokenizer: Any,
     config: Config,
     metrics: Mapping[str, float],
+    *,
+    directory: Optional[Path] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     """Save the task model, tokenizer, config, and best Dev metrics."""
 
-    directory = config.resolve(config.OUTPUT_DIR) / "best_model"
+    directory = (
+        config.resolve(config.OUTPUT_DIR) / "best_model"
+        if directory is None
+        else directory
+    )
     directory.mkdir(parents=True, exist_ok=True)
     model_path = directory / "model_state.pt"
     atomic_torch_save(cpu_model_state(model), model_path)
     tokenizer.save_pretrained(directory / "tokenizer")
     atomic_json_dump(asdict(config), directory / "training_config.json")
     atomic_json_dump(dict(metrics), directory / "metrics.json")
+    if metadata is not None:
+        atomic_json_dump(dict(metadata), directory / "metadata.json")
     return model_path
 
 
@@ -1582,6 +1868,8 @@ def save_training_checkpoint(
     bad_epochs: int,
     config: Config,
     rng_states: Sequence[Mapping[str, Any]],
+    stage_name: str = "stage1",
+    extra_state: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Save all states needed to resume training and model selection."""
 
@@ -1597,7 +1885,10 @@ def save_training_checkpoint(
         "bad_epochs": bad_epochs,
         "config": asdict(config),
         "rng_states": list(rng_states),
+        "stage_name": stage_name,
     }
+    if extra_state is not None:
+        payload.update(dict(extra_state))
     atomic_torch_save(payload, path)
 
 
@@ -1608,10 +1899,18 @@ def resume_training(
     scheduler: Any,
     scaler: Any,
     context: DistributedContext,
+    *,
+    expected_stage: str = "stage1",
 ) -> tuple[int, int, float, float, int]:
     """Restore a full training checkpoint and return selection state."""
 
     checkpoint = load_torch_file(checkpoint_path, context.device)
+    checkpoint_stage = checkpoint.get("stage_name")
+    if checkpoint_stage not in {None, expected_stage}:
+        raise ValueError(
+            f"Checkpoint stage mismatch: expected {expected_stage!r}, "
+            f"got {checkpoint_stage!r}"
+        )
     unwrap_model(model).load_state_dict(checkpoint["model_state"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -1642,6 +1941,9 @@ def make_data_loaders(
     tokenizer: Any,
     config: Config,
     context: DistributedContext,
+    *,
+    weighted_sampling: Optional[bool] = None,
+    per_device_batch_size: Optional[int] = None,
 ) -> tuple[
     DataLoader[Any],
     DataLoader[Any],
@@ -1654,8 +1956,20 @@ def make_data_loaders(
     dev_dataset = BARECDataset(dev_frame, tokenizer, config.MAX_LENGTH)
     test_dataset = BARECDataset(test_frame, tokenizer, config.MAX_LENGTH)
     collator = BARECCollator(tokenizer)
+    use_weighted_sampling = (
+        config.USE_WEIGHTED_SAMPLER
+        if weighted_sampling is None
+        else bool(weighted_sampling)
+    )
+    train_batch_size = (
+        config.PER_DEVICE_BATCH_SIZE
+        if per_device_batch_size is None
+        else int(per_device_batch_size)
+    )
+    if train_batch_size <= 0:
+        raise ValueError("Train per-device batch size must be positive")
 
-    if config.USE_WEIGHTED_SAMPLER:
+    if use_weighted_sampling:
         weights, class_counts, class_weights = sample_weights_from_labels(
             train_frame["_label"].astype(int).tolist(), config
         )
@@ -1709,7 +2023,7 @@ def make_data_loaders(
     }
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.PER_DEVICE_BATCH_SIZE,
+        batch_size=train_batch_size,
         sampler=train_sampler,
         drop_last=True,
         **common,
@@ -1733,6 +2047,17 @@ def make_data_loaders(
             "Train DataLoader has zero batches. Reduce PER_DEVICE_BATCH_SIZE or world size."
         )
     return train_loader, dev_loader, test_loader, train_sampler
+
+
+def shutdown_data_loader_workers(loader: DataLoader[Any]) -> None:
+    """Release persistent workers before constructing another stage's loaders."""
+
+    iterator = getattr(loader, "_iterator", None)
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        shutdown()
+    if hasattr(loader, "_iterator"):
+        loader._iterator = None  # type: ignore[attr-defined]
 
 
 def learning_rates(optimizer: torch.optim.Optimizer) -> tuple[float, float]:
@@ -1863,10 +2188,152 @@ def train_one_epoch(
     return mean_loss, global_step
 
 
-def write_training_history(history: Sequence[Mapping[str, Any]], config: Config) -> None:
+def train_qwk_one_epoch(
+    model: nn.Module,
+    loader: DataLoader[Any],
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any,
+    config: Config,
+    context: DistributedContext,
+    epoch: int,
+    global_step: int,
+    *,
+    max_steps: Optional[int],
+) -> tuple[dict[str, float], int]:
+    """Fine-tune one epoch with global SoftQWK plus a small raw-score MSE anchor."""
+
+    if config.QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS != 1:
+        raise ValueError(
+            "QWK fine-tuning requires gradient accumulation exactly 1 because "
+            "SoftQWK is a non-additive global-batch ratio"
+        )
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    amp_enabled = config.USE_FP16 and context.device.type == "cuda"
+    total_loss = 0.0
+    total_soft_qwk = 0.0
+    total_mse = 0.0
+    total_examples = 0
+    fallback_count = 0
+    fallback_reasons: dict[str, int] = {}
+    start = time.perf_counter()
+    effective_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
+    progress = tqdm(
+        total=effective_steps,
+        desc=f"Stage 2 Epoch {epoch + 1}/{config.QWK_FINETUNE_NUM_EPOCHS}",
+        disable=not context.is_main,
+    )
+
+    for step, batch in enumerate(loader):
+        if step >= effective_steps:
+            break
+        batch = move_model_batch(batch, context.device)
+        with autocast_context(amp_enabled):
+            predictions = model_forward(model, batch)
+        loss_output = qwk_finetune_loss(
+            predictions,
+            batch["labels"],
+            mse_weight=config.QWK_FINETUNE_MSE_WEIGHT,
+            temperature=config.SOFT_QWK_TEMPERATURE,
+            distributed=context.distributed,
+            eps=config.SOFT_QWK_EPSILON,
+        )
+        scaler.scale(loss_output.total).backward()
+
+        batch_size = int(batch["labels"].shape[0])
+        total_loss += float(loss_output.total.detach().item()) * batch_size
+        total_soft_qwk += float(loss_output.soft_qwk.loss.detach().item()) * batch_size
+        total_mse += float(loss_output.mse.detach().item()) * batch_size
+        total_examples += batch_size
+        if loss_output.soft_qwk.used_fallback:
+            fallback_count += 1
+            reason = loss_output.soft_qwk.fallback_reason or "unknown"
+            fallback_reasons[reason] = fallback_reasons.get(reason, 0) + 1
+
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
+        optimizer_stepped, scale_before, scale_after = scaled_optimizer_step(
+            scaler, optimizer
+        )
+        if optimizer_stepped:
+            scheduler.step()
+            global_step += 1
+        elif context.is_main:
+            LOGGER.warning(
+                "Stage 2 AMP overflow: optimizer and scheduler update skipped; "
+                "GradScaler %.0f -> %.0f.",
+                scale_before,
+                scale_after,
+            )
+        optimizer.zero_grad(set_to_none=True)
+
+        if context.is_main:
+            encoder_lr, head_lr = learning_rates(optimizer)
+            elapsed = time.perf_counter() - start
+            memory = "cpu"
+            if context.device.type == "cuda":
+                allocated = torch.cuda.memory_allocated(context.device) / (1024**3)
+                reserved = torch.cuda.memory_reserved(context.device) / (1024**3)
+                memory = f"{allocated:.2f}/{reserved:.2f}GiB"
+            progress.update(1)
+            if (
+                (step + 1) % config.LOG_EVERY_N_STEPS == 0
+                or step + 1 == effective_steps
+            ):
+                progress.set_postfix(
+                    loss=f"{loss_output.total.item():.4f}",
+                    soft=f"{loss_output.soft_qwk.loss.item():.4f}",
+                    mse=f"{loss_output.mse.item():.4f}",
+                    enc_lr=f"{encoder_lr:.2e}",
+                    head_lr=f"{head_lr:.2e}",
+                    fallback=fallback_count,
+                    elapsed=f"{elapsed:.0f}s",
+                    mem=memory,
+                )
+    progress.close()
+
+    totals = torch.tensor(
+        [
+            total_loss,
+            total_soft_qwk,
+            total_mse,
+            float(total_examples),
+        ],
+        dtype=torch.float64,
+        device=context.device,
+    )
+    if context.distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    denominator = max(totals[3].item(), 1.0)
+    metrics = {
+        "loss": float(totals[0].item() / denominator),
+        "soft_qwk_loss": float(totals[1].item() / denominator),
+        "mse": float(totals[2].item() / denominator),
+        "fallback_batches": float(fallback_count),
+    }
+    if context.is_main and fallback_count:
+        LOGGER.warning(
+            "Stage 2 SoftQWK fallback used for %d batch(es): %s",
+            fallback_count,
+            fallback_reasons,
+        )
+    return metrics, global_step
+
+
+def write_training_history(
+    history: Sequence[Mapping[str, Any]],
+    config: Config,
+    *,
+    path: Optional[Path] = None,
+) -> None:
     """Persist one row of real metrics per completed epoch."""
 
-    path = config.resolve(config.OUTPUT_DIR) / "logs" / "training_history.csv"
+    path = (
+        config.resolve(config.OUTPUT_DIR) / "logs" / "training_history.csv"
+        if path is None
+        else path
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(history).to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
 
@@ -2029,7 +2496,6 @@ def prepare_output_directories(config: Config, context: DistributedContext) -> N
     if context.is_main:
         for path in (
             config.resolve(config.OUTPUT_DIR),
-            config.resolve(config.CHECKPOINT_DIR),
             config.resolve(config.CACHE_DIR),
             config.resolve(config.SUBMISSION_DIR),
         ):
@@ -2053,6 +2519,686 @@ def write_preprocessing_report(
     )
 
 
+@dataclass(frozen=True)
+class StageResult:
+    """Best checkpoint and Dev metrics produced or selected by one stage."""
+
+    name: str
+    best_model_path: Path
+    metrics: dict[str, float]
+    improved_over_initial: bool = False
+
+
+def load_model_state_strict(
+    model: nn.Module,
+    path: Path,
+    context: DistributedContext,
+) -> None:
+    """Strict-load one portable scalar-regressor state on every rank."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Model checkpoint does not exist: {path}")
+    state = load_torch_file(path, context.device)
+    unwrap_model(model).load_state_dict(state, strict=True)
+    distributed_barrier(context)
+
+
+def evaluate_dev_metrics(
+    model: nn.Module,
+    dev_loader: DataLoader[Any],
+    dev_size: int,
+    config: Config,
+    context: DistributedContext,
+    *,
+    description: str,
+) -> dict[str, float]:
+    """Evaluate Dev and broadcast rank-0 metrics to every training rank."""
+
+    output = evaluate_model(
+        model,
+        dev_loader,
+        dev_size,
+        config,
+        context,
+        description=description,
+    )
+    metrics: Optional[dict[str, float]] = None
+    if context.is_main:
+        if output is None or output.metrics is None:
+            raise RuntimeError("Dev labels/metrics are required for model selection")
+        metrics = {name: float(value) for name, value in output.metrics.items()}
+    metrics = broadcast_object(metrics, context)
+    if not isinstance(metrics, dict):
+        raise RuntimeError("Failed to broadcast Dev metrics")
+    return {str(name): float(value) for name, value in metrics.items()}
+
+
+def run_mse_stage(
+    model: nn.Module,
+    tokenizer: Any,
+    train_loader: DataLoader[Any],
+    dev_loader: DataLoader[Any],
+    train_sampler: Sampler[int],
+    dev_size: int,
+    config: Config,
+    context: DistributedContext,
+    *,
+    smoke_test: bool,
+) -> StageResult:
+    """Run the unchanged MSE baseline as Stage 1 and reload its best model."""
+
+    stage_directory = stage_output_directory(config, "stage1")
+    best_directory = stage_directory / "best_model"
+    best_model_path = best_directory / "model_state.pt"
+    checkpoint_path = stage_directory / "checkpoints" / "last.pt"
+    history_path = stage_directory / "logs" / "training_history.csv"
+
+    optimizer = create_optimizer(model, config)
+    epoch_loader_steps = len(train_loader)
+    if smoke_test:
+        epoch_loader_steps = min(epoch_loader_steps, config.SMOKE_MAX_TRAIN_STEPS)
+    updates_per_epoch = math.ceil(
+        epoch_loader_steps / config.GRADIENT_ACCUMULATION_STEPS
+    )
+    total_updates = max(1, updates_per_epoch * config.NUM_EPOCHS)
+    warmup_steps = int(total_updates * config.WARMUP_RATIO)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_updates,
+    )
+    amp_enabled = config.USE_FP16 and context.device.type == "cuda"
+    scaler = make_grad_scaler(amp_enabled)
+
+    if context.is_main:
+        effective_batch = (
+            config.PER_DEVICE_BATCH_SIZE
+            * context.world_size
+            * config.GRADIENT_ACCUMULATION_STEPS
+        )
+        LOGGER.info("Stage 1 objective: MSE")
+        LOGGER.info("Stage 1 weighted sampler alpha: %s", config.SAMPLER_ALPHA)
+        LOGGER.info("Stage 1 per-device batch size: %d", config.PER_DEVICE_BATCH_SIZE)
+        LOGGER.info("DDP world size / GPUs used: %d", context.world_size)
+        LOGGER.info(
+            "Stage 1 gradient accumulation steps: %d",
+            config.GRADIENT_ACCUMULATION_STEPS,
+        )
+        LOGGER.info("Stage 1 effective global batch size: %d", effective_batch)
+        LOGGER.info("FP16 enabled: %s", amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    best_qwk = -math.inf
+    best_mae = math.inf
+    bad_epochs = 0
+    if config.RESUME_FROM_CHECKPOINT:
+        resume_path = config.resolve(config.RESUME_FROM_CHECKPOINT)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Stage 1 resume checkpoint does not exist: {resume_path}")
+        if not best_model_path.is_file():
+            raise FileNotFoundError(
+                "Stage 1 resume requires its matching best model at "
+                f"{best_model_path}. Preserve the complete stage1 directory."
+            )
+        start_epoch, global_step, best_qwk, best_mae, bad_epochs = resume_training(
+            resume_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            context,
+            expected_stage="stage1",
+        )
+
+    history: list[dict[str, Any]] = []
+    if context.is_main and config.RESUME_FROM_CHECKPOINT and history_path.is_file():
+        history = pd.read_csv(history_path).to_dict(orient="records")
+    has_selected_model = bool(
+        config.RESUME_FROM_CHECKPOINT and best_model_path.is_file()
+    )
+    epoch_range: Iterable[int] = range(start_epoch, config.NUM_EPOCHS)
+    if config.RESUME_FROM_CHECKPOINT and bad_epochs >= config.EARLY_STOPPING_PATIENCE:
+        if context.is_main:
+            LOGGER.info(
+                "Stage 1 resume checkpoint had already reached early stopping; "
+                "using its best model."
+            )
+        epoch_range = ()
+
+    for epoch in epoch_range:
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
+        epoch_start = time.perf_counter()
+        train_loss, global_step = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            config,
+            context,
+            epoch,
+            global_step,
+            max_steps=config.SMOKE_MAX_TRAIN_STEPS if smoke_test else None,
+        )
+        metrics = evaluate_dev_metrics(
+            model,
+            dev_loader,
+            dev_size,
+            config,
+            context,
+            description="Stage 1 Dev",
+        )
+
+        decision: Optional[dict[str, Any]] = None
+        if context.is_main:
+            improved = is_better_checkpoint(
+                metrics["qwk"],
+                metrics["mae"],
+                best_qwk,
+                best_mae,
+                has_selected_model=has_selected_model,
+            )
+            if improved:
+                best_qwk = metrics["qwk"] if math.isfinite(metrics["qwk"]) else -math.inf
+                best_mae = metrics["mae"]
+                bad_epochs = 0
+                save_best_model(
+                    model,
+                    tokenizer,
+                    config,
+                    metrics,
+                    directory=best_directory,
+                    metadata={"stage": "stage1", "objective": "mse"},
+                )
+                has_selected_model = True
+            else:
+                bad_epochs += 1
+            elapsed = time.perf_counter() - epoch_start
+            history.append(
+                {
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "train_mse": train_loss,
+                    "dev_mse": metrics["mse"],
+                    "dev_mae": metrics["mae"],
+                    "dev_qwk": metrics["qwk"],
+                    "dev_exact_accuracy": metrics["exact_accuracy"],
+                    "dev_adjacent_accuracy": metrics["adjacent_accuracy"],
+                    "epoch_seconds": elapsed,
+                    "is_best": improved,
+                }
+            )
+            write_training_history(history, config, path=history_path)
+            LOGGER.info(
+                "Stage 1 epoch %d | train_mse=%.6f dev_mse=%.6f "
+                "dev_mae=%.6f dev_qwk=%s exact=%.4f adjacent=%.4f "
+                "time=%.1fs best=%s",
+                epoch + 1,
+                train_loss,
+                metrics["mse"],
+                metrics["mae"],
+                f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
+                metrics["exact_accuracy"],
+                metrics["adjacent_accuracy"],
+                elapsed,
+                improved,
+            )
+            decision = {
+                "best_qwk": best_qwk,
+                "best_mae": best_mae,
+                "bad_epochs": bad_epochs,
+                "has_selected_model": has_selected_model,
+                "stop": bad_epochs >= config.EARLY_STOPPING_PATIENCE,
+            }
+
+        decision = broadcast_object(decision, context)
+        if not isinstance(decision, dict):
+            raise RuntimeError("Failed to broadcast Stage 1 selection decision")
+        best_qwk = float(decision["best_qwk"])
+        best_mae = float(decision["best_mae"])
+        bad_epochs = int(decision["bad_epochs"])
+        has_selected_model = bool(decision["has_selected_model"])
+        rng_states = gather_rng_states(context)
+        if context.is_main:
+            save_training_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_qwk=best_qwk,
+                best_mae=best_mae,
+                bad_epochs=bad_epochs,
+                config=config,
+                rng_states=rng_states,
+                stage_name="stage1",
+            )
+        distributed_barrier(context)
+        if bool(decision["stop"]):
+            if context.is_main:
+                LOGGER.info(
+                    "Stage 1 early stopping after %d non-improving epoch(s).",
+                    bad_epochs,
+                )
+            break
+
+    distributed_barrier(context)
+    if not has_selected_model or not best_model_path.is_file():
+        raise RuntimeError(
+            "Stage 1 produced no best model. Ensure NUM_EPOCHS permits a completed epoch."
+        )
+    load_model_state_strict(model, best_model_path, context)
+    best_metrics = evaluate_dev_metrics(
+        model,
+        dev_loader,
+        dev_size,
+        config,
+        context,
+        description="Stage 1 best Dev",
+    )
+    return StageResult("stage1", best_model_path, best_metrics)
+
+
+QWK_RESUME_CONFIG_FIELDS = (
+    "MODEL_NAME",
+    "MAX_LENGTH",
+    "DROPOUT",
+    "MIN_LABEL",
+    "MAX_LABEL",
+    "SEED",
+    "WEIGHT_DECAY",
+    "MAX_GRAD_NORM",
+    "QWK_FINETUNE_NUM_EPOCHS",
+    "QWK_FINETUNE_PER_DEVICE_BATCH_SIZE",
+    "QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS",
+    "QWK_FINETUNE_ENCODER_LR",
+    "QWK_FINETUNE_HEAD_LR",
+    "QWK_FINETUNE_WARMUP_RATIO",
+    "QWK_FINETUNE_MSE_WEIGHT",
+    "QWK_FINETUNE_USE_WEIGHTED_SAMPLER",
+    "SOFT_QWK_TEMPERATURE",
+    "SOFT_QWK_EPSILON",
+)
+
+
+def validate_qwk_resume_config(
+    checkpoint_config: Mapping[str, Any],
+    config: Config,
+) -> None:
+    """Reject Stage-2 resume under a materially different training definition."""
+
+    current = asdict(config)
+    mismatches = {
+        field: {
+            "checkpoint": checkpoint_config.get(field),
+            "current": current.get(field),
+        }
+        for field in QWK_RESUME_CONFIG_FIELDS
+        if checkpoint_config.get(field) != current.get(field)
+    }
+    if mismatches:
+        raise ValueError(f"Stage 2 resume config mismatch: {mismatches}")
+
+
+def resume_qwk_finetune(
+    checkpoint_path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any,
+    config: Config,
+    context: DistributedContext,
+) -> tuple[int, int, float, float, str, float, float]:
+    """Restore Stage-2 state while preserving its Stage-1 fallback candidate."""
+
+    checkpoint = load_torch_file(checkpoint_path, context.device)
+    if checkpoint.get("stage_name") != "stage2":
+        raise ValueError(
+            "QWK fine-tuning resume requires a checkpoint tagged as stage2"
+        )
+    checkpoint_world_size = int(checkpoint.get("world_size", context.world_size))
+    if checkpoint_world_size != context.world_size:
+        raise ValueError(
+            "Stage 2 resume requires the same DDP world size because SoftQWK "
+            f"uses the global physical batch: checkpoint={checkpoint_world_size}, "
+            f"current={context.world_size}"
+        )
+    validate_qwk_resume_config(checkpoint.get("config", {}), config)
+    unwrap_model(model).load_state_dict(checkpoint["model_state"], strict=True)
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    scheduler.load_state_dict(checkpoint["scheduler_state"])
+    scaler_state = checkpoint.get("scaler_state")
+    if scaler_state:
+        scaler.load_state_dict(scaler_state)
+    restore_rng_state(checkpoint.get("rng_states", []), context.rank)
+    best_source = str(checkpoint.get("best_source", "stage1"))
+    if best_source not in {"stage1", "stage2"}:
+        raise ValueError(f"Invalid Stage 2 best source in checkpoint: {best_source!r}")
+    start_epoch = int(checkpoint["epoch"]) + 1
+    LOGGER.info(
+        "Resumed Stage 2 from %s at epoch %d",
+        checkpoint_path,
+        start_epoch + 1,
+    )
+    return (
+        start_epoch,
+        int(checkpoint.get("global_step", 0)),
+        float(checkpoint.get("best_qwk", -math.inf)),
+        float(checkpoint.get("best_mae", math.inf)),
+        best_source,
+        float(checkpoint["initial_qwk"]),
+        float(checkpoint["initial_mae"]),
+    )
+
+
+def run_qwk_finetune_stage(
+    model: nn.Module,
+    tokenizer: Any,
+    train_frame: pd.DataFrame,
+    dev_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    stage1_result: StageResult,
+    config: Config,
+    context: DistributedContext,
+    *,
+    smoke_test: bool,
+) -> StageResult:
+    """Fine-tune the unchanged scalar model with SoftQWK + a small MSE anchor."""
+
+    train_loader, dev_loader, _, train_sampler = make_data_loaders(
+        train_frame,
+        dev_frame,
+        test_frame,
+        tokenizer,
+        config,
+        context,
+        weighted_sampling=config.QWK_FINETUNE_USE_WEIGHTED_SAMPLER,
+        per_device_batch_size=config.QWK_FINETUNE_PER_DEVICE_BATCH_SIZE,
+    )
+    stage_directory = stage_output_directory(config, "stage2")
+    best_directory = stage_directory / "best_model"
+    best_model_path = best_directory / "model_state.pt"
+    checkpoint_path = stage_directory / "checkpoints" / "last.pt"
+    history_path = stage_directory / "logs" / "training_history.csv"
+
+    optimizer = create_optimizer(
+        model,
+        config,
+        encoder_lr=config.QWK_FINETUNE_ENCODER_LR,
+        head_lr=config.QWK_FINETUNE_HEAD_LR,
+    )
+    if optimizer.state:
+        raise AssertionError("Fresh Stage 2 optimizer unexpectedly contains state")
+    epoch_loader_steps = len(train_loader)
+    if smoke_test:
+        epoch_loader_steps = min(epoch_loader_steps, config.SMOKE_MAX_TRAIN_STEPS)
+    updates_per_epoch = epoch_loader_steps
+    total_updates = max(
+        1,
+        updates_per_epoch * config.QWK_FINETUNE_NUM_EPOCHS,
+    )
+    warmup_steps = int(total_updates * config.QWK_FINETUNE_WARMUP_RATIO)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_updates,
+    )
+    amp_enabled = config.USE_FP16 and context.device.type == "cuda"
+    scaler = make_grad_scaler(amp_enabled)
+
+    initial_qwk = float(stage1_result.metrics["qwk"])
+    initial_mae = float(stage1_result.metrics["mae"])
+    start_epoch = 0
+    global_step = 0
+    best_qwk = initial_qwk if math.isfinite(initial_qwk) else -math.inf
+    best_mae = initial_mae
+    best_source = "stage1"
+    if config.QWK_FINETUNE_RESUME_FROM_CHECKPOINT:
+        resume_path = config.resolve(config.QWK_FINETUNE_RESUME_FROM_CHECKPOINT)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Stage 2 resume checkpoint does not exist: {resume_path}")
+        (
+            start_epoch,
+            global_step,
+            best_qwk,
+            best_mae,
+            best_source,
+            saved_initial_qwk,
+            saved_initial_mae,
+        ) = resume_qwk_finetune(
+            resume_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            config,
+            context,
+        )
+        qwk_matches = (
+            (not math.isfinite(saved_initial_qwk) and not math.isfinite(initial_qwk))
+            or math.isclose(
+                saved_initial_qwk,
+                initial_qwk,
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            )
+        )
+        mae_matches = math.isclose(
+            saved_initial_mae,
+            initial_mae,
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        )
+        if not qwk_matches or not mae_matches:
+            raise ValueError(
+                "Stage 1 fallback metrics differ from the Stage 2 resume checkpoint"
+            )
+        if best_source == "stage2" and not best_model_path.is_file():
+            raise FileNotFoundError(
+                "Stage 2 resume selected a Stage-2 best model, but it is missing at "
+                f"{best_model_path}"
+            )
+
+    history: list[dict[str, Any]] = []
+    if (
+        context.is_main
+        and config.QWK_FINETUNE_RESUME_FROM_CHECKPOINT
+        and history_path.is_file()
+    ):
+        history = pd.read_csv(history_path).to_dict(orient="records")
+    if not config.QWK_FINETUNE_RESUME_FROM_CHECKPOINT:
+        if context.is_main:
+            save_best_model(
+                model,
+                tokenizer,
+                config,
+                stage1_result.metrics,
+                directory=best_directory,
+                metadata={
+                    "stage": "stage2",
+                    "candidate_source": "stage1",
+                    "objective": "soft_qwk_plus_mse",
+                    "mse_weight": config.QWK_FINETUNE_MSE_WEIGHT,
+                },
+            )
+        distributed_barrier(context)
+
+    if context.is_main:
+        effective_batch = (
+            config.QWK_FINETUNE_PER_DEVICE_BATCH_SIZE * context.world_size
+        )
+        LOGGER.info(
+            "Stage 2 objective: SoftQWK + %.4f * MSE",
+            config.QWK_FINETUNE_MSE_WEIGHT,
+        )
+        LOGGER.info(
+            "Stage 2 sampler: %s",
+            "weighted" if config.QWK_FINETUNE_USE_WEIGHTED_SAMPLER else "OFF",
+        )
+        LOGGER.info(
+            "Stage 2 per-device/global physical batch: %d/%d",
+            config.QWK_FINETUNE_PER_DEVICE_BATCH_SIZE,
+            effective_batch,
+        )
+        LOGGER.info(
+            "Stage 2 gradient accumulation steps: %d",
+            config.QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS,
+        )
+        LOGGER.info(
+            "Stage 2 initial candidate | Dev QWK=%s MAE=%.6f",
+            f"{initial_qwk:.6f}" if math.isfinite(initial_qwk) else "nan",
+            initial_mae,
+        )
+
+    for epoch in range(start_epoch, config.QWK_FINETUNE_NUM_EPOCHS):
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
+        epoch_start = time.perf_counter()
+        train_metrics, global_step = train_qwk_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            config,
+            context,
+            epoch,
+            global_step,
+            max_steps=config.SMOKE_MAX_TRAIN_STEPS if smoke_test else None,
+        )
+        metrics = evaluate_dev_metrics(
+            model,
+            dev_loader,
+            len(dev_frame),
+            config,
+            context,
+            description="Stage 2 Dev",
+        )
+
+        decision: Optional[dict[str, Any]] = None
+        if context.is_main:
+            improved = is_better_checkpoint(
+                metrics["qwk"],
+                metrics["mae"],
+                best_qwk,
+                best_mae,
+                has_selected_model=True,
+            )
+            if improved:
+                best_qwk = metrics["qwk"] if math.isfinite(metrics["qwk"]) else -math.inf
+                best_mae = metrics["mae"]
+                best_source = "stage2"
+                save_best_model(
+                    model,
+                    tokenizer,
+                    config,
+                    metrics,
+                    directory=best_directory,
+                    metadata={
+                        "stage": "stage2",
+                        "objective": "soft_qwk_plus_mse",
+                        "mse_weight": config.QWK_FINETUNE_MSE_WEIGHT,
+                    },
+                )
+            elapsed = time.perf_counter() - epoch_start
+            history.append(
+                {
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "train_loss": train_metrics["loss"],
+                    "train_soft_qwk_loss": train_metrics["soft_qwk_loss"],
+                    "train_mse": train_metrics["mse"],
+                    "soft_qwk_fallback_batches": int(
+                        train_metrics["fallback_batches"]
+                    ),
+                    "dev_mse": metrics["mse"],
+                    "dev_mae": metrics["mae"],
+                    "dev_qwk": metrics["qwk"],
+                    "dev_exact_accuracy": metrics["exact_accuracy"],
+                    "dev_adjacent_accuracy": metrics["adjacent_accuracy"],
+                    "epoch_seconds": elapsed,
+                    "is_best": improved,
+                }
+            )
+            write_training_history(history, config, path=history_path)
+            LOGGER.info(
+                "Stage 2 epoch %d | loss=%.6f soft_qwk_loss=%.6f "
+                "mse=%.6f fallback=%d dev_mse=%.6f dev_mae=%.6f "
+                "dev_qwk=%s time=%.1fs best=%s",
+                epoch + 1,
+                train_metrics["loss"],
+                train_metrics["soft_qwk_loss"],
+                train_metrics["mse"],
+                int(train_metrics["fallback_batches"]),
+                metrics["mse"],
+                metrics["mae"],
+                f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
+                elapsed,
+                improved,
+            )
+            decision = {
+                "best_qwk": best_qwk,
+                "best_mae": best_mae,
+                "best_source": best_source,
+            }
+
+        decision = broadcast_object(decision, context)
+        if not isinstance(decision, dict):
+            raise RuntimeError("Failed to broadcast Stage 2 selection decision")
+        best_qwk = float(decision["best_qwk"])
+        best_mae = float(decision["best_mae"])
+        best_source = str(decision["best_source"])
+        rng_states = gather_rng_states(context)
+        if context.is_main:
+            save_training_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_qwk=best_qwk,
+                best_mae=best_mae,
+                bad_epochs=0,
+                config=config,
+                rng_states=rng_states,
+                stage_name="stage2",
+                extra_state={
+                    "best_source": best_source,
+                    "initial_qwk": initial_qwk,
+                    "initial_mae": initial_mae,
+                    "world_size": context.world_size,
+                },
+            )
+        distributed_barrier(context)
+
+    selected_path = (
+        best_model_path if best_source == "stage2" else stage1_result.best_model_path
+    )
+    load_model_state_strict(model, selected_path, context)
+    selected_metrics = evaluate_dev_metrics(
+        model,
+        dev_loader,
+        len(dev_frame),
+        config,
+        context,
+        description="Selected model Dev",
+    )
+    shutdown_data_loader_workers(train_loader)
+    shutdown_data_loader_workers(dev_loader)
+    return StageResult(
+        best_source,
+        selected_path,
+        selected_metrics,
+        improved_over_initial=best_source == "stage2",
+    )
+
+
 def train_select_and_predict(
     train_frame: pd.DataFrame,
     dev_frame: pd.DataFrame,
@@ -2062,7 +3208,7 @@ def train_select_and_predict(
     *,
     smoke_test: bool,
 ) -> None:
-    """Fine-tune on Train, select only on Dev, then infer Test once."""
+    """Run MSE Stage 1, optional QWK Stage 2, then infer Test once."""
 
     tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, use_fast=True)
     train_loader, dev_loader, test_loader, train_sampler = make_data_loaders(
@@ -2088,195 +3234,111 @@ def train_select_and_predict(
             find_unused_parameters=False,
         )
 
-    optimizer = create_optimizer(model, config)
-    epoch_loader_steps = len(train_loader)
-    if smoke_test:
-        epoch_loader_steps = min(epoch_loader_steps, config.SMOKE_MAX_TRAIN_STEPS)
-    updates_per_epoch = math.ceil(
-        epoch_loader_steps / config.GRADIENT_ACCUMULATION_STEPS
+    stage1_best_path = (
+        stage_output_directory(config, "stage1") / "best_model" / "model_state.pt"
     )
-    total_updates = max(1, updates_per_epoch * config.NUM_EPOCHS)
-    warmup_steps = int(total_updates * config.WARMUP_RATIO)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_updates,
-    )
-    amp_enabled = config.USE_FP16 and context.device.type == "cuda"
-    scaler = make_grad_scaler(amp_enabled)
-
-    if context.is_main:
-        effective_batch = (
-            config.PER_DEVICE_BATCH_SIZE
-            * context.world_size
-            * config.GRADIENT_ACCUMULATION_STEPS
-        )
-        LOGGER.info("Per-device batch size: %d", config.PER_DEVICE_BATCH_SIZE)
-        LOGGER.info("DDP world size / GPUs used: %d", context.world_size)
-        LOGGER.info("Gradient accumulation steps: %d", config.GRADIENT_ACCUMULATION_STEPS)
-        LOGGER.info("Effective global batch size: %d", effective_batch)
-        LOGGER.info("FP16 enabled: %s", amp_enabled)
-
-    start_epoch = 0
-    global_step = 0
-    best_qwk = -math.inf
-    best_mae = math.inf
-    bad_epochs = 0
-    best_model_path = config.resolve(config.OUTPUT_DIR) / "best_model" / "model_state.pt"
-    checkpoint_path = config.resolve(config.CHECKPOINT_DIR) / "last.pt"
-    history_path = config.resolve(config.OUTPUT_DIR) / "logs" / "training_history.csv"
-    if config.RESUME_FROM_CHECKPOINT:
-        resume_path = config.resolve(config.RESUME_FROM_CHECKPOINT)
-        if not resume_path.is_file():
-            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
-        if not best_model_path.is_file():
-            raise FileNotFoundError(
-                "Resume requires the matching best-model state at "
-                f"{best_model_path}. Preserve the complete outputs directory, "
-                "not only checkpoints/last.pt."
-            )
-        start_epoch, global_step, best_qwk, best_mae, bad_epochs = resume_training(
-            resume_path, model, optimizer, scheduler, scaler, context
-        )
-
-    history: list[dict[str, Any]] = []
-    if context.is_main and config.RESUME_FROM_CHECKPOINT and history_path.is_file():
-        history = pd.read_csv(history_path).to_dict(orient="records")
-    has_selected_model = bool(
-        config.RESUME_FROM_CHECKPOINT and best_model_path.is_file()
-    )
-    epoch_range: Iterable[int] = range(start_epoch, config.NUM_EPOCHS)
-    if config.RESUME_FROM_CHECKPOINT and bad_epochs >= config.EARLY_STOPPING_PATIENCE:
-        if context.is_main:
-            LOGGER.info(
-                "Resume checkpoint had already reached early stopping; "
-                "skipping further training and using its best model."
-            )
-        epoch_range = ()
-
-    for epoch in epoch_range:
-        if hasattr(train_sampler, "set_epoch"):
-            train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
-        epoch_start = time.perf_counter()
-        train_loss, global_step = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scheduler,
-            scaler,
-            config,
-            context,
-            epoch,
-            global_step,
-            max_steps=config.SMOKE_MAX_TRAIN_STEPS if smoke_test else None,
-        )
-        dev_output = evaluate_model(
+    if config.QWK_FINETUNE_RESUME_FROM_CHECKPOINT:
+        load_model_state_strict(model, stage1_best_path, context)
+        stage1_metrics = evaluate_dev_metrics(
             model,
             dev_loader,
             len(dev_frame),
             config,
             context,
-            description="Dev",
+            description="Stage 1 fallback Dev",
         )
-
-        decision: Optional[dict[str, Any]] = None
+        stage1_result = StageResult("stage1", stage1_best_path, stage1_metrics)
         if context.is_main:
-            if dev_output is None or dev_output.metrics is None:
-                raise RuntimeError("Dev labels/metrics are required for model selection")
-            metrics = dev_output.metrics
-            qwk = metrics["qwk"]
-            mae = metrics["mae"]
-            selection_qwk = qwk if math.isfinite(qwk) else -math.inf
-            qwk_tied = (
-                abs(selection_qwk - best_qwk) <= 1e-12
-                if math.isfinite(selection_qwk) and math.isfinite(best_qwk)
-                else selection_qwk == best_qwk
-            )
-            improved = (
-                not has_selected_model
-                or selection_qwk > best_qwk + 1e-12
-                or (qwk_tied and mae < best_mae)
-            )
-            if improved:
-                best_qwk = selection_qwk
-                best_mae = mae
-                bad_epochs = 0
-                save_best_model(model, tokenizer, config, metrics)
-                has_selected_model = True
-            else:
-                bad_epochs += 1
-            elapsed = time.perf_counter() - epoch_start
-            history_row = {
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "train_loss": train_loss,
-                "dev_mse": metrics["mse"],
-                "dev_mae": metrics["mae"],
-                "dev_qwk": metrics["qwk"],
-                "dev_exact_accuracy": metrics["exact_accuracy"],
-                "dev_adjacent_accuracy": metrics["adjacent_accuracy"],
-                "epoch_seconds": elapsed,
-                "is_best": improved,
-            }
-            history.append(history_row)
-            write_training_history(history, config)
             LOGGER.info(
-                "Epoch %d | train_loss=%.6f dev_mse=%.6f dev_mae=%.6f "
-                "dev_qwk=%s exact=%.4f adjacent=%.4f time=%.1fs best=%s",
-                epoch + 1,
-                train_loss,
-                metrics["mse"],
-                metrics["mae"],
-                f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
-                metrics["exact_accuracy"],
-                metrics["adjacent_accuracy"],
-                elapsed,
-                improved,
+                "Stage 2 resume requested; skipped Stage 1 training and loaded %s",
+                stage1_best_path,
             )
-            decision = {
-                "best_qwk": best_qwk,
-                "best_mae": best_mae,
-                "bad_epochs": bad_epochs,
-                "has_selected_model": has_selected_model,
-                "stop": bad_epochs >= config.EARLY_STOPPING_PATIENCE,
-            }
-
-        decision = broadcast_object(decision, context)
-        if not isinstance(decision, dict):
-            raise RuntimeError("Failed to broadcast model-selection decision")
-        best_qwk = float(decision["best_qwk"])
-        best_mae = float(decision["best_mae"])
-        bad_epochs = int(decision["bad_epochs"])
-        has_selected_model = bool(decision["has_selected_model"])
-        rng_states = gather_rng_states(context)
-        if context.is_main:
-            save_training_checkpoint(
-                checkpoint_path,
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch=epoch,
-                global_step=global_step,
-                best_qwk=best_qwk,
-                best_mae=best_mae,
-                bad_epochs=bad_epochs,
-                config=config,
-                rng_states=rng_states,
-            )
-        distributed_barrier(context)
-        if bool(decision["stop"]):
-            if context.is_main:
-                LOGGER.info("Early stopping after %d non-improving epoch(s).", bad_epochs)
-            break
-
-    distributed_barrier(context)
-    if not best_model_path.is_file():
-        raise RuntimeError(
-            "No best model exists. Ensure NUM_EPOCHS permits at least one completed epoch."
+    else:
+        stage1_result = run_mse_stage(
+            model,
+            tokenizer,
+            train_loader,
+            dev_loader,
+            train_sampler,
+            len(dev_frame),
+            config,
+            context,
+            smoke_test=smoke_test,
         )
-    best_state = load_torch_file(best_model_path, context.device)
-    unwrap_model(model).load_state_dict(best_state, strict=True)
+
+    selected_result = stage1_result
+    qwk_result: Optional[StageResult] = None
+    if config.QWK_FINETUNE_ENABLED:
+        shutdown_data_loader_workers(train_loader)
+        shutdown_data_loader_workers(dev_loader)
+        qwk_result = run_qwk_finetune_stage(
+            model,
+            tokenizer,
+            train_frame,
+            dev_frame,
+            test_frame,
+            stage1_result,
+            config,
+            context,
+            smoke_test=smoke_test,
+        )
+        selected_result = qwk_result
+
+    load_model_state_strict(model, selected_result.best_model_path, context)
+    if context.is_main:
+        final_directory = config.resolve(config.OUTPUT_DIR) / "best_model"
+        save_best_model(
+            model,
+            tokenizer,
+            config,
+            selected_result.metrics,
+            directory=final_directory,
+            metadata={
+                "selected_stage": selected_result.name,
+                "selection_rule": "higher Dev QWK, then lower Dev MAE",
+                "qwk_finetune_enabled": config.QWK_FINETUNE_ENABLED,
+            },
+        )
+        atomic_json_dump(
+            {
+                "selected_stage": selected_result.name,
+                "selected_checkpoint": str(selected_result.best_model_path),
+                "selection_rule": "higher Dev QWK, then lower Dev MAE",
+                "stage1": {
+                    "checkpoint": str(stage1_result.best_model_path),
+                    "metrics": stage1_result.metrics,
+                },
+                "stage2": (
+                    {
+                        "best_candidate_checkpoint": str(
+                            stage_output_directory(config, "stage2")
+                            / "best_model"
+                            / "model_state.pt"
+                        ),
+                        "selected_checkpoint": str(qwk_result.best_model_path),
+                        "selected_source": qwk_result.name,
+                        "metrics": qwk_result.metrics,
+                        "improved_over_initial": qwk_result.improved_over_initial,
+                        "objective": (
+                            f"SoftQWK + {config.QWK_FINETUNE_MSE_WEIGHT} * MSE"
+                        ),
+                    }
+                    if qwk_result is not None
+                    else None
+                ),
+            },
+            config.resolve(config.OUTPUT_DIR) / "selection.json",
+        )
+        LOGGER.info(
+            "Final checkpoint selected from %s | Dev QWK=%s MAE=%.6f",
+            selected_result.name,
+            (
+                f"{selected_result.metrics['qwk']:.6f}"
+                if math.isfinite(selected_result.metrics["qwk"])
+                else "nan"
+            ),
+            selected_result.metrics["mae"],
+        )
     distributed_barrier(context)
 
     test_output = evaluate_model(
@@ -2366,6 +3428,13 @@ def validate_config(config: Config) -> None:
         "PER_DEVICE_BATCH_SIZE": config.PER_DEVICE_BATCH_SIZE,
         "EVAL_BATCH_SIZE": config.EVAL_BATCH_SIZE,
         "GRADIENT_ACCUMULATION_STEPS": config.GRADIENT_ACCUMULATION_STEPS,
+        "QWK_FINETUNE_NUM_EPOCHS": config.QWK_FINETUNE_NUM_EPOCHS,
+        "QWK_FINETUNE_PER_DEVICE_BATCH_SIZE": (
+            config.QWK_FINETUNE_PER_DEVICE_BATCH_SIZE
+        ),
+        "QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS": (
+            config.QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS
+        ),
         "EARLY_STOPPING_PATIENCE": config.EARLY_STOPPING_PATIENCE,
         "DDP_TIMEOUT_MINUTES": config.DDP_TIMEOUT_MINUTES,
         "LOG_EVERY_N_STEPS": config.LOG_EVERY_N_STEPS,
@@ -2380,14 +3449,49 @@ def validate_config(config: Config) -> None:
         raise ValueError("Worker counts cannot be negative/zero")
     if not 0.0 <= config.WARMUP_RATIO < 1.0:
         raise ValueError("WARMUP_RATIO must be in [0, 1)")
+    if not 0.0 <= config.QWK_FINETUNE_WARMUP_RATIO < 1.0:
+        raise ValueError("QWK_FINETUNE_WARMUP_RATIO must be in [0, 1)")
     if not 0.0 <= config.DROPOUT < 1.0:
         raise ValueError("DROPOUT must be in [0, 1)")
     if config.ENCODER_LR <= 0.0 or config.HEAD_LR <= 0.0:
         raise ValueError("ENCODER_LR and HEAD_LR must be positive")
+    if (
+        config.QWK_FINETUNE_ENCODER_LR <= 0.0
+        or config.QWK_FINETUNE_HEAD_LR <= 0.0
+    ):
+        raise ValueError("QWK fine-tuning encoder/head learning rates must be positive")
     if config.WEIGHT_DECAY < 0.0 or config.MAX_GRAD_NORM <= 0.0:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
-    if config.SAMPLER_ALPHA < 0.0:
-        raise ValueError("SAMPLER_ALPHA cannot be negative")
+    if not config.USE_WEIGHTED_SAMPLER:
+        raise ValueError("Stage 1 weighted sampling must remain enabled")
+    if not math.isclose(config.SAMPLER_ALPHA, 0.5, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("Stage 1 SAMPLER_ALPHA is locked to 0.5")
+    if config.QWK_FINETUNE_USE_WEIGHTED_SAMPLER:
+        raise ValueError("Stage 2 weighted sampler must remain disabled")
+    if config.QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS != 1:
+        raise ValueError("Stage 2 gradient accumulation must be exactly 1")
+    if not math.isfinite(config.QWK_FINETUNE_MSE_WEIGHT) or (
+        config.QWK_FINETUNE_MSE_WEIGHT < 0.0
+    ):
+        raise ValueError("QWK_FINETUNE_MSE_WEIGHT must be finite and non-negative")
+    if (
+        not math.isfinite(config.SOFT_QWK_TEMPERATURE)
+        or config.SOFT_QWK_TEMPERATURE <= 0.0
+        or not math.isfinite(config.SOFT_QWK_EPSILON)
+        or config.SOFT_QWK_EPSILON <= 0.0
+    ):
+        raise ValueError("SoftQWK temperature and epsilon must be finite and positive")
+    if config.QWK_FINETUNE_ENABLED and (
+        config.MIN_LABEL != 1 or config.MAX_LABEL != 19
+    ):
+        raise ValueError("SoftQWK fine-tuning requires the official label range 1..19")
+    if config.RESUME_FROM_CHECKPOINT and config.QWK_FINETUNE_RESUME_FROM_CHECKPOINT:
+        raise ValueError("Set only one resume point: Stage 1 or Stage 2")
+    if (
+        config.QWK_FINETUNE_RESUME_FROM_CHECKPOINT
+        and not config.QWK_FINETUNE_ENABLED
+    ):
+        raise ValueError("Stage 2 resume requires QWK_FINETUNE_ENABLED=True")
 
 
 def main() -> None:
