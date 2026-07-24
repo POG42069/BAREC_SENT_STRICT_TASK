@@ -44,11 +44,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-)
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 
 # ---------------------------------------------------------------------------
@@ -83,10 +79,7 @@ class Config:
     LABEL_COLUMN: str = "Readability_Level_19"
 
     # Model and Arabic preprocessing.
-    MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-reg"
-    # The pretrained regression checkpoint predicts the original zero-based
-    # BAREC levels 0..18; the shared task submission uses 1..19.
-    MODEL_OUTPUT_OFFSET: float = 1.0
+    MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
     MAX_LENGTH: int = 256
     DROPOUT: float = 0.1
     D3TOK_BERT_MODEL: str = "msa"
@@ -112,9 +105,7 @@ class Config:
     EVAL_BATCH_SIZE: int = 16
     GRADIENT_ACCUMULATION_STEPS: int = 2
     ENCODER_LR: float = 2e-5
-    # The regression head is already pretrained; use a conservative LR to
-    # preserve its ordinal calibration instead of relearning it aggressively.
-    HEAD_LR: float = 1e-5
+    HEAD_LR: float = 1e-4
     WEIGHT_DECAY: float = 0.01
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
@@ -124,7 +115,7 @@ class Config:
     PIN_MEMORY: bool = True
     USE_FP16: bool = True
     USE_WEIGHTED_SAMPLER: bool = True
-    SAMPLER_ALPHA: float = 0.25
+    SAMPLER_ALPHA: float = 0.5
     SAMPLER_REPLACEMENT: bool = True
     DDP_TIMEOUT_MINUTES: int = 180
     LOG_EVERY_N_STEPS: int = 50
@@ -1226,36 +1217,30 @@ def run_sampler_checks() -> None:
 
 
 class ArabicReadabilityRegressor(nn.Module):
-    """Fine-tune the complete task-specific AraBERT regression model."""
+    """AraBERT encoder with a dropout and scalar sentence-regression head."""
 
-    def __init__(
-        self,
-        model_name: str,
-        dropout: float,
-        output_offset: float,
-    ) -> None:
+    def __init__(self, model_name: str, dropout: float) -> None:
         super().__init__()
-        pretrained = AutoModelForSequenceClassification.from_pretrained(model_name)
-        if int(pretrained.config.num_labels) != 1:
-            raise RuntimeError(
-                "The configured checkpoint must have one regression output, "
-                f"but {model_name!r} declares {pretrained.config.num_labels}."
-            )
-        classifier = getattr(pretrained, "classifier", None)
-        if not isinstance(classifier, nn.Linear) or classifier.out_features != 1:
-            raise RuntimeError(
-                "The configured checkpoint must expose a one-output linear "
-                "classifier so its pretrained regression head can be retained."
-            )
-        checkpoint_dropout = getattr(pretrained, "dropout", None)
-        self.encoder = pretrained.base_model
-        self.dropout = (
-            checkpoint_dropout
-            if isinstance(checkpoint_dropout, nn.Module)
-            else nn.Dropout(dropout)
+        # The checkpoint's 19-class head is intentionally replaced by a scalar
+        # regression head. Raw CLS is used, so do not instantiate an unused
+        # BERT pooler when DDP expects every trainable parameter to receive grad.
+        self.encoder = AutoModel.from_pretrained(
+            model_name,
+            add_pooling_layer=False,
         )
-        self.regression_head = classifier
-        self.output_offset = float(output_offset)
+        trainable_pooler_parameters = [
+            name
+            for name, parameter in self.encoder.named_parameters()
+            if parameter.requires_grad and "pooler" in name.lower()
+        ]
+        if trainable_pooler_parameters:
+            raise RuntimeError(
+                "The CLS regressor must not retain trainable encoder-pooler "
+                f"parameters: {trainable_pooler_parameters}"
+            )
+        hidden_size = int(self.encoder.config.hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.regression_head = nn.Linear(hidden_size, 1)
 
     def forward(
         self,
@@ -1272,14 +1257,8 @@ class ArabicReadabilityRegressor(nn.Module):
         if token_type_ids is not None:
             encoder_arguments["token_type_ids"] = token_type_ids
         outputs = self.encoder(**encoder_arguments)
-        if outputs.pooler_output is None:
-            raise RuntimeError(
-                "The pretrained regression checkpoint did not return pooler_output."
-            )
-        zero_based_score = self.regression_head(
-            self.dropout(outputs.pooler_output)
-        ).squeeze(-1)
-        return zero_based_score + self.output_offset
+        cls_embedding = outputs.last_hidden_state[:, 0, :]
+        return self.regression_head(self.dropout(cls_embedding)).squeeze(-1)
 
 
 def unwrap_model(model: nn.Module) -> ArabicReadabilityRegressor:
@@ -2254,11 +2233,7 @@ def train_select_and_predict(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
-    base_model = ArabicReadabilityRegressor(
-        config.MODEL_NAME,
-        config.DROPOUT,
-        config.MODEL_OUTPUT_OFFSET,
-    )
+    base_model = ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
     base_model.to(context.device)
     run_regression_shape_check(
         base_model,
@@ -2571,8 +2546,6 @@ def validate_config(config: Config) -> None:
         raise ValueError("WARMUP_RATIO must be in [0, 1)")
     if not 0.0 <= config.DROPOUT < 1.0:
         raise ValueError("DROPOUT must be in [0, 1)")
-    if not math.isfinite(config.MODEL_OUTPUT_OFFSET):
-        raise ValueError("MODEL_OUTPUT_OFFSET must be finite")
     if config.ENCODER_LR <= 0.0 or config.HEAD_LR <= 0.0:
         raise ValueError("ENCODER_LR and HEAD_LR must be positive")
     if config.WEIGHT_DECAY < 0.0 or config.MAX_GRAD_NORM <= 0.0:

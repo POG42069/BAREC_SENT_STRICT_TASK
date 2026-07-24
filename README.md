@@ -8,14 +8,14 @@ pipeline nằm trong `train.py` và có thể chạy bằng một lệnh:
 python train.py
 ```
 
-Pipeline sử dụng BERT-disambiguated D3Tok của CAMeL Tools và toàn bộ checkpoint
-regression AraBERTv2, gồm encoder, pooler và regression head đã pretrained. Khi Kaggle cung
+Pipeline sử dụng BERT-disambiguated D3Tok của CAMeL Tools, encoder AraBERTv2 từ
+checkpoint CE và một regression head một chiều. Khi Kaggle cung
 cấp hai GPU T4, script tự khởi chạy PyTorch DDP;
 không cần gọi `torchrun` thủ công.
 
 > [!IMPORTANT]
 > Checkpoint mặc định
-> [`CAMeL-Lab/readability-arabertv2-d3tok-reg`](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-reg)
+> [`CAMeL-Lab/readability-arabertv2-d3tok-CE`](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-CE)
 > là checkpoint **task-specific**. Trước khi dùng kết quả để nộp Strict Track
 > 2026, hãy xác nhận trực tiếp với ban tổ chức rằng lịch sử huấn luyện và việc sử
 > dụng checkpoint này được phép. Repository không mặc định coi tên model trên
@@ -204,13 +204,13 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Data | `TRAIN_PATH`, `DEV_PATH`, `TEST_PATH` | Đường dẫn tương đối với thư mục chứa `train.py` |
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
-| Model | `MODEL_NAME`, `MODEL_OUTPUT_OFFSET=1.0` | Toàn bộ checkpoint regression và đổi thang `0..18` → `1..19` |
+| Model | `MODEL_NAME` | Checkpoint CE dùng để khởi tạo encoder/tokenizer |
 | Preprocess | `D3TOK_BERT_MODEL="msa"`, `D3TOK_DATABASE="calima-msa-s31"` | BERT-Unfactored D3Tok; fallback công khai là r13 |
 | Length | `MAX_LENGTH=256` | Chiều dài sau HF tokenization |
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
-| Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-5` | LR thấp cho regression head đã pretrained |
-| Sampling | `SAMPLER_ALPHA=0.25` | Mức cân bằng lớp |
+| Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng cho encoder/head mới |
+| Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
 | Resume | `RESUME_FROM_CHECKPOINT=None` | Đường dẫn checkpoint để tiếp tục |
@@ -275,18 +275,16 @@ lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn
 ## 10. Kiến trúc và objective
 
 ```text
-AutoModelForSequenceClassification
-→ pretrained AraBERTv2 encoder + pooler
-→ pretrained Dropout + Linear(hidden_size, 1)
-→ zero-based readability score + 1
-→ shared-task readability score on the 1..19 scale
+AutoModel AraBERTv2 encoder từ checkpoint CE
+→ last_hidden_state[:, 0, :] (CLS)
+→ Dropout
+→ Linear(hidden_size, 1)
+→ raw readability score
 ```
 
-Pipeline giữ lại regression head một đầu ra và BERT pooler đã được huấn luyện
-cùng checkpoint. Checkpoint gốc dùng mức zero-based `0..18`, nên model cộng
-`MODEL_OUTPUT_OFFSET=1.0` trước khi tối ưu MSE với nhãn float `1..19`. Raw score
-không được round trong loss. Regression head dùng `HEAD_LR=1e-5`, thấp hơn cấu
-hình cũ `1e-4`, nhằm hạn chế phá vỡ calibration đã pretrained.
+Classification head 19 lớp của checkpoint CE không được sử dụng. Pipeline lấy
+CLS từ encoder, thêm dropout và một scalar regression head mới, rồi tối ưu MSE
+trực tiếp trên nhãn float `1..19`. Raw score không được round trong loss.
 
 AdamW dùng parameter group riêng cho encoder/head, loại bias và LayerNorm khỏi
 weight decay, linear warmup, gradient clipping và gradient accumulation. CUDA
@@ -297,7 +295,7 @@ dùng FP16 autocast + GradScaler; baseline không yêu cầu BF16 trên T4.
 Weighted sampling chỉ áp dụng Train:
 
 ```text
-class_weight[c] = (1 / class_count[c]) ** 0.25
+class_weight[c] = (1 / class_count[c]) ** 0.5
 ```
 
 Sampler dùng replacement, `seed + epoch`, có `set_epoch`, và phân phối cùng số
@@ -518,4 +516,4 @@ Nguồn chính thức:
 
 - [BAREC Shared Task 2026](https://barec.camel-lab.com/sharedtask2026)
 - [BAREC 2026 sentence-level dataset](https://huggingface.co/datasets/CAMeL-Lab/BAREC-Shared-Task-2026-sent)
-- [Checkpoint mặc định](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-reg)
+- [Checkpoint mặc định](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-CE)
