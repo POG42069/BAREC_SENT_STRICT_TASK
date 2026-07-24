@@ -48,6 +48,17 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
+from hierarchical import (
+    HierarchicalArabicReadabilityRegressor,
+    HierarchicalModelOutput,
+    SoftQWKOutput,
+    combine_stage2_loss,
+    derive_auxiliary_labels,
+    hierarchical_huber_aux_loss,
+    soft_qwk_loss,
+    validate_official_hierarchy_columns,
+)
+
 
 # ---------------------------------------------------------------------------
 # 1. Centralized configuration
@@ -64,7 +75,7 @@ ARABIC_DIACRITICS = frozenset(chr(code) for code in range(0x064B, 0x0653)) | {
 
 @dataclass
 class Config:
-    """All user-editable paths and hyperparameters for the baseline."""
+    """All user-editable paths and hyperparameters for the training pipeline."""
 
     # Data and output paths, resolved relative to this file.
     TRAIN_PATH: str = "data/barec-corpus-v1/train.csv"
@@ -82,8 +93,12 @@ class Config:
 
     # Model and Arabic preprocessing.
     MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
+    PIPELINE_MODE: str = "two_stage"
     MAX_LENGTH: int = 256
     DROPOUT: float = 0.1
+    AUX_HIDDEN_SIZE: int = 64
+    FUSION_HIDDEN_SIZE: int = 256
+    HUBER_DELTA: float = 1.0
     D3TOK_RESOURCE: str = "calima-msa-r13"
     AUTO_DOWNLOAD_CAMEL_DATA: bool = True
     CAMEL_DATA_PACKAGE: str = "light"
@@ -106,11 +121,36 @@ class Config:
     PIN_MEMORY: bool = True
     USE_FP16: bool = True
     USE_WEIGHTED_SAMPLER: bool = True
-    SAMPLER_ALPHA: float = 0.25
+    SAMPLER_ALPHA: float = 0.5
     SAMPLER_REPLACEMENT: bool = True
     DDP_TIMEOUT_MINUTES: int = 180
     LOG_EVERY_N_STEPS: int = 50
     RESUME_FROM_CHECKPOINT: Optional[str] = None
+
+    # Stage 1: Huber regression with 3/5/7-level auxiliary CE.
+    STAGE1_HUBER_WEIGHT: float = 1.0
+    STAGE1_CE3_WEIGHT: float = 0.1
+    STAGE1_CE5_WEIGHT: float = 0.1
+    STAGE1_CE7_WEIGHT: float = 0.1
+    STAGE1_RESUME_FROM_CHECKPOINT: Optional[str] = None
+
+    # Stage 2: global differentiable SoftQWK plus smaller anchor losses.
+    STAGE2_NUM_EPOCHS: int = 2
+    STAGE2_PER_DEVICE_BATCH_SIZE: int = 8
+    STAGE2_GRADIENT_ACCUMULATION_STEPS: int = 1
+    STAGE2_ENCODER_LR: float = 4e-6
+    STAGE2_HEAD_LR: float = 2e-5
+    STAGE2_WARMUP_RATIO: float = 0.05
+    STAGE2_USE_WEIGHTED_SAMPLER: bool = False
+    STAGE2_SOFT_QWK_WEIGHT: float = 1.0
+    STAGE2_HUBER_WEIGHT: float = 0.1
+    STAGE2_CE3_WEIGHT: float = 0.03
+    STAGE2_CE5_WEIGHT: float = 0.03
+    STAGE2_CE7_WEIGHT: float = 0.03
+    SOFT_QWK_TEMPERATURE: float = 1.0
+    SOFT_QWK_EPSILON: float = 1e-8
+    STAGE2_RESUME_FROM_CHECKPOINT: Optional[str] = None
+    STAGE2_INITIAL_MODEL_PATH: Optional[str] = None
 
     # Labels and submission.
     MIN_LABEL: int = 1
@@ -139,15 +179,20 @@ class Config:
         self.SUBMISSION_DIR = "outputs/smoke"
         self.CACHE_DIR = "cache/smoke"
         self.NUM_EPOCHS = 1
+        self.STAGE2_NUM_EPOCHS = 1
         self.PER_DEVICE_BATCH_SIZE = 2
+        self.STAGE2_PER_DEVICE_BATCH_SIZE = 2
         self.EVAL_BATCH_SIZE = 2
         self.GRADIENT_ACCUMULATION_STEPS = 1
+        self.STAGE2_GRADIENT_ACCUMULATION_STEPS = 1
         self.MAX_LENGTH = 64
         self.NUM_WORKERS = 0
         self.PREPROCESS_NUM_WORKERS = 1
         self.EARLY_STOPPING_PATIENCE = 1
         self.LOG_EVERY_N_STEPS = 1
         self.RESUME_FROM_CHECKPOINT = None
+        self.STAGE1_RESUME_FROM_CHECKPOINT = None
+        self.STAGE2_RESUME_FROM_CHECKPOINT = None
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +382,11 @@ ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
 DOCUMENT_ALIASES = ("Document", "document")
+AUXILIARY_LABEL_COLUMNS = {
+    3: "Readability_Level_3",
+    5: "Readability_Level_5",
+    7: "Readability_Level_7",
+}
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -462,6 +512,45 @@ def load_split(
                     f"{config.MAX_LABEL}]: {bad}"
                 )
             frame["_label"] = labels
+
+            auxiliary = derive_auxiliary_labels(torch.as_tensor(labels, dtype=torch.long))
+            official_present = {
+                levels: column in frame.columns
+                for levels, column in AUXILIARY_LABEL_COLUMNS.items()
+            }
+            if any(official_present.values()) and not all(official_present.values()):
+                missing = [
+                    AUXILIARY_LABEL_COLUMNS[levels]
+                    for levels, present in official_present.items()
+                    if not present
+                ]
+                raise ValueError(
+                    f"{split_name}: hierarchy columns are incomplete; missing {missing}"
+                )
+            if all(official_present.values()):
+                parsed_auxiliary: dict[int, np.ndarray] = {}
+                for levels, column in AUXILIARY_LABEL_COLUMNS.items():
+                    values = pd.to_numeric(frame[column], errors="coerce")
+                    numeric_values = values.to_numpy(dtype=float)
+                    invalid_values = ~np.isfinite(numeric_values) | ~np.isclose(
+                        numeric_values, np.rint(numeric_values)
+                    )
+                    if invalid_values.any():
+                        rows = np.flatnonzero(invalid_values)[:10].tolist()
+                        raise ValueError(
+                            f"{split_name}: invalid {column} values at rows {rows}"
+                        )
+                    parsed_auxiliary[levels] = np.rint(numeric_values).astype(np.int64)
+                validate_official_hierarchy_columns(
+                    torch.as_tensor(labels, dtype=torch.long),
+                    torch.as_tensor(parsed_auxiliary[3], dtype=torch.long),
+                    torch.as_tensor(parsed_auxiliary[5], dtype=torch.long),
+                    torch.as_tensor(parsed_auxiliary[7], dtype=torch.long),
+                    auxiliary_one_based=True,
+                )
+            frame["_label3"] = auxiliary.label3.cpu().numpy()
+            frame["_label5"] = auxiliary.label5.cpu().numpy()
+            frame["_label7"] = auxiliary.label7.cpu().numpy()
 
     if document_column is not None:
         frame["_document"] = frame[document_column].map(
@@ -883,8 +972,17 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.ids = frame["_id"].astype(str).tolist()
         self.indices = frame["_original_index"].astype(int).tolist()
         self.has_labels = bool(frame.attrs.get("has_labels", False))
-        self.labels = (
+        self.labels19 = (
             frame["_label"].astype(float).tolist() if self.has_labels else None
+        )
+        self.labels3 = (
+            frame["_label3"].astype(int).tolist() if self.has_labels else None
+        )
+        self.labels5 = (
+            frame["_label5"].astype(int).tolist() if self.has_labels else None
+        )
+        self.labels7 = (
+            frame["_label7"].astype(int).tolist() if self.has_labels else None
         )
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -902,8 +1000,14 @@ class BARECDataset(Dataset[dict[str, Any]]):
         item: dict[str, Any] = dict(encoded)
         item["sample_id"] = self.ids[index]
         item["original_index"] = self.indices[index]
-        if self.labels is not None:
-            item["label"] = self.labels[index]
+        if self.labels19 is not None:
+            item["label19"] = self.labels19[index]
+            assert self.labels3 is not None
+            assert self.labels5 is not None
+            assert self.labels7 is not None
+            item["label3"] = self.labels3[index]
+            item["label5"] = self.labels5[index]
+            item["label7"] = self.labels7[index]
         return item
 
 
@@ -917,25 +1021,43 @@ class BARECCollator:
         model_features: list[dict[str, Any]] = []
         sample_ids: list[str] = []
         indices: list[int] = []
-        labels: list[float] = []
-        labels_present = "label" in features[0]
+        labels19: list[float] = []
+        labels3: list[int] = []
+        labels5: list[int] = []
+        labels7: list[int] = []
+        labels_present = "label19" in features[0]
+        metadata_keys = {
+            "sample_id",
+            "original_index",
+            "label19",
+            "label3",
+            "label5",
+            "label7",
+        }
         for feature in features:
             model_features.append(
                 {
                     key: value
                     for key, value in feature.items()
-                    if key not in {"sample_id", "original_index", "label"}
+                    if key not in metadata_keys
                 }
             )
             sample_ids.append(str(feature["sample_id"]))
             indices.append(int(feature["original_index"]))
             if labels_present:
-                labels.append(float(feature["label"]))
+                labels19.append(float(feature["label19"]))
+                labels3.append(int(feature["label3"]))
+                labels5.append(int(feature["label5"]))
+                labels7.append(int(feature["label7"]))
         batch = dict(self.tokenizer.pad(model_features, padding=True, return_tensors="pt"))
         batch["sample_ids"] = sample_ids
         batch["original_indices"] = torch.tensor(indices, dtype=torch.long)
         if labels_present:
-            batch["labels"] = torch.tensor(labels, dtype=torch.float32)
+            batch["labels"] = torch.tensor(labels19, dtype=torch.float32)
+            batch["label19"] = batch["labels"]
+            batch["label3"] = torch.tensor(labels3, dtype=torch.long)
+            batch["label5"] = torch.tensor(labels5, dtype=torch.long)
+            batch["label7"] = torch.tensor(labels7, dtype=torch.long)
         return batch
 
 
@@ -1057,7 +1179,12 @@ def run_sampler_checks() -> None:
 class ArabicReadabilityRegressor(nn.Module):
     """AraBERT encoder with a dropout and scalar sentence-regression head."""
 
-    def __init__(self, model_name: str, dropout: float) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        dropout: float,
+        output_bias: Optional[float] = None,
+    ) -> None:
         super().__init__()
         # The regression head consumes raw CLS from last_hidden_state.  A
         # BertModel pooler would therefore be trainable but disconnected from
@@ -1081,6 +1208,11 @@ class ArabicReadabilityRegressor(nn.Module):
         hidden_size = int(self.encoder.config.hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.regression_head = nn.Linear(hidden_size, 1)
+        if output_bias is not None:
+            if not math.isfinite(float(output_bias)):
+                raise ValueError("Regression output bias must be finite")
+            with torch.no_grad():
+                self.regression_head.bias.fill_(float(output_bias))
 
     def forward(
         self,
@@ -1101,21 +1233,26 @@ class ArabicReadabilityRegressor(nn.Module):
         return self.regression_head(self.dropout(cls_embedding)).squeeze(-1)
 
 
-def unwrap_model(model: nn.Module) -> ArabicReadabilityRegressor:
+def unwrap_model(model: nn.Module) -> nn.Module:
     """Return the underlying model whether or not DDP wraps it."""
 
     unwrapped = model.module if isinstance(model, DDP) else model
-    if not isinstance(unwrapped, ArabicReadabilityRegressor):
+    if not isinstance(
+        unwrapped,
+        (ArabicReadabilityRegressor, HierarchicalArabicReadabilityRegressor),
+    ):
         raise TypeError(f"Unexpected model type: {type(unwrapped)}")
     return unwrapped
 
 
-def split_decay_parameters(module: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
-    """Separate weight-decayed tensors from biases and normalization weights."""
+def split_named_decay_parameters(
+    named_parameters: Iterable[tuple[str, nn.Parameter]],
+) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    """Split an arbitrary named-parameter stream into decay/no-decay tensors."""
 
     decay: list[nn.Parameter] = []
     no_decay: list[nn.Parameter] = []
-    for name, parameter in module.named_parameters():
+    for name, parameter in named_parameters:
         if not parameter.requires_grad:
             continue
         lowered = name.lower()
@@ -1126,40 +1263,66 @@ def split_decay_parameters(module: nn.Module) -> tuple[list[nn.Parameter], list[
     return decay, no_decay
 
 
-def create_optimizer(model: nn.Module, config: Config) -> AdamW:
+def create_optimizer(
+    model: nn.Module,
+    config: Config,
+    *,
+    encoder_lr: Optional[float] = None,
+    head_lr: Optional[float] = None,
+) -> AdamW:
     """Create AdamW groups with independent encoder/head learning rates."""
 
     base = unwrap_model(model)
-    encoder_decay, encoder_no_decay = split_decay_parameters(base.encoder)
-    head_decay, head_no_decay = split_decay_parameters(
-        nn.ModuleList([base.dropout, base.regression_head])
+    if not hasattr(base, "encoder"):
+        raise TypeError("Readability model must expose an encoder module")
+    selected_encoder_lr = config.ENCODER_LR if encoder_lr is None else encoder_lr
+    selected_head_lr = config.HEAD_LR if head_lr is None else head_lr
+    encoder_decay, encoder_no_decay = split_named_decay_parameters(
+        base.encoder.named_parameters()
+    )
+    head_decay, head_no_decay = split_named_decay_parameters(
+        (name, parameter)
+        for name, parameter in base.named_parameters()
+        if not name.startswith("encoder.")
     )
     groups = [
         {
             "params": encoder_decay,
-            "lr": config.ENCODER_LR,
+            "lr": selected_encoder_lr,
             "weight_decay": config.WEIGHT_DECAY,
             "group_name": "encoder_decay",
         },
         {
             "params": encoder_no_decay,
-            "lr": config.ENCODER_LR,
+            "lr": selected_encoder_lr,
             "weight_decay": 0.0,
             "group_name": "encoder_no_decay",
         },
         {
             "params": head_decay,
-            "lr": config.HEAD_LR,
+            "lr": selected_head_lr,
             "weight_decay": config.WEIGHT_DECAY,
             "group_name": "head_decay",
         },
         {
             "params": head_no_decay,
-            "lr": config.HEAD_LR,
+            "lr": selected_head_lr,
             "weight_decay": 0.0,
             "group_name": "head_no_decay",
         },
     ]
+    optimized = {
+        id(parameter)
+        for group in groups
+        for parameter in group["params"]
+    }
+    trainable = {
+        id(parameter)
+        for parameter in base.parameters()
+        if parameter.requires_grad
+    }
+    if optimized != trainable:
+        raise AssertionError("Optimizer parameter groups do not cover the model exactly once")
     return AdamW(groups)
 
 
@@ -1194,18 +1357,29 @@ def scaled_optimizer_step(
     return optimizer_stepped, scale_before, scale_after
 
 
-def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
-    """Pass only encoder tensors from a collated batch into the model."""
+def model_outputs(
+    model: nn.Module, batch: Mapping[str, Any]
+) -> torch.Tensor | HierarchicalModelOutput:
+    """Pass only encoder tensors from a collated batch into either model."""
 
-    predictions = model(
+    output = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         token_type_ids=batch.get("token_type_ids"),
     )
+    predictions = output.scores if isinstance(output, HierarchicalModelOutput) else output
     if predictions.ndim != 1 or predictions.shape[0] != batch["input_ids"].shape[0]:
         raise AssertionError(
             f"Regression output must have shape [batch_size], got {tuple(predictions.shape)}"
         )
+    return output
+
+
+def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
+    """Return only scalar 19-level scores for evaluation/backward compatibility."""
+
+    output = model_outputs(model, batch)
+    predictions = output.scores if isinstance(output, HierarchicalModelOutput) else output
     return predictions
 
 
@@ -1245,6 +1419,86 @@ def run_regression_shape_check(
             raise AssertionError(
                 "Trainable model parameters are disconnected from the regression "
                 f"loss: {disconnected}"
+            )
+    finally:
+        model.zero_grad(set_to_none=True)
+        model.train(was_training)
+
+
+def run_hierarchical_shape_and_gradient_checks(
+    model: HierarchicalArabicReadabilityRegressor,
+    tokenizer: Any,
+    text: str,
+    device: torch.device,
+    max_length: int,
+) -> None:
+    """Verify HMTL tensor shapes and all intended gradient paths before DDP."""
+
+    encoded = tokenizer(
+        text,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    encoded = {key: value.to(device) for key, value in encoded.items()}
+    was_training = model.training
+    model.train()
+    model.zero_grad(set_to_none=True)
+    try:
+        output = model(**encoded)
+        hidden_size = int(model.encoder.config.hidden_size)
+        projection_size = int(model.classifier3.in_features)
+        expected_shapes = {
+            "scores": torch.Size([1]),
+            "cls_embedding": torch.Size([1, hidden_size]),
+            "z3": torch.Size([1, projection_size]),
+            "z5": torch.Size([1, projection_size]),
+            "z7": torch.Size([1, projection_size]),
+            "logits3": torch.Size([1, 3]),
+            "logits5": torch.Size([1, 5]),
+            "logits7": torch.Size([1, 7]),
+        }
+        for name, expected in expected_shapes.items():
+            actual = getattr(output, name).shape
+            if actual != expected:
+                raise AssertionError(
+                    f"HMTL {name} must have shape {tuple(expected)}, got {tuple(actual)}"
+                )
+
+        output.scores.sum().backward(retain_graph=True)
+        missing_projection_gradients = [
+            name
+            for name, parameter in model.named_parameters()
+            if name.startswith(("projection3.", "projection5.", "projection7."))
+            and parameter.requires_grad
+            and parameter.grad is None
+        ]
+        if missing_projection_gradients:
+            raise AssertionError(
+                "Regression fusion did not reach hierarchy projections: "
+                f"{missing_projection_gradients}"
+            )
+
+        model.zero_grad(set_to_none=True)
+        label19 = torch.tensor([1.0], device=device)
+        auxiliary = derive_auxiliary_labels(label19.long())
+        combined = hierarchical_huber_aux_loss(
+            output,
+            label19,
+            auxiliary.label3,
+            auxiliary.label5,
+            auxiliary.label7,
+        )
+        combined.total.backward()
+        disconnected = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        if disconnected:
+            raise AssertionError(
+                "Trainable HMTL parameters are outside the combined loss graph: "
+                f"{disconnected}"
             )
     finally:
         model.zero_grad(set_to_none=True)
@@ -1347,6 +1601,44 @@ def merge_evaluation_payloads(
     return ordered_ids, np.arange(expected_size), predictions, label_array
 
 
+def merge_auxiliary_accuracies(
+    payloads: Sequence[Mapping[str, Any]], expected_size: int
+) -> dict[str, float]:
+    """Deduplicate distributed evaluation padding and score auxiliary heads."""
+
+    auxiliary_keys = ("3", "5", "7")
+    if not any(payload.get("aux_predictions") is not None for payload in payloads):
+        return {}
+    records: dict[int, tuple[tuple[int, int, int], tuple[int, int, int]]] = {}
+    for payload in payloads:
+        predictions = payload.get("aux_predictions")
+        labels = payload.get("aux_labels")
+        if predictions is None or labels is None:
+            raise RuntimeError("Only part of an evaluation payload has auxiliary labels")
+        indices = payload["indices"]
+        for key in auxiliary_keys:
+            if len(predictions[key]) != len(indices) or len(labels[key]) != len(indices):
+                raise RuntimeError("Malformed auxiliary evaluation payload")
+        for position, index in enumerate(indices):
+            integer_index = int(index)
+            candidate = (
+                tuple(int(predictions[key][position]) for key in auxiliary_keys),
+                tuple(int(labels[key][position]) for key in auxiliary_keys),
+            )
+            if integer_index in records and records[integer_index] != candidate:
+                raise RuntimeError("Padded auxiliary evaluation entries disagree")
+            records.setdefault(integer_index, candidate)
+    if sorted(records) != list(range(expected_size)):
+        raise RuntimeError("Auxiliary evaluation gather does not cover the full split")
+    ordered = [records[index] for index in range(expected_size)]
+    return {
+        f"aux_accuracy_{key}": float(
+            np.mean([prediction[position] == truth[position] for prediction, truth in ordered])
+        )
+        for position, key in enumerate(auxiliary_keys)
+    }
+
+
 def run_gather_order_check() -> None:
     """Verify out-of-order/padded evaluation records are restored exactly once."""
 
@@ -1387,12 +1679,25 @@ def evaluate_model(
     local_ids: list[str] = []
     local_predictions: list[float] = []
     local_labels: Optional[list[float]] = []
+    local_aux_predictions: Optional[dict[str, list[int]]] = {
+        "3": [],
+        "5": [],
+        "7": [],
+    }
+    local_aux_labels: Optional[dict[str, list[int]]] = {
+        "3": [],
+        "5": [],
+        "7": [],
+    }
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
     progress = tqdm(loader, desc=description, disable=not context.is_main, leave=False)
     for batch in progress:
         batch = move_model_batch(batch, context.device)
         with autocast_context(amp_enabled):
-            predictions = model_forward(model, batch)
+            output = model_outputs(model, batch)
+            predictions = (
+                output.scores if isinstance(output, HierarchicalModelOutput) else output
+            )
         local_indices.extend(batch["original_indices"].cpu().tolist())
         local_ids.extend(batch["sample_ids"])
         local_predictions.extend(predictions.float().cpu().tolist())
@@ -1401,12 +1706,29 @@ def evaluate_model(
             local_labels.extend(batch["labels"].float().cpu().tolist())
         else:
             local_labels = None
+        if isinstance(output, HierarchicalModelOutput) and "label3" in batch:
+            assert local_aux_predictions is not None
+            assert local_aux_labels is not None
+            for key, logits in (
+                ("3", output.logits3),
+                ("5", output.logits5),
+                ("7", output.logits7),
+            ):
+                local_aux_predictions[key].extend(
+                    logits.argmax(dim=-1).cpu().tolist()
+                )
+                local_aux_labels[key].extend(batch[f"label{key}"].cpu().tolist())
+        else:
+            local_aux_predictions = None
+            local_aux_labels = None
 
     payload: dict[str, Any] = {
         "indices": local_indices,
         "ids": local_ids,
         "predictions": local_predictions,
         "labels": local_labels,
+        "aux_predictions": local_aux_predictions,
+        "aux_labels": local_aux_labels,
     }
     if context.distributed:
         gathered: list[Optional[dict[str, Any]]] = [None] * context.world_size
@@ -1422,6 +1744,8 @@ def evaluate_model(
     )
     final_predictions = round_and_clip(raw_predictions, config)
     metrics = calculate_metrics(labels, raw_predictions, config) if labels is not None else None
+    if metrics is not None:
+        metrics.update(merge_auxiliary_accuracies(payloads, expected_size))
     return EvaluationOutput(
         ids,
         indices,
@@ -1555,16 +1879,26 @@ def save_best_model(
     tokenizer: Any,
     config: Config,
     metrics: Mapping[str, float],
+    *,
+    directory: Optional[Path] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     """Save the task model, tokenizer, config, and best Dev metrics."""
 
-    directory = config.resolve(config.OUTPUT_DIR) / "best_model"
+    directory = (
+        config.resolve(config.OUTPUT_DIR) / "best_model"
+        if directory is None
+        else directory
+    )
     directory.mkdir(parents=True, exist_ok=True)
     model_path = directory / "model_state.pt"
     atomic_torch_save(cpu_model_state(model), model_path)
     tokenizer.save_pretrained(directory / "tokenizer")
     atomic_json_dump(asdict(config), directory / "training_config.json")
-    atomic_json_dump(dict(metrics), directory / "metrics.json")
+    metrics_payload: dict[str, Any] = dict(metrics)
+    if metadata is not None:
+        metrics_payload.update(metadata)
+    atomic_json_dump(metrics_payload, directory / "metrics.json")
     return model_path
 
 
@@ -1582,6 +1916,7 @@ def save_training_checkpoint(
     bad_epochs: int,
     config: Config,
     rng_states: Sequence[Mapping[str, Any]],
+    stage_name: str = "baseline",
 ) -> None:
     """Save all states needed to resume training and model selection."""
 
@@ -1597,8 +1932,86 @@ def save_training_checkpoint(
         "bad_epochs": bad_epochs,
         "config": asdict(config),
         "rng_states": list(rng_states),
+        "stage_name": stage_name,
     }
     atomic_torch_save(payload, path)
+
+
+def validate_resume_config(
+    saved_config: Mapping[str, Any],
+    current_config: Config,
+    stage_name: str,
+) -> None:
+    """Reject resume when training-critical stage settings have changed."""
+
+    common_fields = {
+        "MODEL_NAME",
+        "MAX_LENGTH",
+        "DROPOUT",
+        "AUX_HIDDEN_SIZE",
+        "FUSION_HIDDEN_SIZE",
+        "HUBER_DELTA",
+        "WEIGHT_DECAY",
+        "MAX_GRAD_NORM",
+        "EARLY_STOPPING_PATIENCE",
+        "USE_FP16",
+        "SEED",
+        "MIN_LABEL",
+        "MAX_LABEL",
+    }
+    stage_fields = {
+        "stage1": {
+            "NUM_EPOCHS",
+            "PER_DEVICE_BATCH_SIZE",
+            "GRADIENT_ACCUMULATION_STEPS",
+            "ENCODER_LR",
+            "HEAD_LR",
+            "WARMUP_RATIO",
+            "USE_WEIGHTED_SAMPLER",
+            "SAMPLER_ALPHA",
+            "SAMPLER_REPLACEMENT",
+            "STAGE1_HUBER_WEIGHT",
+            "STAGE1_CE3_WEIGHT",
+            "STAGE1_CE5_WEIGHT",
+            "STAGE1_CE7_WEIGHT",
+        },
+        "stage2": {
+            "STAGE2_NUM_EPOCHS",
+            "STAGE2_PER_DEVICE_BATCH_SIZE",
+            "STAGE2_GRADIENT_ACCUMULATION_STEPS",
+            "STAGE2_ENCODER_LR",
+            "STAGE2_HEAD_LR",
+            "STAGE2_WARMUP_RATIO",
+            "STAGE2_USE_WEIGHTED_SAMPLER",
+            "STAGE2_SOFT_QWK_WEIGHT",
+            "STAGE2_HUBER_WEIGHT",
+            "STAGE2_CE3_WEIGHT",
+            "STAGE2_CE5_WEIGHT",
+            "STAGE2_CE7_WEIGHT",
+            "SOFT_QWK_TEMPERATURE",
+            "SOFT_QWK_EPSILON",
+        },
+    }
+    if stage_name not in stage_fields:
+        raise ValueError(f"Cannot validate unknown resume stage {stage_name!r}")
+    current = asdict(current_config)
+    mismatches: dict[str, dict[str, Any]] = {}
+    for field in sorted(common_fields | stage_fields[stage_name]):
+        if field not in saved_config:
+            mismatches[field] = {
+                "checkpoint": "<missing>",
+                "current": current[field],
+            }
+        elif saved_config[field] != current[field]:
+            mismatches[field] = {
+                "checkpoint": saved_config[field],
+                "current": current[field],
+            }
+    if mismatches:
+        raise ValueError(
+            f"{stage_name} resume config differs from its checkpoint: {mismatches}. "
+            "Use the original training settings or start that stage again."
+        )
 
 
 def resume_training(
@@ -1608,10 +2021,26 @@ def resume_training(
     scheduler: Any,
     scaler: Any,
     context: DistributedContext,
+    *,
+    expected_stage: Optional[str] = None,
+    current_config: Optional[Config] = None,
 ) -> tuple[int, int, float, float, int]:
     """Restore a full training checkpoint and return selection state."""
 
     checkpoint = load_torch_file(checkpoint_path, context.device)
+    if expected_stage is not None and checkpoint.get("stage_name") != expected_stage:
+        raise ValueError(
+            f"Checkpoint stage {checkpoint.get('stage_name')!r} does not match "
+            f"requested stage {expected_stage!r}"
+        )
+    if expected_stage is not None:
+        if current_config is None:
+            raise ValueError("Stage-specific resume requires the current Config")
+        validate_resume_config(
+            checkpoint.get("config", {}),
+            current_config,
+            expected_stage,
+        )
     unwrap_model(model).load_state_dict(checkpoint["model_state"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -1642,6 +2071,9 @@ def make_data_loaders(
     tokenizer: Any,
     config: Config,
     context: DistributedContext,
+    *,
+    weighted_sampling: Optional[bool] = None,
+    per_device_batch_size: Optional[int] = None,
 ) -> tuple[
     DataLoader[Any],
     DataLoader[Any],
@@ -1655,7 +2087,17 @@ def make_data_loaders(
     test_dataset = BARECDataset(test_frame, tokenizer, config.MAX_LENGTH)
     collator = BARECCollator(tokenizer)
 
-    if config.USE_WEIGHTED_SAMPLER:
+    use_weighted_sampling = (
+        config.USE_WEIGHTED_SAMPLER
+        if weighted_sampling is None
+        else weighted_sampling
+    )
+    selected_batch_size = (
+        config.PER_DEVICE_BATCH_SIZE
+        if per_device_batch_size is None
+        else per_device_batch_size
+    )
+    if use_weighted_sampling:
         weights, class_counts, class_weights = sample_weights_from_labels(
             train_frame["_label"].astype(int).tolist(), config
         )
@@ -1670,6 +2112,8 @@ def make_data_loaders(
             seed=config.SEED,
         )
     else:
+        if context.is_main:
+            LOGGER.info("Train sampler: distributed random sampler (weighted sampler OFF)")
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=context.world_size,
@@ -1709,7 +2153,7 @@ def make_data_loaders(
     }
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.PER_DEVICE_BATCH_SIZE,
+        batch_size=selected_batch_size,
         sampler=train_sampler,
         drop_last=True,
         **common,
@@ -1751,6 +2195,678 @@ def learning_rates(optimizer: torch.optim.Optimizer) -> tuple[float, float]:
     return encoder_lr, head_lr
 
 
+@dataclass(frozen=True)
+class StageSpec:
+    """Immutable runtime settings for one HMTL training stage."""
+
+    name: str
+    epochs: int
+    per_device_batch_size: int
+    gradient_accumulation_steps: int
+    encoder_lr: float
+    head_lr: float
+    warmup_ratio: float
+    weighted_sampling: bool
+    resume_from_checkpoint: Optional[str]
+    use_soft_qwk: bool
+    huber_weight: float
+    ce3_weight: float
+    ce5_weight: float
+    ce7_weight: float
+
+
+@dataclass(frozen=True)
+class StageResult:
+    """Best checkpoint and Dev selection state produced by one stage."""
+
+    name: str
+    best_model_path: Path
+    metrics: dict[str, float]
+    improved_over_initial: bool
+
+
+def make_stage_spec(config: Config, stage_name: str) -> StageSpec:
+    """Build the locked Stage-1 or Stage-2 settings from Config."""
+
+    if stage_name == "stage1":
+        return StageSpec(
+            name=stage_name,
+            epochs=config.NUM_EPOCHS,
+            per_device_batch_size=config.PER_DEVICE_BATCH_SIZE,
+            gradient_accumulation_steps=config.GRADIENT_ACCUMULATION_STEPS,
+            encoder_lr=config.ENCODER_LR,
+            head_lr=config.HEAD_LR,
+            warmup_ratio=config.WARMUP_RATIO,
+            weighted_sampling=config.USE_WEIGHTED_SAMPLER,
+            resume_from_checkpoint=config.STAGE1_RESUME_FROM_CHECKPOINT,
+            use_soft_qwk=False,
+            huber_weight=config.STAGE1_HUBER_WEIGHT,
+            ce3_weight=config.STAGE1_CE3_WEIGHT,
+            ce5_weight=config.STAGE1_CE5_WEIGHT,
+            ce7_weight=config.STAGE1_CE7_WEIGHT,
+        )
+    if stage_name == "stage2":
+        return StageSpec(
+            name=stage_name,
+            epochs=config.STAGE2_NUM_EPOCHS,
+            per_device_batch_size=config.STAGE2_PER_DEVICE_BATCH_SIZE,
+            gradient_accumulation_steps=config.STAGE2_GRADIENT_ACCUMULATION_STEPS,
+            encoder_lr=config.STAGE2_ENCODER_LR,
+            head_lr=config.STAGE2_HEAD_LR,
+            warmup_ratio=config.STAGE2_WARMUP_RATIO,
+            weighted_sampling=config.STAGE2_USE_WEIGHTED_SAMPLER,
+            resume_from_checkpoint=config.STAGE2_RESUME_FROM_CHECKPOINT,
+            use_soft_qwk=True,
+            huber_weight=config.STAGE2_HUBER_WEIGHT,
+            ce3_weight=config.STAGE2_CE3_WEIGHT,
+            ce5_weight=config.STAGE2_CE5_WEIGHT,
+            ce7_weight=config.STAGE2_CE7_WEIGHT,
+        )
+    raise ValueError(f"Unknown stage: {stage_name}")
+
+
+def stage_output_directory(config: Config, stage_name: str) -> Path:
+    """Return the isolated output root for a training stage."""
+
+    return config.resolve(config.OUTPUT_DIR) / stage_name
+
+
+def is_better_checkpoint(
+    qwk: float,
+    mae: float,
+    best_qwk: float,
+    best_mae: float,
+    *,
+    has_selected_model: bool,
+) -> bool:
+    """Apply the exact QWK-first, MAE-tiebreak selection rule."""
+
+    selection_qwk = qwk if math.isfinite(qwk) else -math.inf
+    tied = (
+        abs(selection_qwk - best_qwk) <= 1e-12
+        if math.isfinite(selection_qwk) and math.isfinite(best_qwk)
+        else selection_qwk == best_qwk
+    )
+    return (
+        not has_selected_model
+        or selection_qwk > best_qwk + 1e-12
+        or (tied and mae < best_mae)
+    )
+
+
+def hierarchical_loss_for_batch(
+    output: HierarchicalModelOutput,
+    batch: Mapping[str, Any],
+    config: Config,
+    stage: StageSpec,
+    context: DistributedContext,
+) -> tuple[torch.Tensor, dict[str, float], Optional[SoftQWKOutput]]:
+    """Calculate Stage-1 or Stage-2 loss with FP32 SoftQWK when requested."""
+
+    components = hierarchical_huber_aux_loss(
+        output,
+        batch["label19"],
+        batch["label3"],
+        batch["label5"],
+        batch["label7"],
+        huber_delta=config.HUBER_DELTA,
+        ce3_weight=stage.ce3_weight if not stage.use_soft_qwk else 0.0,
+        ce5_weight=stage.ce5_weight if not stage.use_soft_qwk else 0.0,
+        ce7_weight=stage.ce7_weight if not stage.use_soft_qwk else 0.0,
+    )
+    if not stage.use_soft_qwk:
+        total = stage.huber_weight * components.huber
+        total = total + stage.ce3_weight * components.ce3
+        total = total + stage.ce5_weight * components.ce5
+        total = total + stage.ce7_weight * components.ce7
+        return (
+            total,
+            {
+                "huber": float(components.huber.detach().item()),
+                "ce3": float(components.ce3.detach().item()),
+                "ce5": float(components.ce5.detach().item()),
+                "ce7": float(components.ce7.detach().item()),
+                "soft_qwk": 0.0,
+            },
+            None,
+        )
+
+    soft_qwk = soft_qwk_loss(
+        output.scores,
+        batch["label19"],
+        temperature=config.SOFT_QWK_TEMPERATURE,
+        distributed=context.distributed,
+        eps=config.SOFT_QWK_EPSILON,
+    )
+    combined = combine_stage2_loss(
+        soft_qwk,
+        components,
+        qwk_weight=config.STAGE2_SOFT_QWK_WEIGHT,
+        huber_weight=stage.huber_weight,
+        ce3_weight=stage.ce3_weight,
+        ce5_weight=stage.ce5_weight,
+        ce7_weight=stage.ce7_weight,
+    )
+    return (
+        combined.total,
+        {
+            "huber": float(combined.huber.detach().item()),
+            "ce3": float(combined.ce3.detach().item()),
+            "ce5": float(combined.ce5.detach().item()),
+            "ce7": float(combined.ce7.detach().item()),
+            "soft_qwk": float(soft_qwk.loss.detach().item()),
+        },
+        soft_qwk,
+    )
+
+
+def train_hierarchical_one_epoch(
+    model: nn.Module,
+    loader: DataLoader[Any],
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any,
+    config: Config,
+    stage: StageSpec,
+    context: DistributedContext,
+    epoch: int,
+    global_step: int,
+    *,
+    max_steps: Optional[int],
+) -> tuple[dict[str, float], int, int]:
+    """Train one HMTL epoch and return global diagnostics."""
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    amp_enabled = config.USE_FP16 and context.device.type == "cuda"
+    totals = {
+        "loss": 0.0,
+        "huber": 0.0,
+        "ce3": 0.0,
+        "ce5": 0.0,
+        "ce7": 0.0,
+        "soft_qwk": 0.0,
+    }
+    total_examples = 0
+    fallback_count = 0
+    start = time.perf_counter()
+    effective_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
+    progress = tqdm(
+        total=effective_steps,
+        desc=f"{stage.name} epoch {epoch + 1}/{stage.epochs}",
+        disable=not context.is_main,
+    )
+
+    for step, batch in enumerate(loader):
+        if step >= effective_steps:
+            break
+        batch = move_model_batch(batch, context.device)
+        is_update_step = (
+            (step + 1) % stage.gradient_accumulation_steps == 0
+            or step + 1 == effective_steps
+        )
+        synchronization = (
+            contextlib.nullcontext()
+            if is_update_step or not isinstance(model, DDP)
+            else model.no_sync()
+        )
+        with synchronization:
+            with autocast_context(amp_enabled):
+                output = model_outputs(model, batch)
+            if not isinstance(output, HierarchicalModelOutput):
+                raise TypeError("HMTL stage requires HierarchicalModelOutput")
+            raw_loss, components, soft_qwk = hierarchical_loss_for_batch(
+                output, batch, config, stage, context
+            )
+            window_start = (
+                step // stage.gradient_accumulation_steps
+            ) * stage.gradient_accumulation_steps
+            accumulation_window = min(
+                stage.gradient_accumulation_steps,
+                effective_steps - window_start,
+            )
+            scaler.scale(raw_loss / accumulation_window).backward()
+
+        batch_size = int(batch["label19"].shape[0])
+        totals["loss"] += float(raw_loss.detach().item()) * batch_size
+        for name, value in components.items():
+            totals[name] += value * batch_size
+        total_examples += batch_size
+        if soft_qwk is not None and soft_qwk.used_fallback:
+            fallback_count += 1
+
+        if is_update_step:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
+            optimizer_stepped, scale_before, scale_after = scaled_optimizer_step(
+                scaler, optimizer
+            )
+            if optimizer_stepped:
+                scheduler.step()
+                global_step += 1
+            elif context.is_main:
+                LOGGER.warning(
+                    "AMP overflow: optimizer and scheduler update skipped; "
+                    "GradScaler %.0f -> %.0f.",
+                    scale_before,
+                    scale_after,
+                )
+            optimizer.zero_grad(set_to_none=True)
+
+        if context.is_main:
+            encoder_lr, head_lr = learning_rates(optimizer)
+            progress.update(1)
+            if (
+                (step + 1) % config.LOG_EVERY_N_STEPS == 0
+                or step + 1 == effective_steps
+            ):
+                elapsed = time.perf_counter() - start
+                memory = "cpu"
+                if context.device.type == "cuda":
+                    allocated = torch.cuda.memory_allocated(context.device) / (1024**3)
+                    reserved = torch.cuda.memory_reserved(context.device) / (1024**3)
+                    memory = f"{allocated:.2f}/{reserved:.2f}GiB"
+                progress.set_postfix(
+                    loss=f"{raw_loss.item():.4f}",
+                    avg=f"{totals['loss'] / max(total_examples, 1):.4f}",
+                    huber=f"{components['huber']:.3f}",
+                    qwk_loss=f"{components['soft_qwk']:.3f}",
+                    enc_lr=f"{encoder_lr:.2e}",
+                    head_lr=f"{head_lr:.2e}",
+                    accum=f"{(step % stage.gradient_accumulation_steps) + 1}/"
+                    f"{stage.gradient_accumulation_steps}",
+                    fallback=fallback_count,
+                    elapsed=f"{elapsed:.0f}s",
+                    mem=memory,
+                )
+    progress.close()
+
+    names = list(totals)
+    packed = torch.tensor(
+        [totals[name] for name in names] + [float(total_examples)],
+        dtype=torch.float64,
+        device=context.device,
+    )
+    if context.distributed:
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    denominator = max(float(packed[-1].item()), 1.0)
+    means = {
+        name: float(packed[position].item() / denominator)
+        for position, name in enumerate(names)
+    }
+    return means, global_step, fallback_count
+
+
+def run_hierarchical_stage(
+    model: nn.Module,
+    tokenizer: Any,
+    train_loader: DataLoader[Any],
+    dev_loader: DataLoader[Any],
+    dev_size: int,
+    train_sampler: Sampler[int],
+    config: Config,
+    stage: StageSpec,
+    context: DistributedContext,
+    *,
+    smoke_test: bool,
+    initial_candidate: bool,
+) -> StageResult:
+    """Train/select one isolated HMTL stage and reload its best checkpoint."""
+
+    root = stage_output_directory(config, stage.name)
+    best_directory = root / "best_model"
+    best_model_path = best_directory / "model_state.pt"
+    checkpoint_path = root / "checkpoints" / "last.pt"
+    history_path = root / "logs" / "training_history.csv"
+    if context.is_main:
+        root.mkdir(parents=True, exist_ok=True)
+    distributed_barrier(context)
+
+    optimizer = create_optimizer(
+        model,
+        config,
+        encoder_lr=stage.encoder_lr,
+        head_lr=stage.head_lr,
+    )
+    epoch_loader_steps = len(train_loader)
+    if smoke_test:
+        epoch_loader_steps = min(epoch_loader_steps, config.SMOKE_MAX_TRAIN_STEPS)
+    updates_per_epoch = math.ceil(
+        epoch_loader_steps / stage.gradient_accumulation_steps
+    )
+    total_updates = max(1, updates_per_epoch * stage.epochs)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_updates * stage.warmup_ratio),
+        num_training_steps=total_updates,
+    )
+    amp_enabled = config.USE_FP16 and context.device.type == "cuda"
+    scaler = make_grad_scaler(amp_enabled)
+
+    if context.is_main:
+        effective_batch = (
+            stage.per_device_batch_size
+            * context.world_size
+            * stage.gradient_accumulation_steps
+        )
+        LOGGER.info(
+            "%s | batch/device=%d world_size=%d accumulation=%d effective=%d "
+            "weighted_sampler=%s alpha=%s encoder_lr=%.2e head_lr=%.2e",
+            stage.name,
+            stage.per_device_batch_size,
+            context.world_size,
+            stage.gradient_accumulation_steps,
+            effective_batch,
+            stage.weighted_sampling,
+            config.SAMPLER_ALPHA if stage.weighted_sampling else "OFF",
+            stage.encoder_lr,
+            stage.head_lr,
+        )
+        if stage.use_soft_qwk:
+            LOGGER.info(
+                "%s | global SoftQWK physical batch=%d; accumulation is fixed at %d",
+                stage.name,
+                stage.per_device_batch_size * context.world_size,
+                stage.gradient_accumulation_steps,
+            )
+            if optimizer.state:
+                raise AssertionError("Fresh Stage-2 optimizer unexpectedly has state")
+            if stage.resume_from_checkpoint:
+                LOGGER.info(
+                    "Stage-2 optimizer/scheduler/scaler objects created; their "
+                    "saved Stage-2 states will now be restored."
+                )
+            else:
+                LOGGER.info("Stage-2 optimizer/scheduler/scaler initialized from scratch.")
+
+    start_epoch = 0
+    global_step = 0
+    best_qwk = -math.inf
+    best_mae = math.inf
+    bad_epochs = 0
+    history: list[dict[str, Any]] = []
+    has_selected_model = False
+    improved_over_initial = False
+
+    if stage.resume_from_checkpoint:
+        resume_path = config.resolve(stage.resume_from_checkpoint)
+        if not resume_path.is_file():
+            raise FileNotFoundError(
+                f"{stage.name} resume checkpoint does not exist: {resume_path}"
+            )
+        if not best_model_path.is_file():
+            raise FileNotFoundError(
+                f"{stage.name} resume requires {best_model_path}"
+            )
+        start_epoch, global_step, best_qwk, best_mae, bad_epochs = resume_training(
+            resume_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            context,
+            expected_stage=stage.name,
+            current_config=config,
+        )
+        has_selected_model = True
+        if context.is_main and history_path.is_file():
+            history = pd.read_csv(history_path).to_dict(orient="records")
+            improved_over_initial = any(
+                bool(row.get("improved_over_initial", False)) for row in history
+            )
+    elif initial_candidate:
+        initial_output = evaluate_model(
+            model,
+            dev_loader,
+            dev_size,
+            config,
+            context,
+            description=f"{stage.name} initial Dev",
+        )
+        initial_state: Optional[dict[str, Any]] = None
+        if context.is_main:
+            if initial_output is None or initial_output.metrics is None:
+                raise RuntimeError("Stage-2 initial Dev evaluation is missing metrics")
+            initial_metrics = initial_output.metrics
+            best_qwk = (
+                initial_metrics["qwk"]
+                if math.isfinite(initial_metrics["qwk"])
+                else -math.inf
+            )
+            best_mae = initial_metrics["mae"]
+            save_best_model(
+                model,
+                tokenizer,
+                config,
+                initial_metrics,
+                directory=best_directory,
+                metadata={
+                    "stage": stage.name,
+                    "candidate_epoch": 0,
+                    "improved_over_initial": False,
+                },
+            )
+            history.append(
+                {
+                    "epoch": 0,
+                    "global_step": 0,
+                    "train_loss": None,
+                    **{f"dev_{key}": value for key, value in initial_metrics.items()},
+                    "soft_qwk_fallback_batches": 0,
+                    "is_best": True,
+                    "improved_over_initial": False,
+                }
+            )
+            write_training_history(history, config, path=history_path)
+            has_selected_model = True
+            initial_state = {
+                "best_qwk": best_qwk,
+                "best_mae": best_mae,
+            }
+            LOGGER.info(
+                "Stage-2 initial candidate (Stage-1 best): Dev QWK=%s MAE=%.6f",
+                (
+                    f"{initial_metrics['qwk']:.6f}"
+                    if math.isfinite(initial_metrics["qwk"])
+                    else "nan"
+                ),
+                initial_metrics["mae"],
+            )
+        initial_state = broadcast_object(initial_state, context)
+        if not isinstance(initial_state, dict):
+            raise RuntimeError("Failed to broadcast Stage-2 initial metrics")
+        best_qwk = float(initial_state["best_qwk"])
+        best_mae = float(initial_state["best_mae"])
+        has_selected_model = True
+        distributed_barrier(context)
+
+    epoch_range: Iterable[int] = range(start_epoch, stage.epochs)
+    if stage.resume_from_checkpoint and bad_epochs >= config.EARLY_STOPPING_PATIENCE:
+        epoch_range = ()
+        if context.is_main:
+            LOGGER.info("%s resume checkpoint had already early-stopped.", stage.name)
+
+    for epoch in epoch_range:
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
+        epoch_start = time.perf_counter()
+        train_metrics, global_step, fallback_count = train_hierarchical_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            config,
+            stage,
+            context,
+            epoch,
+            global_step,
+            max_steps=config.SMOKE_MAX_TRAIN_STEPS if smoke_test else None,
+        )
+        dev_output = evaluate_model(
+            model,
+            dev_loader,
+            dev_size,
+            config,
+            context,
+            description=f"{stage.name} Dev",
+        )
+
+        decision: Optional[dict[str, Any]] = None
+        if context.is_main:
+            if dev_output is None or dev_output.metrics is None:
+                raise RuntimeError("Dev labels/metrics are required for model selection")
+            metrics = dev_output.metrics
+            improved = is_better_checkpoint(
+                metrics["qwk"],
+                metrics["mae"],
+                best_qwk,
+                best_mae,
+                has_selected_model=has_selected_model,
+            )
+            if improved:
+                best_qwk = metrics["qwk"] if math.isfinite(metrics["qwk"]) else -math.inf
+                best_mae = metrics["mae"]
+                bad_epochs = 0
+                save_best_model(
+                    model,
+                    tokenizer,
+                    config,
+                    metrics,
+                    directory=best_directory,
+                    metadata={
+                        "stage": stage.name,
+                        "candidate_epoch": epoch + 1,
+                        "improved_over_initial": (
+                            improved_over_initial or initial_candidate
+                        ),
+                    },
+                )
+                has_selected_model = True
+                if initial_candidate:
+                    improved_over_initial = True
+            else:
+                bad_epochs += 1
+            elapsed = time.perf_counter() - epoch_start
+            history_row = {
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "train_loss": train_metrics["loss"],
+                "train_huber": train_metrics["huber"],
+                "train_ce3": train_metrics["ce3"],
+                "train_ce5": train_metrics["ce5"],
+                "train_ce7": train_metrics["ce7"],
+                "train_soft_qwk_loss": train_metrics["soft_qwk"],
+                **{f"dev_{key}": value for key, value in metrics.items()},
+                "soft_qwk_fallback_batches": fallback_count,
+                "epoch_seconds": elapsed,
+                "is_best": improved,
+                "improved_over_initial": improved_over_initial,
+            }
+            history.append(history_row)
+            write_training_history(history, config, path=history_path)
+            atomic_json_dump(
+                {
+                    "stage": stage.name,
+                    "best_qwk": best_qwk,
+                    "best_mae": best_mae,
+                    "improved_over_initial": improved_over_initial,
+                    "soft_qwk_fallback_batches_last_epoch": fallback_count,
+                },
+                root / "metrics.json",
+            )
+            LOGGER.info(
+                "%s epoch %d | loss=%.6f huber=%.6f soft_qwk_loss=%.6f "
+                "dev_qwk=%s dev_mae=%.6f aux3=%.4f aux5=%.4f aux7=%.4f "
+                "fallback=%d time=%.1fs best=%s",
+                stage.name,
+                epoch + 1,
+                train_metrics["loss"],
+                train_metrics["huber"],
+                train_metrics["soft_qwk"],
+                f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
+                metrics["mae"],
+                metrics.get("aux_accuracy_3", math.nan),
+                metrics.get("aux_accuracy_5", math.nan),
+                metrics.get("aux_accuracy_7", math.nan),
+                fallback_count,
+                elapsed,
+                improved,
+            )
+            decision = {
+                "best_qwk": best_qwk,
+                "best_mae": best_mae,
+                "bad_epochs": bad_epochs,
+                "has_selected_model": has_selected_model,
+                "improved_over_initial": improved_over_initial,
+                "stop": bad_epochs >= config.EARLY_STOPPING_PATIENCE,
+            }
+
+        decision = broadcast_object(decision, context)
+        if not isinstance(decision, dict):
+            raise RuntimeError("Failed to broadcast HMTL model-selection decision")
+        best_qwk = float(decision["best_qwk"])
+        best_mae = float(decision["best_mae"])
+        bad_epochs = int(decision["bad_epochs"])
+        has_selected_model = bool(decision["has_selected_model"])
+        improved_over_initial = bool(decision["improved_over_initial"])
+        rng_states = gather_rng_states(context)
+        if context.is_main:
+            save_training_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_qwk=best_qwk,
+                best_mae=best_mae,
+                bad_epochs=bad_epochs,
+                config=config,
+                rng_states=rng_states,
+                stage_name=stage.name,
+            )
+        distributed_barrier(context)
+        if bool(decision["stop"]):
+            if context.is_main:
+                LOGGER.info("%s early stopping after %d bad epoch(s).", stage.name, bad_epochs)
+            break
+
+    distributed_barrier(context)
+    if not best_model_path.is_file():
+        raise RuntimeError(f"{stage.name} did not produce a best model")
+    best_state = load_torch_file(best_model_path, context.device)
+    unwrap_model(model).load_state_dict(best_state, strict=True)
+    distributed_barrier(context)
+
+    best_output = evaluate_model(
+        model,
+        dev_loader,
+        dev_size,
+        config,
+        context,
+        description=f"{stage.name} best Dev",
+    )
+    result_payload: Optional[dict[str, Any]] = None
+    if context.is_main:
+        if best_output is None or best_output.metrics is None:
+            raise RuntimeError(f"{stage.name} best checkpoint evaluation failed")
+        result_payload = {
+            "metrics": best_output.metrics,
+            "improved_over_initial": improved_over_initial,
+        }
+    result_payload = broadcast_object(result_payload, context)
+    if not isinstance(result_payload, dict):
+        raise RuntimeError(f"Failed to broadcast {stage.name} result")
+    return StageResult(
+        name=stage.name,
+        best_model_path=best_model_path,
+        metrics={key: float(value) for key, value in result_payload["metrics"].items()},
+        improved_over_initial=bool(result_payload["improved_over_initial"]),
+    )
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
@@ -1763,12 +2879,18 @@ def train_one_epoch(
     global_step: int,
     *,
     max_steps: Optional[int],
+    loss_kind: str = "mse",
 ) -> tuple[float, int]:
     """Train exactly one epoch on Train; Dev/Test never call this function."""
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss_function = nn.MSELoss()
+    if loss_kind == "mse":
+        loss_function: nn.Module = nn.MSELoss()
+    elif loss_kind == "huber":
+        loss_function = nn.HuberLoss(delta=config.HUBER_DELTA)
+    else:
+        raise ValueError(f"Unsupported baseline loss: {loss_kind}")
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
     total_loss = 0.0
     total_examples = 0
@@ -1863,10 +2985,19 @@ def train_one_epoch(
     return mean_loss, global_step
 
 
-def write_training_history(history: Sequence[Mapping[str, Any]], config: Config) -> None:
+def write_training_history(
+    history: Sequence[Mapping[str, Any]],
+    config: Config,
+    *,
+    path: Optional[Path] = None,
+) -> None:
     """Persist one row of real metrics per completed epoch."""
 
-    path = config.resolve(config.OUTPUT_DIR) / "logs" / "training_history.csv"
+    path = (
+        config.resolve(config.OUTPUT_DIR) / "logs" / "training_history.csv"
+        if path is None
+        else path
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(history).to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
 
@@ -2053,6 +3184,254 @@ def write_preprocessing_report(
     )
 
 
+def wrap_for_ddp(model: nn.Module, context: DistributedContext) -> nn.Module:
+    """Wrap a model with the repository's strict no-unused-parameter DDP policy."""
+
+    if not context.distributed:
+        return model
+    return DDP(
+        model,
+        device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+        output_device=context.local_rank if context.device.type == "cuda" else None,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+    )
+
+
+def load_model_state_strict(
+    model: nn.Module,
+    path: Path,
+    context: DistributedContext,
+) -> None:
+    """Load an architecture-matching checkpoint on every rank."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Model checkpoint does not exist: {path}")
+    state = load_torch_file(path, context.device)
+    unwrap_model(model).load_state_dict(state, strict=True)
+    distributed_barrier(context)
+
+
+def train_hierarchical_select_and_predict(
+    train_frame: pd.DataFrame,
+    dev_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    config: Config,
+    context: DistributedContext,
+    *,
+    smoke_test: bool,
+) -> None:
+    """Run HMTL Stage 1/2 according to PIPELINE_MODE, then infer Test."""
+
+    tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, use_fast=True)
+    train_mean = float(train_frame["_label"].astype(float).mean())
+    base_model = HierarchicalArabicReadabilityRegressor(
+        config.MODEL_NAME,
+        config.DROPOUT,
+        output_bias=train_mean,
+        projection_size=config.AUX_HIDDEN_SIZE,
+        fusion_hidden_size=config.FUSION_HIDDEN_SIZE,
+    )
+    base_model.to(context.device)
+    run_hierarchical_shape_and_gradient_checks(
+        base_model,
+        tokenizer,
+        str(train_frame.iloc[0]["_processed_text"]),
+        context.device,
+        config.MAX_LENGTH,
+    )
+    model = wrap_for_ddp(base_model, context)
+    if context.is_main:
+        LOGGER.info(
+            "HMTL regression output bias initialized to Train mean %.6f.", train_mean
+        )
+
+    stage1_result: Optional[StageResult] = None
+    stage2_result: Optional[StageResult] = None
+    final_test_loader: Optional[DataLoader[Any]] = None
+    resume_stage2_only = (
+        config.PIPELINE_MODE == "two_stage"
+        and config.STAGE2_RESUME_FROM_CHECKPOINT is not None
+    )
+
+    if config.PIPELINE_MODE in {"stage1_hmtl", "two_stage"} and not resume_stage2_only:
+        stage1 = make_stage_spec(config, "stage1")
+        train_loader, dev_loader, test_loader, train_sampler = make_data_loaders(
+            train_frame,
+            dev_frame,
+            test_frame,
+            tokenizer,
+            config,
+            context,
+            weighted_sampling=stage1.weighted_sampling,
+            per_device_batch_size=stage1.per_device_batch_size,
+        )
+        stage1_result = run_hierarchical_stage(
+            model,
+            tokenizer,
+            train_loader,
+            dev_loader,
+            len(dev_frame),
+            train_sampler,
+            config,
+            stage1,
+            context,
+            smoke_test=smoke_test,
+            initial_candidate=False,
+        )
+        final_test_loader = test_loader
+    elif resume_stage2_only and context.is_main:
+        LOGGER.info(
+            "STAGE2_RESUME_FROM_CHECKPOINT is set; skipping Stage 1 and "
+            "resuming Stage 2 from its own complete checkpoint state."
+        )
+
+    if config.PIPELINE_MODE in {"stage2_softqwk", "two_stage"}:
+        stage2 = make_stage_spec(config, "stage2")
+        if stage2.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "Stage 2 requires GRADIENT_ACCUMULATION_STEPS=1 because SoftQWK "
+                "is a non-additive global-batch ratio"
+            )
+        if stage2.weighted_sampling:
+            raise ValueError("Stage 2 weighted sampling must remain disabled")
+
+        if stage1_result is None and stage2.resume_from_checkpoint is None:
+            initial_path = (
+                config.resolve(config.STAGE2_INITIAL_MODEL_PATH)
+                if config.STAGE2_INITIAL_MODEL_PATH is not None
+                else stage_output_directory(config, "stage1")
+                / "best_model"
+                / "model_state.pt"
+            )
+            load_model_state_strict(model, initial_path, context)
+            if context.is_main:
+                LOGGER.info("Stage 2 strict-loaded Stage-1 weights from %s", initial_path)
+
+        train_loader, dev_loader, test_loader, train_sampler = make_data_loaders(
+            train_frame,
+            dev_frame,
+            test_frame,
+            tokenizer,
+            config,
+            context,
+            weighted_sampling=False,
+            per_device_batch_size=stage2.per_device_batch_size,
+        )
+        stage2_result = run_hierarchical_stage(
+            model,
+            tokenizer,
+            train_loader,
+            dev_loader,
+            len(dev_frame),
+            train_sampler,
+            config,
+            stage2,
+            context,
+            smoke_test=smoke_test,
+            initial_candidate=stage2.resume_from_checkpoint is None,
+        )
+        final_test_loader = test_loader
+
+    candidates = [
+        result for result in (stage1_result, stage2_result) if result is not None
+    ]
+    if not candidates or final_test_loader is None:
+        raise RuntimeError("The selected HMTL mode did not execute a training stage")
+    selected = candidates[0]
+    for candidate in candidates[1:]:
+        if is_better_checkpoint(
+            candidate.metrics["qwk"],
+            candidate.metrics["mae"],
+            selected.metrics["qwk"],
+            selected.metrics["mae"],
+            has_selected_model=True,
+        ):
+            selected = candidate
+
+    load_model_state_strict(model, selected.best_model_path, context)
+    if context.is_main:
+        final_directory = config.resolve(config.OUTPUT_DIR) / "best_model"
+        save_best_model(
+            model,
+            tokenizer,
+            config,
+            selected.metrics,
+            directory=final_directory,
+            metadata={
+                "selected_stage": selected.name,
+                "pipeline_mode": config.PIPELINE_MODE,
+                "stage1_qwk": (
+                    stage1_result.metrics["qwk"] if stage1_result is not None else None
+                ),
+                "stage2_qwk": (
+                    stage2_result.metrics["qwk"] if stage2_result is not None else None
+                ),
+            },
+        )
+        atomic_json_dump(
+            {
+                "pipeline_mode": config.PIPELINE_MODE,
+                "selected_stage": selected.name,
+                "selected_checkpoint": str(selected.best_model_path),
+                "selection_rule": "higher Dev QWK, then lower Dev MAE",
+                "stage1": (
+                    {
+                        "checkpoint": str(stage1_result.best_model_path),
+                        "metrics": stage1_result.metrics,
+                    }
+                    if stage1_result is not None
+                    else None
+                ),
+                "stage2": (
+                    {
+                        "checkpoint": str(stage2_result.best_model_path),
+                        "metrics": stage2_result.metrics,
+                        "improved_over_initial": stage2_result.improved_over_initial,
+                    }
+                    if stage2_result is not None
+                    else None
+                ),
+            },
+            config.resolve(config.OUTPUT_DIR) / "selection.json",
+        )
+        LOGGER.info(
+            "Final checkpoint selected from %s: Dev QWK=%s MAE=%.6f",
+            selected.name,
+            (
+                f"{selected.metrics['qwk']:.6f}"
+                if math.isfinite(selected.metrics["qwk"])
+                else "nan"
+            ),
+            selected.metrics["mae"],
+        )
+    distributed_barrier(context)
+
+    test_output = evaluate_model(
+        model,
+        final_test_loader,
+        len(test_frame),
+        config,
+        context,
+        description="Test inference",
+    )
+    if context.is_main:
+        if test_output is None:
+            raise RuntimeError("Rank 0 did not receive Test predictions")
+        expected_ids = test_frame.sort_values("_original_index")["_id"].astype(str).tolist()
+        if test_output.ids != expected_ids:
+            raise RuntimeError("Test predictions are not in the original ID order")
+        diagnostics_path = write_diagnostics(test_output, config)
+        LOGGER.info("Test diagnostics: %s", diagnostics_path)
+        if test_output.metrics is not None:
+            LOGGER.info(
+                "Open-Test metrics (diagnostic only; never used for selection): %s",
+                test_output.metrics,
+            )
+        create_submission(test_output.ids, test_output.final_predictions, config)
+    distributed_barrier(context)
+
+
 def train_select_and_predict(
     train_frame: pd.DataFrame,
     dev_frame: pd.DataFrame,
@@ -2069,7 +3448,17 @@ def train_select_and_predict(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
-    base_model = ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
+    loss_kind = "huber" if config.PIPELINE_MODE == "huber_only" else "mse"
+    output_bias = (
+        float(train_frame["_label"].astype(float).mean())
+        if loss_kind == "huber"
+        else None
+    )
+    base_model = ArabicReadabilityRegressor(
+        config.MODEL_NAME,
+        config.DROPOUT,
+        output_bias=output_bias,
+    )
     base_model.to(context.device)
     run_regression_shape_check(
         base_model,
@@ -2116,6 +3505,7 @@ def train_select_and_predict(
         LOGGER.info("Gradient accumulation steps: %d", config.GRADIENT_ACCUMULATION_STEPS)
         LOGGER.info("Effective global batch size: %d", effective_batch)
         LOGGER.info("FP16 enabled: %s", amp_enabled)
+        LOGGER.info("Baseline loss: %s", loss_kind.upper())
 
     start_epoch = 0
     global_step = 0
@@ -2169,6 +3559,7 @@ def train_select_and_predict(
             epoch,
             global_step,
             max_steps=config.SMOKE_MAX_TRAIN_STEPS if smoke_test else None,
+            loss_kind=loss_kind,
         )
         dev_output = evaluate_model(
             model,
@@ -2263,6 +3654,7 @@ def train_select_and_predict(
                 bad_epochs=bad_epochs,
                 config=config,
                 rng_states=rng_states,
+                stage_name=config.PIPELINE_MODE,
             )
         distributed_barrier(context)
         if bool(decision["stop"]):
@@ -2345,14 +3737,24 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
 
     run_sampler_checks()
     run_gather_order_check()
-    train_select_and_predict(
-        train_processed,
-        dev_processed,
-        test_processed,
-        config,
-        context,
-        smoke_test=smoke_test,
-    )
+    if config.PIPELINE_MODE in {"baseline_mse", "huber_only"}:
+        train_select_and_predict(
+            train_processed,
+            dev_processed,
+            test_processed,
+            config,
+            context,
+            smoke_test=smoke_test,
+        )
+    else:
+        train_hierarchical_select_and_predict(
+            train_processed,
+            dev_processed,
+            test_processed,
+            config,
+            context,
+            smoke_test=smoke_test,
+        )
 
 
 def validate_config(config: Config) -> None:
@@ -2360,12 +3762,77 @@ def validate_config(config: Config) -> None:
 
     if config.MIN_LABEL >= config.MAX_LABEL:
         raise ValueError("MIN_LABEL must be less than MAX_LABEL")
+    allowed_modes = {
+        "baseline_mse",
+        "huber_only",
+        "stage1_hmtl",
+        "stage2_softqwk",
+        "two_stage",
+    }
+    if config.PIPELINE_MODE not in allowed_modes:
+        raise ValueError(
+            f"PIPELINE_MODE must be one of {sorted(allowed_modes)}, "
+            f"got {config.PIPELINE_MODE!r}"
+        )
+    baseline_mode = config.PIPELINE_MODE in {"baseline_mse", "huber_only"}
+    if baseline_mode and (
+        config.STAGE1_RESUME_FROM_CHECKPOINT
+        or config.STAGE2_RESUME_FROM_CHECKPOINT
+        or config.STAGE2_INITIAL_MODEL_PATH
+    ):
+        raise ValueError(
+            "Baseline modes only accept RESUME_FROM_CHECKPOINT; "
+            "stage-specific resume/initial paths would be ignored"
+        )
+    if not baseline_mode and config.RESUME_FROM_CHECKPOINT:
+        raise ValueError(
+            "HMTL modes require STAGE1_RESUME_FROM_CHECKPOINT or "
+            "STAGE2_RESUME_FROM_CHECKPOINT, not the legacy baseline resume field"
+        )
+    if config.PIPELINE_MODE == "stage1_hmtl" and (
+        config.STAGE2_RESUME_FROM_CHECKPOINT or config.STAGE2_INITIAL_MODEL_PATH
+    ):
+        raise ValueError("stage1_hmtl cannot use Stage-2 resume/initial paths")
+    if config.PIPELINE_MODE == "stage2_softqwk" and config.STAGE1_RESUME_FROM_CHECKPOINT:
+        raise ValueError("stage2_softqwk cannot use STAGE1_RESUME_FROM_CHECKPOINT")
+    if (
+        config.PIPELINE_MODE == "two_stage"
+        and config.STAGE1_RESUME_FROM_CHECKPOINT
+        and config.STAGE2_RESUME_FROM_CHECKPOINT
+    ):
+        raise ValueError(
+            "Choose one resume point: Stage 1 (then start Stage 2 fresh) or "
+            "Stage 2 (which automatically skips Stage 1)"
+        )
+    if (
+        config.STAGE2_RESUME_FROM_CHECKPOINT
+        and config.STAGE2_INITIAL_MODEL_PATH
+    ):
+        raise ValueError(
+            "STAGE2_INITIAL_MODEL_PATH is only for a fresh Stage 2, not resume"
+        )
+    if (
+        config.STAGE2_INITIAL_MODEL_PATH
+        and config.PIPELINE_MODE != "stage2_softqwk"
+    ):
+        raise ValueError(
+            "STAGE2_INITIAL_MODEL_PATH is only used by stage2_softqwk mode"
+        )
+    if (config.MIN_LABEL, config.MAX_LABEL) != (1, 19):
+        raise ValueError("The official hierarchy and SoftQWK require labels 1..19")
     positive_integer_fields = {
         "MAX_LENGTH": config.MAX_LENGTH,
         "NUM_EPOCHS": config.NUM_EPOCHS,
+        "STAGE2_NUM_EPOCHS": config.STAGE2_NUM_EPOCHS,
         "PER_DEVICE_BATCH_SIZE": config.PER_DEVICE_BATCH_SIZE,
+        "STAGE2_PER_DEVICE_BATCH_SIZE": config.STAGE2_PER_DEVICE_BATCH_SIZE,
         "EVAL_BATCH_SIZE": config.EVAL_BATCH_SIZE,
         "GRADIENT_ACCUMULATION_STEPS": config.GRADIENT_ACCUMULATION_STEPS,
+        "STAGE2_GRADIENT_ACCUMULATION_STEPS": (
+            config.STAGE2_GRADIENT_ACCUMULATION_STEPS
+        ),
+        "AUX_HIDDEN_SIZE": config.AUX_HIDDEN_SIZE,
+        "FUSION_HIDDEN_SIZE": config.FUSION_HIDDEN_SIZE,
         "EARLY_STOPPING_PATIENCE": config.EARLY_STOPPING_PATIENCE,
         "DDP_TIMEOUT_MINUTES": config.DDP_TIMEOUT_MINUTES,
         "LOG_EVERY_N_STEPS": config.LOG_EVERY_N_STEPS,
@@ -2380,14 +3847,46 @@ def validate_config(config: Config) -> None:
         raise ValueError("Worker counts cannot be negative/zero")
     if not 0.0 <= config.WARMUP_RATIO < 1.0:
         raise ValueError("WARMUP_RATIO must be in [0, 1)")
+    if not 0.0 <= config.STAGE2_WARMUP_RATIO < 1.0:
+        raise ValueError("STAGE2_WARMUP_RATIO must be in [0, 1)")
     if not 0.0 <= config.DROPOUT < 1.0:
         raise ValueError("DROPOUT must be in [0, 1)")
     if config.ENCODER_LR <= 0.0 or config.HEAD_LR <= 0.0:
         raise ValueError("ENCODER_LR and HEAD_LR must be positive")
+    if config.STAGE2_ENCODER_LR <= 0.0 or config.STAGE2_HEAD_LR <= 0.0:
+        raise ValueError("Stage-2 encoder/head learning rates must be positive")
     if config.WEIGHT_DECAY < 0.0 or config.MAX_GRAD_NORM <= 0.0:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
-    if config.SAMPLER_ALPHA < 0.0:
-        raise ValueError("SAMPLER_ALPHA cannot be negative")
+    if not math.isclose(config.SAMPLER_ALPHA, 0.5, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("Baseline and Stage-1 SAMPLER_ALPHA is locked to 0.5")
+    if config.PIPELINE_MODE != "stage2_softqwk" and not config.USE_WEIGHTED_SAMPLER:
+        raise ValueError("Baseline and Stage-1 weighted sampling must remain enabled")
+    if config.STAGE2_USE_WEIGHTED_SAMPLER:
+        raise ValueError("Stage-2 weighted sampler must remain disabled")
+    if config.STAGE2_GRADIENT_ACCUMULATION_STEPS != 1:
+        raise ValueError("Stage-2 gradient accumulation must be exactly 1")
+    if config.HUBER_DELTA <= 0.0:
+        raise ValueError("HUBER_DELTA must be positive")
+    if config.SOFT_QWK_TEMPERATURE <= 0.0 or config.SOFT_QWK_EPSILON <= 0.0:
+        raise ValueError("SoftQWK temperature/epsilon must be positive")
+    loss_weights = {
+        "STAGE1_HUBER_WEIGHT": config.STAGE1_HUBER_WEIGHT,
+        "STAGE1_CE3_WEIGHT": config.STAGE1_CE3_WEIGHT,
+        "STAGE1_CE5_WEIGHT": config.STAGE1_CE5_WEIGHT,
+        "STAGE1_CE7_WEIGHT": config.STAGE1_CE7_WEIGHT,
+        "STAGE2_SOFT_QWK_WEIGHT": config.STAGE2_SOFT_QWK_WEIGHT,
+        "STAGE2_HUBER_WEIGHT": config.STAGE2_HUBER_WEIGHT,
+        "STAGE2_CE3_WEIGHT": config.STAGE2_CE3_WEIGHT,
+        "STAGE2_CE5_WEIGHT": config.STAGE2_CE5_WEIGHT,
+        "STAGE2_CE7_WEIGHT": config.STAGE2_CE7_WEIGHT,
+    }
+    invalid_weights = {
+        name: value
+        for name, value in loss_weights.items()
+        if not math.isfinite(value) or value < 0.0
+    }
+    if invalid_weights:
+        raise ValueError(f"Loss weights must be finite and non-negative: {invalid_weights}")
 
 
 def main() -> None:
