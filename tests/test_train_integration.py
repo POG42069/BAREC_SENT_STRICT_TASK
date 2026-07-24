@@ -159,6 +159,7 @@ class DataAndStageTests(unittest.TestCase):
         self.assertTrue(stage1.weighted_sampling)
         self.assertEqual(stage1.gradient_accumulation_steps, 2)
         self.assertFalse(stage2.weighted_sampling)
+        self.assertEqual(stage2.per_device_batch_size, 16)
         self.assertEqual(stage2.gradient_accumulation_steps, 1)
         self.assertEqual(stage2.encoder_lr, 4e-6)
         self.assertEqual(stage2.head_lr, 2e-5)

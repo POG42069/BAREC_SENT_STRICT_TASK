@@ -212,7 +212,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Stage 1 | `NUM_EPOCHS=5`, batch `8`, accumulation `2` | Huber + `0.1×(CE3+CE5+CE7)` |
 | Stage 1 LR | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate encoder/head |
 | Stage 1 sampler | `SAMPLER_ALPHA=0.5` | Weighted sampler được bật |
-| Stage 2 | `STAGE2_NUM_EPOCHS=2`, batch `8`, accumulation `1` | SoftQWK + các loss neo |
+| Stage 2 | `STAGE2_NUM_EPOCHS=2`, batch `16`, accumulation `1` | SoftQWK + các loss neo |
 | Stage 2 LR | `4e-6` encoder, `2e-5` head | Giảm 5 lần và reset optimizer |
 | Stage 2 sampler | `STAGE2_USE_WEIGHTED_SAMPLER=False` | Giữ phân phối Train tự nhiên |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
@@ -370,7 +370,7 @@ Effective batch mặc định trên T4 x2:
 
 ```text
 Stage 1: 8 per-device × 2 GPU × 2 accumulation = 32
-Stage 2: 8 per-device × 2 GPU × 1 accumulation = 16
+Stage 2: 16 per-device × 2 GPU × 1 accumulation = 32
 ```
 
 Stage 2 cố định accumulation bằng `1`: cộng gradient qua nhiều micro-batch

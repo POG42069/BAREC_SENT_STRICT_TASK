@@ -136,7 +136,7 @@ class Config:
 
     # Stage 2: global differentiable SoftQWK plus smaller anchor losses.
     STAGE2_NUM_EPOCHS: int = 2
-    STAGE2_PER_DEVICE_BATCH_SIZE: int = 8
+    STAGE2_PER_DEVICE_BATCH_SIZE: int = 16
     STAGE2_GRADIENT_ACCUMULATION_STEPS: int = 1
     STAGE2_ENCODER_LR: float = 4e-6
     STAGE2_HEAD_LR: float = 2e-5
