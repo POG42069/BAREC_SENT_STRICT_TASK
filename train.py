@@ -100,7 +100,7 @@ class Config:
     PREPROCESS_NUM_WORKERS: int = 1
 
     # Training.
-    NUM_EPOCHS: int = 5
+    NUM_EPOCHS: int = 8
     PER_DEVICE_BATCH_SIZE: int = 8
     EVAL_BATCH_SIZE: int = 16
     GRADIENT_ACCUMULATION_STEPS: int = 2
@@ -109,7 +109,7 @@ class Config:
     WEIGHT_DECAY: float = 0.01
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
-    EARLY_STOPPING_PATIENCE: int = 2
+    EARLY_STOPPING_PATIENCE: int = 3
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
