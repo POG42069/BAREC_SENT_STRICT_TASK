@@ -205,7 +205,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
-| Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
+| Sampling | `SAMPLER_ALPHA=0.25` | Mức cân bằng lớp |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
 | Resume | `RESUME_FROM_CHECKPOINT=None` | Đường dẫn checkpoint để tiếp tục |
@@ -288,7 +288,7 @@ dùng FP16 autocast + GradScaler; baseline không yêu cầu BF16 trên T4.
 Weighted sampling chỉ áp dụng Train:
 
 ```text
-class_weight[c] = (1 / class_count[c]) ** 0.5
+class_weight[c] = (1 / class_count[c]) ** 0.25
 ```
 
 Sampler dùng replacement, `seed + epoch`, có `set_epoch`, và phân phối cùng số

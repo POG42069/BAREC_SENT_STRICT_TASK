@@ -106,7 +106,7 @@ class Config:
     PIN_MEMORY: bool = True
     USE_FP16: bool = True
     USE_WEIGHTED_SAMPLER: bool = True
-    SAMPLER_ALPHA: float = 0.5
+    SAMPLER_ALPHA: float = 0.25
     SAMPLER_REPLACEMENT: bool = True
     DDP_TIMEOUT_MINUTES: int = 180
     LOG_EVERY_N_STEPS: int = 50
