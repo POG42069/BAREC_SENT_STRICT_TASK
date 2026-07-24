@@ -112,7 +112,7 @@ class Config:
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
     USE_FP16: bool = True
-    USE_WEIGHTED_SAMPLER: bool = True
+    USE_WEIGHTED_SAMPLER: bool = False
     SAMPLER_ALPHA: float = 0.5
     SAMPLER_REPLACEMENT: bool = True
     DDP_TIMEOUT_MINUTES: int = 180
