@@ -8,14 +8,14 @@ pipeline nằm trong `train.py` và có thể chạy bằng một lệnh:
 python train.py
 ```
 
-Pipeline sử dụng D3Tok thật của CAMeL Tools, một encoder AraBERTv2 và regression
-head một chiều. Khi Kaggle cung
+Pipeline sử dụng BERT-disambiguated D3Tok của CAMeL Tools và toàn bộ checkpoint
+regression AraBERTv2, gồm encoder, pooler và regression head đã pretrained. Khi Kaggle cung
 cấp hai GPU T4, script tự khởi chạy PyTorch DDP;
 không cần gọi `torchrun` thủ công.
 
 > [!IMPORTANT]
 > Checkpoint mặc định
-> [`CAMeL-Lab/readability-arabertv2-d3tok-CE`](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-CE)
+> [`CAMeL-Lab/readability-arabertv2-d3tok-reg`](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-reg)
 > là checkpoint **task-specific**. Trước khi dùng kết quả để nộp Strict Track
 > 2026, hãy xác nhận trực tiếp với ban tổ chức rằng lịch sử huấn luyện và việc sử
 > dụng checkpoint này được phép. Repository không mặc định coi tên model trên
@@ -113,12 +113,13 @@ Trong Kaggle Notebook, chọn accelerator **GPU T4 x2**, bật Internet trong gi
 đoạn cài dependency/tải model và chạy:
 
 ```bash
-git clone --branch Khangtest --single-branch \
+git clone --branch Nho --single-branch \
   https://github.com/POG42069/BAREC_SENT_STRICT_TASK.git
 cd BAREC_SENT_STRICT_TASK
 
 python -m pip install -r requirements.txt
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
+camel_data -i morphology-db-msa-r13
 
 python train.py --smoke-test
 python train.py
@@ -128,9 +129,11 @@ python train.py
 Không nên cài lại PyTorch sau đó vì wheel CPU hoặc CUDA không tương thích có thể
 làm mất khả năng sử dụng hai T4.
 
-Lệnh `camel_data -i light` cài morphology database và MLE disambiguator cần cho
-`calima-msa-r13`. Nếu cấu hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng thử
-chuẩn bị resource khi thiếu; cài thủ công trước vẫn là cách dễ chẩn đoán nhất.
+Hai lệnh `camel_data` cài BERT-Unfactored disambiguator và database r13 công
+khai. Script ưu tiên `calima-msa-s31`, là database dùng trong paper, nếu đã được
+provision; nếu chưa có, nó fallback có cảnh báo sang r13 để Kaggle vẫn chạy.
+Nếu cấu hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng tự cài hai package
+công khai khi thiếu.
 
 ### Chạy Blind Test 2026 riêng tư
 
@@ -183,7 +186,8 @@ python -m venv .venv
 
 # Cài torch theo hướng dẫn tại https://pytorch.org/get-started/locally/
 python -m pip install -r requirements.txt
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
+camel_data -i morphology-db-msa-r13
 python train.py --smoke-test
 ```
 
@@ -200,12 +204,12 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Data | `TRAIN_PATH`, `DEV_PATH`, `TEST_PATH` | Đường dẫn tương đối với thư mục chứa `train.py` |
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
-| Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
-| Preprocess | `D3TOK_RESOURCE="calima-msa-r13"` | MLE disambiguator cho D3Tok |
+| Model | `MODEL_NAME`, `MODEL_OUTPUT_OFFSET=1.0` | Toàn bộ checkpoint regression và đổi thang `0..18` → `1..19` |
+| Preprocess | `D3TOK_BERT_MODEL="msa"`, `D3TOK_DATABASE="calima-msa-s31"` | BERT-Unfactored D3Tok; fallback công khai là r13 |
 | Length | `MAX_LENGTH=256` | Chiều dài sau HF tokenization |
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
-| Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
+| Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-5` | LR thấp cho regression head đã pretrained |
 | Sampling | `SAMPLER_ALPHA=0.25` | Mức cân bằng lớp |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
@@ -230,36 +234,40 @@ Thứ tự là một invariant của baseline:
 
 ```text
 raw sentence
-→ Unicode NFKC-compatible normalization
-→ xóa Kashida/Tatweel U+0640
-→ simple_word_tokenize
-→ D3Tok thật (calima-msa-r13)
-→ dediac_ar sau D3Tok
+→ CAMeL built-in arclean
+→ contextual Alef-Maksura rule
+→ simple_word_tokenize(split_digits=True)
+→ BERTUnfactoredDisambiguator (ưu tiên calima-msa-s31)
+→ lấy analysis["d3tok"] và tách clitic markers
+→ dediac_ar
 → Hugging Face tokenizer
 ```
 
 Chi tiết:
 
-1. `normalize_unicode(text, compatibility=True)` chuẩn hóa Unicode.
-2. `text.replace("\u0640", "")` xóa đúng Kashida/Tatweel `ـ`; không xóa chữ,
-   số hoặc dấu câu.
-3. `simple_word_tokenize` tạo word/punctuation sequence.
-4. `MLEDisambiguator.pretrained("calima-msa-r13")` kết hợp
-   `MorphologicalTokenizer(..., scheme="d3tok", split=True, diac=True)` thực
-   hiện D3Tok thật. Không có regex giả lập segmentation.
-5. `dediac_ar` chạy **sau D3Tok** để loại tanwin, fatha, damma, kasra, shadda,
-   sukun và dagger alif. Dấu `+` do D3Tok tạo ra được giữ nguyên.
-6. Các token được ghép lại bằng một khoảng trắng rồi mới đưa vào HF tokenizer.
+1. `CharMapper.builtin_mapper("arclean")` thực hiện cùng loại cleaning mà
+   pipeline BAREC chính thức sử dụng, gồm bỏ dấu phụ/Kashida và chuẩn hóa các
+   ký tự mở rộng.
+2. Quy tắc `(?<=\B)ى(?=\B) → ي` được áp dụng giống script preprocessing chính
+   thức.
+3. `simple_word_tokenize(..., split_digits=True)` tạo chuỗi word/punctuation.
+4. `BERTUnfactoredDisambiguator.pretrained(model_name="msa", top=1)` chọn phân
+   tích hình thái theo ngữ cảnh. Analyzer ưu tiên `calima-msa-s31`; khi s31
+   chưa được provision, script cảnh báo và dùng `calima-msa-r13`.
+5. D3Tok được lấy trực tiếp từ top `analysis["d3tok"]`; `_+` và `+_` được đổi
+   thành clitic marker có khoảng trắng như pipeline chính thức.
+6. `dediac_ar` loại dấu phụ còn lại nhưng giữ dấu `+`, sau đó câu mới được đưa
+   vào Hugging Face tokenizer.
 
 Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
-Unicode-normalized, bỏ Kashida và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
+arclean và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
 fallback; nó không âm thầm thay bằng chuỗi rỗng và không tạo D3Tok giả.
 
 ## 9. Cache preprocessing
 
 Train, Dev và Test có cache Parquet riêng. Fingerprint bao gồm nội dung ID/text,
-split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Thay đổi
-Kashida/dediac/D3Tok sẽ làm cache cũ mất hiệu lực.
+split, phiên bản pipeline, CAMeL Tools, BERT model và database D3Tok thực tế.
+Việc chuyển từ MLE sang BERT hoặc từ r13 sang s31 tự tạo cache mới.
 
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
@@ -267,18 +275,18 @@ lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn
 ## 10. Kiến trúc và objective
 
 ```text
-AutoModel AraBERTv2 encoder
-→ last_hidden_state[:, 0, :] (CLS)
-→ Dropout
-→ Linear(hidden_size, 1)
-→ raw readability score
+AutoModelForSequenceClassification
+→ pretrained AraBERTv2 encoder + pooler
+→ pretrained Dropout + Linear(hidden_size, 1)
+→ zero-based readability score + 1
+→ shared-task readability score on the 1..19 scale
 ```
 
-Classification head 19 lớp của checkpoint không được sử dụng. Regression head
-trả tensor `[batch_size]` và model tối ưu MSE trên nhãn float. Raw score không
-được round trong loss. BERT pooler cũng không được khởi tạo vì baseline lấy CLS
-trực tiếp từ `last_hidden_state`; cách này tránh giữ hai tham số pooler không nối
-với loss và bảo đảm DDP có gradient cho mọi tham số trainable.
+Pipeline giữ lại regression head một đầu ra và BERT pooler đã được huấn luyện
+cùng checkpoint. Checkpoint gốc dùng mức zero-based `0..18`, nên model cộng
+`MODEL_OUTPUT_OFFSET=1.0` trước khi tối ưu MSE với nhãn float `1..19`. Raw score
+không được round trong loss. Regression head dùng `HEAD_LR=1e-5`, thấp hơn cấu
+hình cũ `1e-4`, nhằm hạn chế phá vỡ calibration đã pretrained.
 
 AdamW dùng parameter group riêng cho encoder/head, loại bias và LayerNorm khỏi
 weight decay, linear warmup, gradient clipping và gradient accumulation. CUDA
@@ -408,14 +416,26 @@ thành công. Raw score (và gold Open Test nếu có) chỉ nằm trong diagnos
 
 ## 16. Troubleshooting
 
-### Không tìm thấy `calima-msa-r13`
+### Không tìm thấy BERT D3Tok hoặc morphology database
 
 ```bash
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
+camel_data -i morphology-db-msa-r13
 ```
 
 Sau đó chạy lại. Nếu môi trường không có Internet, tải CAMeL data/model vào một
 phiên có Internet hoặc gắn cache hợp lệ; baseline không thay D3Tok bằng regex.
+
+Để khớp chính xác database `calima-msa-s31` của paper, cần có bản SAMA 3.1
+`LDC2010L01.tgz` được cấp phép:
+
+```bash
+camel_data -i morphology-db-msa-s31
+camel_data -p morphology-db-msa-s31 /path/to/LDC2010L01.tgz
+```
+
+Không được commit hoặc phân phối archive/database có giấy phép trong repository.
+Nếu s31 chưa được provision, log sẽ ghi rõ rằng r13 đang được dùng làm fallback.
 
 ### CUDA out of memory
 
@@ -498,4 +518,4 @@ Nguồn chính thức:
 
 - [BAREC Shared Task 2026](https://barec.camel-lab.com/sharedtask2026)
 - [BAREC 2026 sentence-level dataset](https://huggingface.co/datasets/CAMeL-Lab/BAREC-Shared-Task-2026-sent)
-- [Checkpoint mặc định](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-CE)
+- [Checkpoint mặc định](https://huggingface.co/CAMeL-Lab/readability-arabertv2-d3tok-reg)
