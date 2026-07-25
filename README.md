@@ -1,4 +1,4 @@
-# BAREC 2026 Sentence-Level Strict Track Two-Stage Baseline
+# BAREC 2026 Sentence-Level Strict Track Baseline
 
 Baseline một tệp cho bài toán dự đoán độ khó câu tiếng Ả Rập theo 19 mức của
 [BAREC Shared Task 2026](https://barec.camel-lab.com/sharedtask2026). Toàn bộ
@@ -9,10 +9,8 @@ python train.py
 ```
 
 Pipeline sử dụng D3Tok thật của CAMeL Tools, một encoder AraBERTv2 và regression
-head một chiều. Stage 1 giữ nguyên baseline MSE; Stage 2 load best checkpoint
-Stage 1 rồi fine-tune thêm bằng `SoftQWK + 0.05 × MSE`. Hai stage dùng cùng một
-model scalar, không có HMTL, auxiliary head, Huber hay CE. Khi Kaggle cung cấp
-hai GPU T4, script tự khởi chạy PyTorch DDP; không cần gọi `torchrun` thủ công.
+head một chiều. Khi Kaggle cung cấp hai GPU T4, script tự khởi chạy PyTorch DDP;
+không cần gọi `torchrun` thủ công.
 
 > [!IMPORTANT]
 > Checkpoint mặc định
@@ -125,10 +123,6 @@ python train.py --smoke-test
 python train.py
 ```
 
-`python train.py` chạy cả hai stage rồi tạo Open Test submission. Lệnh
-`python train_blind.py` cũng chạy đúng hai stage đó, nhưng inference trên Blind
-Test và ghi output dưới `outputs/blind/`.
-
 `requirements.txt` cố ý không pin `torch`: Kaggle đã cung cấp PyTorch có CUDA.
 Không nên cài lại PyTorch sau đó vì wheel CPU hoặc CUDA không tương thích có thể
 làm mất khả năng sử dụng hai T4.
@@ -139,10 +133,10 @@ chuẩn bị resource khi thiếu; cài thủ công trước vẫn là cách d�
 
 ### Chạy Blind Test 2026 riêng tư
 
-`train_blind.py` tải đúng dataset sentence-level riêng tư, chạy cùng pipeline
-Stage 1 → Stage 2 bằng Train, chọn model cuối bằng Dev rồi chỉ dùng Blind Test để
-inference. Script loại mọi cột giống label trước khi gọi pipeline, nên Blind
-không thể tham gia loss, checkpoint selection hoặc metric.
+`train_blind.py` tải đúng dataset sentence-level riêng tư, huấn luyện bằng Train,
+chọn checkpoint bằng Dev rồi chỉ dùng Blind Test để inference. Script loại mọi
+cột giống label trước khi gọi pipeline, nên Blind không thể tham gia loss,
+checkpoint selection hoặc metric.
 
 Trên Kaggle, mở **Add-ons → Secrets**, tạo Secret tên `HF_TOKEN`, dán token do
 ban tổ chức cấp và bật quyền truy cập cho notebook. Không dán token vào source,
@@ -208,18 +202,13 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
 | Preprocess | `D3TOK_RESOURCE="calima-msa-r13"` | MLE disambiguator cho D3Tok |
 | Length | `MAX_LENGTH=256` | Chiều dài sau HF tokenization |
-| Stage 1 batch | `PER_DEVICE_BATCH_SIZE=8`, `GRADIENT_ACCUMULATION_STEPS=2` | Baseline MSE |
-| Stage 1 optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate encoder/head |
-| Stage 1 sampling | `SAMPLER_ALPHA=0.5` | Weighted sampling Train |
-| Stage 2 switch | `QWK_FINETUNE_ENABLED=True` | Bật QWK fine-tuning sau Stage 1 |
-| Stage 2 epochs | `QWK_FINETUNE_NUM_EPOCHS=2` | Số epoch QWK fine-tuning |
-| Stage 2 batch | `QWK_FINETUNE_PER_DEVICE_BATCH_SIZE=16`, `QWK_FINETUNE_GRADIENT_ACCUMULATION_STEPS=1` | Global physical batch 32 trên T4 x2 |
-| Stage 2 optimizer | `QWK_FINETUNE_ENCODER_LR=4e-6`, `QWK_FINETUNE_HEAD_LR=2e-5`, `QWK_FINETUNE_WARMUP_RATIO=0.05` | Optimizer/scheduler mới |
-| Stage 2 loss | `QWK_FINETUNE_MSE_WEIGHT=0.05`, `SOFT_QWK_TEMPERATURE=1.0` | `SoftQWK + 0.05 × MSE` |
-| Stage 2 sampling | `QWK_FINETUNE_USE_WEIGHTED_SAMPLER=False` | Giữ phân phối Train tự nhiên |
+| Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
+| Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
+| Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
+| Sampling | `USE_WEIGHTED_SAMPLER=False` | Giữ phân phối Train tự nhiên |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
-| Resume | `RESUME_FROM_CHECKPOINT=None`, `QWK_FINETUNE_RESUME_FROM_CHECKPOINT=None` | Resume riêng từng stage |
+| Resume | `RESUME_FROM_CHECKPOINT=None` | Đường dẫn checkpoint để tiếp tục |
 
 Để dùng Blind Test, chỉ đổi `TEST_PATH` sang CSV/TSV/Parquet mới. File đó phải
 có ID và sentence; label là tùy chọn.
@@ -274,7 +263,7 @@ Kashida/dediac/D3Tok sẽ làm cache cũ mất hiệu lực.
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
 
-## 10. Kiến trúc và objective hai giai đoạn
+## 10. Kiến trúc và objective
 
 ```text
 AutoModel AraBERTv2 encoder
@@ -285,44 +274,30 @@ AutoModel AraBERTv2 encoder
 ```
 
 Classification head 19 lớp của checkpoint không được sử dụng. Regression head
-trả tensor `[batch_size]`. Cả hai stage dùng nguyên kiến trúc scalar này: không
-có HMTL, projection/fusion, auxiliary classifier, Huber hoặc classification
-head mới. Raw score không được round hoặc clamp trong loss. BERT pooler cũng
-không được khởi tạo vì baseline lấy CLS trực tiếp từ `last_hidden_state`; cách
-này tránh giữ hai tham số pooler không nối với loss và bảo đảm DDP có gradient
-cho mọi tham số trainable.
+trả tensor `[batch_size]` và model tối ưu MSE trên nhãn float. Raw score không
+được round trong loss. BERT pooler cũng không được khởi tạo vì baseline lấy CLS
+trực tiếp từ `last_hidden_state`; cách này tránh giữ hai tham số pooler không nối
+với loss và bảo đảm DDP có gradient cho mọi tham số trainable.
 
-Stage 1 train 5 epoch như baseline gốc bằng MSE trên nhãn float. Stage 2 strict
-load best weights Stage 1, tạo AdamW, scheduler và GradScaler mới rồi train mặc
-định thêm 2 epoch với:
+AdamW dùng parameter group riêng cho encoder/head, loại bias và LayerNorm khỏi
+weight decay, linear warmup, gradient clipping và gradient accumulation. CUDA
+dùng FP16 autocast + GradScaler; baseline không yêu cầu BF16 trên T4.
 
-```text
-SoftQWK + 0.05 × MSE
-```
+## 11. Train sampling
 
-SoftQWK biến mỗi raw score thành phân phối mềm trên tâm lớp `1..19` bằng
-`softmax(-(score-k)² / temperature)`, sau đó tối ưu `1 − QWK`. Thành phần này
-chạy FP32 ngoài autocast; observed matrix và histogram được cộng differentiably
-giữa các rank để loss phản ánh global batch. Nếu global batch chỉ có một gold
-class hoặc expected disagreement quá nhỏ, batch đó dùng connected-zero cho
-SoftQWK và vẫn backward qua `0.05 × MSE`.
-
-AdamW ở mỗi stage dùng parameter group riêng cho encoder/head, loại bias và
-LayerNorm khỏi weight decay, linear warmup và gradient clipping. CUDA dùng FP16
-autocast + GradScaler cho model forward; baseline không yêu cầu BF16 trên T4.
-
-## 11. Weighted sampling
-
-Weighted sampling chỉ áp dụng Train trong Stage 1:
+Mặc định weighted sampling bị tắt:
 
 ```text
-class_weight[c] = (1 / class_count[c]) ** 0.5
+USE_WEIGHTED_SAMPLER = False
 ```
 
-Sampler dùng replacement, `seed + epoch`, có `set_epoch`, và phân phối cùng số
-sample/step cho mọi rank. Stage 2 tắt weighted sampler và dùng distributed random
-sampling thông thường để SoftQWK quan sát phân phối Train tự nhiên. Dev và Test
-luôn giữ phân phối, ID và thứ tự gốc.
+Train dùng `DistributedSampler` với shuffle deterministic theo `seed + epoch`,
+không oversample lớp hiếm và giữ phân phối nhãn tự nhiên. Mỗi rank vẫn nhận cùng
+số sample/step. Dev và Test giữ ID và thứ tự gốc.
+
+Phần cài đặt weighted sampler vẫn được giữ để có thể làm ablation sau này.
+`SAMPLER_ALPHA=0.5` chỉ có hiệu lực nếu bật lại
+`USE_WEIGHTED_SAMPLER=True`.
 
 ## 12. Tự động DDP trên hai T4
 
@@ -336,45 +311,20 @@ Trên Kaggle/Linux CUDA, backend là NCCL. Mỗi process gắn với một `LOCA
 model được bọc `DistributedDataParallel`, và chỉ rank 0 hiển thị progress/lưu
 file. Một GPU hoặc CPU dùng single-process fallback.
 
-Effective batch Stage 1 mặc định trên T4 x2:
+Effective batch mặc định trên T4 x2:
 
 ```text
 8 per-device × 2 GPU × 2 accumulation = 32
 ```
 
-Global physical batch Stage 2 mặc định:
-
-```text
-16 per-device × 2 GPU × 1 accumulation = 32
-```
-
-Với 54.845 câu Train và T4 x2, Stage 2 có khoảng `1713` iteration mỗi epoch
-(khác `3427` iteration của Stage 1 vì batch mỗi GPU tăng từ 8 lên 16).
-
-Stage 2 khóa accumulation ở `1`: trung bình loss SoftQWK từ nhiều micro-batch
-không tương đương tính SoftQWK một lần trên batch lớn.
-
 Việc triển khai DDP không đồng nghĩa đã xác minh runtime Kaggle. Hãy chạy
 `--smoke-test` trên chính notebook T4 x2 và kiểm tra log có hai rank trước khi
 full training.
 
-## 13. Training, evaluation và chọn model cuối
+## 13. Training, evaluation và best checkpoint
 
-Chỉ Train DataLoader thực hiện backward. Luồng mặc định là:
-
-1. Stage 1 train 5 epoch bằng MSE, weighted sampler `alpha=0.5`, encoder LR
-   `2e-5`, head LR `1e-4`, batch 8/GPU và accumulation 2.
-2. Chọn best Stage 1 bằng Dev QWK; nếu hòa thì MAE thấp hơn thắng.
-3. Strict-load best Stage 1, đánh giá nó làm ứng viên ban đầu cho model cuối và
-   reset optimizer/scheduler/scaler.
-4. Stage 2 train 2 epoch bằng `SoftQWK + 0.05 × MSE`, encoder LR `4e-6`, head LR
-   `2e-5`, warmup `0.05`, batch 16/GPU, accumulation 1 và sampler weighted OFF.
-5. Sau mỗi epoch Stage 2, chỉ thay model cuối nếu Dev QWK cao hơn; khi QWK hòa,
-   MAE thấp hơn phải thắng. Nếu Stage 2 không cải thiện, pipeline tự động quay
-   về best Stage 1.
-
-Sau mỗi epoch, Dev được gather theo `original_index`, sắp lại và loại
-padding/duplicate do phân phối trước khi tính:
+Chỉ Train DataLoader thực hiện backward. Sau mỗi epoch, Dev được gather theo
+`original_index`, sắp lại và loại padding/duplicate do phân phối trước khi tính:
 
 - raw MSE;
 - MAE;
@@ -383,16 +333,15 @@ padding/duplicate do phân phối trước khi tính:
 - Quadratic Weighted Kappa (QWK) với label cố định `1..19`.
 
 Prediction cho metric được tính bằng `np.rint`, clip vào `[1, 19]`, rồi chuyển
-sang integer. Early stopping và model selection chỉ dựa trên Dev, không nhìn
-Open Test hoặc Blind Test.
+sang integer. Checkpoint có QWK cao nhất được chọn; nếu QWK hòa, MAE thấp hơn
+thắng. Early stopping chỉ dựa trên Dev, không nhìn Test.
 
-Mỗi stage lưu `last.pt` riêng với model, optimizer, scheduler, scaler,
-epoch/global step, best QWK/MAE, config và RNG state. Dùng
-`RESUME_FROM_CHECKPOINT` cho Stage 1 hoặc
-`QWK_FINETUNE_RESUME_FROM_CHECKPOINT` cho Stage 2; không đặt đồng thời hai
-đường dẫn. Resume Stage 2 yêu cầu best Stage 1 vẫn tồn tại để pipeline luôn có
-checkpoint fallback. Model state được lưu sau khi unwrap DDP nên load được trên
-một hoặc nhiều GPU.
+Checkpoint resume lưu model hiện tại, optimizer, scheduler, scaler, epoch/global
+step, best QWK/MAE, config và RNG state. Đặt `RESUME_FROM_CHECKPOINT` tới
+`last.pt` để tiếp tục; model state được lưu sau khi unwrap DDP nên dùng được ở
+một hoặc nhiều GPU. Phải giữ cùng `outputs/best_model/model_state.pt` (nên lưu
+nguyên cây `outputs/`), vì đây là best state sẽ được load để inference sau khi
+resume; script fail fast nếu cặp artifact này không đầy đủ.
 
 ## 14. Smoke test và kiểm tra tối thiểu
 
@@ -408,10 +357,9 @@ Smoke test thật (mẫu nhỏ, D3Tok/checkpoint thật, output riêng):
 python train.py --smoke-test
 ```
 
-Smoke mode chạy tập con qua cả Stage 1 và Stage 2 (mỗi stage một epoch ngắn), rồi
-kiểm tra đọc dữ liệu, Kashida removal, D3Tok, dediac, HF tokenization, sampler,
-MSE/SoftQWK forward-backward, checkpoint/fallback/reload, inference và submission
-ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
+Smoke mode kiểm tra pipeline đọc dữ liệu, Kashida removal, D3Tok, dediac, HF
+tokenization, sampler, forward/backward, metric, checkpoint/reload, inference và
+submission ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
 
 Các invariant cần đạt:
 
@@ -419,8 +367,7 @@ Các invariant cần đạt:
 - không còn Arabic diacritics sau `dediac_ar`;
 - dấu `+` của D3Tok không bị xóa;
 - output model giữ shape `[batch_size]`, kể cả batch size 1;
-- Stage 1 sampler dùng `alpha=0.5`; Stage 2 xác nhận weighted sampler tắt;
-- SoftQWK finite, chạy FP32 và vẫn có gradient khi DDP;
+- sampler chia đều hai rank và deterministic theo seed/epoch;
 - gather trả đúng số mẫu theo thứ tự gốc;
 - submission validator từ chối header/ID/range/ZIP sai.
 
@@ -430,31 +377,17 @@ Sau full training:
 
 ```text
 outputs/
-├── stage1/
-│   ├── best_model/
-│   ├── checkpoints/
-│   │   └── last.pt
-│   └── logs/
-│       └── training_history.csv
-├── stage2/
-│   ├── best_model/
-│   ├── checkpoints/
-│   │   └── last.pt
-│   └── logs/
-│       └── training_history.csv
-├── best_model/                 # model cuối: Stage 1 hoặc Stage 2
-├── selection.json
+├── best_model/
+├── checkpoints/
+│   └── last.pt
 ├── logs/
+│   ├── training_history.csv
 │   └── preprocessing_report.json
 ├── diagnostics/
 │   └── test_predictions_with_raw_scores.csv
 ├── prediction
 └── prediction.zip
 ```
-
-`selection.json` ghi stage/checkpoint cuối được chọn và metric Dev dùng cho quyết
-định fallback. Với Blind, cùng cây Stage 1/Stage 2 và file selection nằm dưới
-`outputs/blind/`; submission cuối là `outputs/blind/prediction.zip`.
 
 File nộp gốc là `outputs/prediction`: CSV UTF-8 không BOM và **không có phần mở
 rộng**. Header phải chính xác:
@@ -490,11 +423,9 @@ phiên có Internet hoặc gắn cache hợp lệ; baseline không thay D3Tok b�
 
 ### CUDA out of memory
 
-Nếu Stage 1 OOM, giảm `PER_DEVICE_BATCH_SIZE` hoặc `MAX_LENGTH` và có thể tăng
-`GRADIENT_ACCUMULATION_STEPS` để giữ effective batch. Nếu Stage 2 batch 16/GPU
-OOM, giảm `QWK_FINETUNE_PER_DEVICE_BATCH_SIZE` xuống 8 nhưng giữ accumulation
-bằng `1`; không dùng accumulation để mô phỏng global SoftQWK batch. Xóa
-checkpoint dở nếu không resume.
+Giảm `PER_DEVICE_BATCH_SIZE` hoặc `MAX_LENGTH`, tăng
+`GRADIENT_ACCUMULATION_STEPS`, rồi xóa checkpoint dở nếu không resume. Effective
+batch có thể giữ nguyên bằng accumulation.
 
 ### Kaggle chỉ nhận một GPU
 
@@ -526,10 +457,8 @@ và Dev bắt buộc có label 19 mức.
 
 ### Checkpoint không load được
 
-Đảm bảo checkpoint và config/model name cùng scalar baseline, không trộn
-checkpoint HMTL/ensemble cũ. Stage 1 và Stage 2 có optimizer state riêng. Nếu
-không cần resume, đặt cả `RESUME_FROM_CHECKPOINT` và
-`QWK_FINETUNE_RESUME_FROM_CHECKPOINT` về `None`.
+Đảm bảo checkpoint và config/model name cùng baseline, không trộn checkpoint từ
+ensemble cũ. Nếu không cần resume, đặt `RESUME_FROM_CHECKPOINT=None`.
 
 ### ZIP bị hệ thống chấm từ chối
 
