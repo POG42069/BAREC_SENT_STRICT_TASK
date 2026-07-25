@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import math
+import multiprocessing
 import os
 import random
 import re
@@ -28,6 +29,7 @@ import time
 import unicodedata
 import uuid
 import zipfile
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -54,7 +56,7 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
-PREPROCESSING_VERSION = "barec-d3tok-bert-v2"
+PREPROCESSING_VERSION = "barec-d3tok-v1"
 TATWEEL = "\u0640"
 ARABIC_DIACRITICS = frozenset(chr(code) for code in range(0x064B, 0x0653)) | {
     "\u0670"
@@ -83,21 +85,10 @@ class Config:
     MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
     MAX_LENGTH: int = 256
     DROPOUT: float = 0.1
-    D3TOK_BERT_MODEL: str = "msa"
-    D3TOK_DATABASE: str = "calima-msa-s31"
-    D3TOK_FALLBACK_DATABASE: str = "calima-msa-r13"
-    D3TOK_ALLOW_DATABASE_FALLBACK: bool = True
-    D3TOK_BERT_BATCH_SIZE: int = 32
-    D3TOK_SENTENCE_CHUNK_SIZE: int = 256
-    D3TOK_BERT_USE_GPU: bool = True
+    D3TOK_RESOURCE: str = "calima-msa-r13"
     AUTO_DOWNLOAD_CAMEL_DATA: bool = True
-    CAMEL_DATA_PACKAGES: tuple[str, ...] = (
-        "disambig-bert-unfactored-msa",
-        "morphology-db-msa-r13",
-    )
+    CAMEL_DATA_PACKAGE: str = "light"
     FORCE_REPROCESS: bool = False
-    # BERT disambiguation batches sentences internally. Multiple Python
-    # workers would duplicate the 445 MB tagger and can exhaust RAM/VRAM.
     PREPROCESS_NUM_WORKERS: int = 1
 
     # Training.
@@ -662,207 +653,71 @@ class PreprocessResult:
     error: Optional[str]
 
 
-def resolve_d3tok_database_name(config: Config) -> str:
-    """Prefer the paper's SAMA 3.1 database and explicitly record any fallback."""
-
-    cached = getattr(config, "_resolved_d3tok_database", None)
-    if isinstance(cached, str):
-        return cached
-
-    try:
-        from camel_tools.morphology.database import MorphologyDB
-    except ImportError:
-        # Resource installation is handled by create_preprocessor(). Returning
-        # the public fallback here keeps the pre-install cache key deterministic.
-        resolved = config.D3TOK_FALLBACK_DATABASE
-    else:
-        try:
-            MorphologyDB.builtin_db(config.D3TOK_DATABASE, "a")
-            resolved = config.D3TOK_DATABASE
-        except Exception as requested_error:
-            if not config.D3TOK_ALLOW_DATABASE_FALLBACK:
-                raise RuntimeError(
-                    f"D3Tok requires {config.D3TOK_DATABASE!r}, but it is unavailable. "
-                    "Provision SAMA 3.1 with `camel_data -i morphology-db-msa-s31` "
-                    "and `camel_data -p morphology-db-msa-s31 /path/LDC2010L01.tgz`."
-                ) from requested_error
-            resolved = config.D3TOK_FALLBACK_DATABASE
-
-    setattr(config, "_resolved_d3tok_database", resolved)
-    return resolved
-
-
 class ArabicD3TokPreprocessor:
-    """Replicate BAREC's BERT-disambiguated D3Tok input construction."""
+    """Apply Unicode normalization, Tatweel removal, MLE D3Tok, then dediacritize."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, resource: str) -> None:
         try:
-            from camel_tools.disambig.bert import BERTUnfactoredDisambiguator
-            from camel_tools.morphology.analyzer import Analyzer
-            from camel_tools.morphology.database import MorphologyDB
+            from camel_tools.disambig.mle import MLEDisambiguator
+            from camel_tools.tokenizers.morphological import MorphologicalTokenizer
             from camel_tools.tokenizers.word import simple_word_tokenize
-            from camel_tools.utils.charmap import CharMapper
             from camel_tools.utils.dediac import dediac_ar
-            from camel_tools.utils.transliterate import Transliterator
+            from camel_tools.utils.normalize import normalize_unicode
         except ImportError as error:
             raise RuntimeError(
-                "CAMeL Tools with BERT disambiguation is required for D3Tok. "
-                "Install requirements.txt and the configured CAMeL data packages."
+                "CAMeL Tools is required for real D3Tok. Install requirements.txt first."
             ) from error
 
         self._simple_word_tokenize = simple_word_tokenize
         self._dediac_ar = dediac_ar
-        self._clean_transliterator = Transliterator(
-            CharMapper.builtin_mapper("arclean")
+        self._normalize_unicode = normalize_unicode
+        disambiguator = MLEDisambiguator.pretrained(resource)
+        self._d3tok = MorphologicalTokenizer(
+            disambiguator=disambiguator,
+            scheme="d3tok",
+            split=True,
+            diac=True,
         )
-        self.database_name = resolve_d3tok_database_name(config)
-
-        database = MorphologyDB.builtin_db(self.database_name, "a")
-        analyzer = Analyzer(database, backoff="ADD_PROP", cache_size=100000)
-        self._disambiguator = BERTUnfactoredDisambiguator.pretrained(
-            model_name=config.D3TOK_BERT_MODEL,
-            top=1,
-            use_gpu=config.D3TOK_BERT_USE_GPU,
-            batch_size=config.D3TOK_BERT_BATCH_SIZE,
-            pretrained_cache=False,
-            ranking_cache_size=100000,
-        )
-        if hasattr(self._disambiguator, "set_analyzer"):
-            self._disambiguator.set_analyzer(analyzer)
-        else:
-            # CAMeL Tools 1.5.5 used the same analyzer slot before exposing the
-            # public setter used by newer versions.
-            self._disambiguator._analyzer = analyzer
-        self._sentence_chunk_size = config.D3TOK_SENTENCE_CHUNK_SIZE
 
     def normalize_and_remove_tatweel(self, text: str) -> str:
-        """Apply the official BAREC arclean map and contextual Alef-Maksura rule."""
+        """Perform compatibility Unicode normalization and remove only U+0640."""
 
-        cleaned = self._clean_transliterator.transliterate(text)
-        return re.sub(r"(?<=\B)ى(?=\B)", "ي", cleaned)
+        normalized = self._normalize_unicode(text, compatibility=True)
+        return normalized.replace(TATWEEL, "")
 
     def fallback(self, normalized_text: str) -> str:
-        """Preserve cleaned content when contextual disambiguation fails."""
+        """Preserve normalized content when morphological tokenization fails."""
 
         return self._dediac_ar(normalized_text).replace(TATWEEL, "")
 
-    def _prepare(self, text: str) -> tuple[str, list[str]]:
+    def process(self, text: str) -> PreprocessResult:
+        """Preprocess one sentence, using a content-preserving per-row fallback."""
+
         if not isinstance(text, str) or not text.strip():
             raise ValueError("D3Tok received an empty/non-string sentence")
-        cleaned = self.normalize_and_remove_tatweel(text)
-        words = self._simple_word_tokenize(cleaned, split_digits=True)
-        if not words:
-            raise ValueError("D3Tok word tokenization returned no content")
-        return cleaned, words
-
-    def _render_disambiguated_sentence(self, words: Sequence[Any]) -> str:
-        output_words: list[str] = []
-        for word in words:
-            if not getattr(word, "analyses", None):
-                raise ValueError("BERT disambiguator returned no analysis")
-            scored_analysis = word.analyses[0]
-            analysis = getattr(scored_analysis, "analysis", None)
-            if analysis is None:
-                try:
-                    analysis = scored_analysis[1]
-                except Exception as error:
-                    raise TypeError("Unsupported CAMeL scored-analysis object") from error
-            d3tok = analysis.get("d3tok")
-            if not isinstance(d3tok, str) or not d3tok:
-                raise ValueError("Top BERT analysis does not contain d3tok")
-            rendered = (
-                self._dediac_ar(d3tok)
-                .replace("_+", " +")
-                .replace("+_", "+ ")
-            )
-            output_words.append(rendered)
-        processed = " ".join(output_words)
-        if not processed.strip():
-            raise ValueError("BERT D3Tok returned no content")
-        return processed
-
-    def _disambiguate_chunk(
-        self,
-        prepared: Sequence[tuple[int, str, list[str]]],
-        results: list[Optional[PreprocessResult]],
-    ) -> None:
-        tokenized_sentences = [words for _, _, words in prepared]
         try:
-            disambiguated = self._disambiguator.disambiguate_sentences(
-                tokenized_sentences
-            )
-            if len(disambiguated) != len(prepared):
-                raise RuntimeError("BERT disambiguator changed the sentence count")
-            for (index, cleaned, _), sentence in zip(prepared, disambiguated):
-                try:
-                    results[index] = PreprocessResult(
-                        self._render_disambiguated_sentence(sentence),
-                        None,
-                    )
-                except Exception as error:
-                    results[index] = PreprocessResult(
-                        self.fallback(cleaned),
-                        f"D3TokError: {type(error).__name__}: {error}",
-                    )
-        except Exception as chunk_error:
-            # Keep failures auditable per ID. A single malformed sentence must
-            # not force every sentence in its BERT batch through the fallback.
-            for index, cleaned, words in prepared:
-                try:
-                    sentence = self._disambiguator.disambiguate(words)
-                    results[index] = PreprocessResult(
-                        self._render_disambiguated_sentence(sentence),
-                        None,
-                    )
-                except Exception as row_error:
-                    results[index] = PreprocessResult(
-                        self.fallback(cleaned),
-                        "D3TokError: "
-                        f"{type(row_error).__name__}: {row_error}; "
-                        "batch_error="
-                        f"{type(chunk_error).__name__}: {chunk_error}",
-                    )
-
-    def process_many(
-        self,
-        texts: Sequence[str],
-        *,
-        description: str,
-    ) -> list[PreprocessResult]:
-        """Clean, batch-disambiguate, and render many sentences in input order."""
-
-        results: list[Optional[PreprocessResult]] = [None] * len(texts)
-        prepared: list[tuple[int, str, list[str]]] = []
-        for index, text in enumerate(texts):
-            try:
-                cleaned, words = self._prepare(text)
-                prepared.append((index, cleaned, words))
-            except Exception as error:
-                normalized = unicodedata.normalize("NFKC", str(text)).replace(TATWEEL, "")
-                results[index] = PreprocessResult(
-                    self.fallback(normalized),
-                    f"CleaningError: {type(error).__name__}: {error}",
-                )
-
-        chunks = range(0, len(prepared), self._sentence_chunk_size)
-        for start in tqdm(
-            chunks,
-            total=math.ceil(len(prepared) / self._sentence_chunk_size),
-            desc=description,
-        ):
-            self._disambiguate_chunk(
-                prepared[start : start + self._sentence_chunk_size],
-                results,
+            normalized = self.normalize_and_remove_tatweel(text)
+        except Exception as error:
+            normalized = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
+            fallback = self._dediac_ar(normalized)
+            return PreprocessResult(
+                fallback,
+                f"UnicodeNormalizationError: {type(error).__name__}: {error}",
             )
 
-        if any(result is None for result in results):
-            raise AssertionError("BERT D3Tok did not return one result per input sentence")
-        return [result for result in results if result is not None]
-
-    def process(self, text: str) -> PreprocessResult:
-        """Preprocess one sentence through the same batched implementation."""
-
-        return self.process_many([text], description="D3Tok check")[0]
+        try:
+            words = self._simple_word_tokenize(normalized)
+            d3_tokens = self._d3tok.tokenize(words)
+            output_tokens = [self._dediac_ar(str(token)) for token in d3_tokens]
+            processed = " ".join(token for token in output_tokens if token != "")
+            if normalized.strip() and not processed.strip():
+                raise ValueError("D3Tok returned no content")
+            return PreprocessResult(processed, None)
+        except Exception as error:
+            return PreprocessResult(
+                self.fallback(normalized),
+                f"D3TokError: {type(error).__name__}: {error}",
+            )
 
 
 def camel_data_install_command(package: str) -> list[str]:
@@ -875,58 +730,49 @@ def camel_data_install_command(package: str) -> list[str]:
 
 
 def create_preprocessor(config: Config, *, allow_download: bool) -> ArabicD3TokPreprocessor:
-    """Load BERT D3Tok and optionally install its public data packages once."""
+    """Load MLE D3Tok and optionally install CAMeL's light data bundle once."""
 
     try:
-        preprocessor = ArabicD3TokPreprocessor(config)
-        if preprocessor.database_name != config.D3TOK_DATABASE:
-            LOGGER.warning(
-                "Requested D3Tok database %s is unavailable; using %s. "
-                "Provision licensed SAMA 3.1 data for exact checkpoint compatibility.",
-                config.D3TOK_DATABASE,
-                preprocessor.database_name,
-            )
-        return preprocessor
+        return ArabicD3TokPreprocessor(config.D3TOK_RESOURCE)
     except Exception as first_error:
         if allow_download and config.AUTO_DOWNLOAD_CAMEL_DATA:
+            command = camel_data_install_command(config.CAMEL_DATA_PACKAGE)
             LOGGER.warning(
-                "Could not load BERT D3Tok; installing public CAMeL packages %s.",
-                config.CAMEL_DATA_PACKAGES,
+                "Could not load CAMeL resource %s; installing data package %s.",
+                config.D3TOK_RESOURCE,
+                config.CAMEL_DATA_PACKAGE,
             )
             try:
-                for package in config.CAMEL_DATA_PACKAGES:
-                    subprocess.run(
-                        camel_data_install_command(package),
-                        check=True,
-                        cwd=str(SCRIPT_DIR),
-                    )
-                # A previously unavailable public fallback may now be loadable.
-                if hasattr(config, "_resolved_d3tok_database"):
-                    delattr(config, "_resolved_d3tok_database")
-                preprocessor = ArabicD3TokPreprocessor(config)
-                LOGGER.warning(
-                    "BERT D3Tok database in use: %s%s",
-                    preprocessor.database_name,
-                    (
-                        " (public fallback; provision calima-msa-s31 for exact "
-                        "paper compatibility)"
-                        if preprocessor.database_name != config.D3TOK_DATABASE
-                        else ""
-                    ),
-                )
-                return preprocessor
+                subprocess.run(command, check=True, cwd=str(SCRIPT_DIR))
+                return ArabicD3TokPreprocessor(config.D3TOK_RESOURCE)
             except Exception as install_error:
                 raise RuntimeError(
-                    "Unable to load BERT-disambiguated D3Tok. Install "
-                    "`disambig-bert-unfactored-msa` and a compatible morphology "
-                    "database. Exact s31 reproduction additionally requires a "
-                    "licensed LDC2010L01 archive. "
+                    "Unable to load the required real D3Tok resource "
+                    f"{config.D3TOK_RESOURCE!r}. Run `camel_data -i "
+                    f"{config.CAMEL_DATA_PACKAGE}` with internet access. "
                     f"Initial error: {first_error}. Install error: {install_error}"
                 ) from install_error
         raise RuntimeError(
-            "Unable to load BERT-disambiguated D3Tok and auto-download is disabled. "
-            f"Error: {first_error}"
+            "Unable to load the required real D3Tok resource "
+            f"{config.D3TOK_RESOURCE!r}. Run `camel_data -i "
+            f"{config.CAMEL_DATA_PACKAGE}`. Error: {first_error}"
         ) from first_error
+
+
+_PROCESS_PREPROCESSOR: Optional[ArabicD3TokPreprocessor] = None
+
+
+def _preprocess_worker_init(resource: str) -> None:
+    global _PROCESS_PREPROCESSOR
+    _PROCESS_PREPROCESSOR = ArabicD3TokPreprocessor(resource)
+
+
+def _preprocess_worker_item(item: tuple[str, str]) -> tuple[str, str, Optional[str]]:
+    if _PROCESS_PREPROCESSOR is None:
+        raise RuntimeError("Preprocessing worker was not initialized")
+    row_id, text = item
+    result = _PROCESS_PREPROCESSOR.process(text)
+    return row_id, result.text, result.error
 
 
 def package_version(package: str) -> str:
@@ -953,15 +799,12 @@ def preprocessing_fingerprint(
         "source_path": str(source_path.resolve()),
         "id_column": config.ID_COLUMN,
         "text_column": config.TEXT_COLUMN,
-        "backend": "BERTUnfactoredDisambiguator",
-        "bert_model": config.D3TOK_BERT_MODEL,
-        "requested_database": config.D3TOK_DATABASE,
-        "resolved_database": resolve_d3tok_database_name(config),
-        "database_fallback_allowed": config.D3TOK_ALLOW_DATABASE_FALLBACK,
-        "cleaning": "official BAREC arclean_map + contextual Alef-Maksura rule",
-        "arclean_map": "CAMeL built-in arclean",
-        "word_tokenization": "simple_word_tokenize(split_digits=True)",
-        "dediac": "CAMeL dediac_ar after analysis['d3tok']",
+        "backend": "MLEDisambiguator+MorphologicalTokenizer",
+        "resource": config.D3TOK_RESOURCE,
+        "unicode": "CAMeL normalize_unicode compatibility=True",
+        "tatweel": "remove U+0640 before D3Tok",
+        "word_tokenization": "simple_word_tokenize(default split_digits=False)",
+        "dediac": "CAMeL dediac_ar after D3Tok",
         "camel_tools": package_version("camel-tools"),
     }
     digest.update(json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8"))
@@ -995,23 +838,16 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
         raise AssertionError("Fallback content-preservation check failed")
 
     class _ForcedD3TokFailure:
-        def disambiguate_sentences(
-            self,
-            sentences: Sequence[Sequence[str]],
-        ) -> list[list[Any]]:
-            del sentences
+        def tokenize(self, words: Sequence[str]) -> list[str]:
+            del words
             raise RuntimeError("forced internal fallback check")
 
-        def disambiguate(self, sentence: Sequence[str]) -> list[Any]:
-            del sentence
-            raise RuntimeError("forced internal fallback check")
-
-    real_disambiguator = preprocessor._disambiguator
+    real_d3tok = preprocessor._d3tok
     try:
-        preprocessor._disambiguator = _ForcedD3TokFailure()
+        preprocessor._d3tok = _ForcedD3TokFailure()
         forced_fallback = preprocessor.process(sample)
     finally:
-        preprocessor._disambiguator = real_disambiguator
+        preprocessor._d3tok = real_d3tok
     if not forced_fallback.error or not forced_fallback.error.startswith("D3TokError:"):
         raise AssertionError("Forced D3Tok failure was not diagnosed")
     if not forced_fallback.text.strip() or any(
@@ -1029,25 +865,32 @@ def build_preprocessing_cache(
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     items = list(zip(frame["_id"].astype(str), frame["_text"].astype(str)))
-    preprocessor = create_preprocessor(config, allow_download=True)
-    LOGGER.info(
-        "D3Tok backend: BERT-Unfactored model=%s database=%s batch=%d.",
-        config.D3TOK_BERT_MODEL,
-        preprocessor.database_name,
-        config.D3TOK_BERT_BATCH_SIZE,
-    )
-    run_arabic_preprocessing_checks(preprocessor)
-    processed = preprocessor.process_many(
-        [text for _, text in items],
-        description=f"BERT D3Tok {cache_path.stem}",
-    )
-    rows = [
-        (row_id, result.text, result.error)
-        for (row_id, _), result in zip(items, processed)
-    ]
-    del preprocessor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    rows: list[tuple[str, str, Optional[str]]]
+
+    if config.PREPROCESS_NUM_WORKERS > 1:
+        probe = create_preprocessor(config, allow_download=True)
+        run_arabic_preprocessing_checks(probe)
+        del probe
+        with ProcessPoolExecutor(
+            max_workers=config.PREPROCESS_NUM_WORKERS,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_preprocess_worker_init,
+            initargs=(config.D3TOK_RESOURCE,),
+        ) as executor:
+            rows = list(
+                tqdm(
+                    executor.map(_preprocess_worker_item, items, chunksize=32),
+                    total=len(items),
+                    desc=f"D3Tok {cache_path.stem}",
+                )
+            )
+    else:
+        preprocessor = create_preprocessor(config, allow_download=True)
+        run_arabic_preprocessing_checks(preprocessor)
+        rows = []
+        for row_id, text in tqdm(items, desc=f"D3Tok {cache_path.stem}"):
+            result = preprocessor.process(text)
+            rows.append((row_id, result.text, result.error))
 
     cache_frame = pd.DataFrame(
         {
@@ -1120,9 +963,8 @@ def preprocess_split_cached(
         "rows": len(processed),
         "cache": str(cache_path),
         "fingerprint": fingerprint,
-        "d3tok_backend": "BERTUnfactoredDisambiguator",
-        "d3tok_bert_model": config.D3TOK_BERT_MODEL,
-        "d3tok_database": resolve_d3tok_database_name(config),
+        "d3tok_backend": "MLEDisambiguator+MorphologicalTokenizer",
+        "d3tok_resource": config.D3TOK_RESOURCE,
         "fallback_count": len(failures),
         # Keep every affected ID/error so preprocessing failures are auditable.
         "fallback_errors": failures.to_dict(orient="records"),
@@ -2610,10 +2452,8 @@ def write_preprocessing_report(
     atomic_json_dump(
         {
             "preprocessing_version": PREPROCESSING_VERSION,
-            "d3tok_backend": "BERTUnfactoredDisambiguator",
-            "d3tok_bert_model": config.D3TOK_BERT_MODEL,
-            "requested_database": config.D3TOK_DATABASE,
-            "resolved_database": resolve_d3tok_database_name(config),
+            "d3tok_backend": "MLEDisambiguator+MorphologicalTokenizer",
+            "d3tok_resource": config.D3TOK_RESOURCE,
             "reports": list(reports),
             "total_fallback_count": sum(int(report["fallback_count"]) for report in reports),
         },
@@ -3072,13 +2912,6 @@ def validate_config(config: Config) -> None:
         or config.CALIBRATION_MIN_QWK_GAIN < 0.0
     ):
         raise ValueError(f"Invalid Dev calibration settings: {calibration_values}")
-    if config.PREPROCESS_NUM_WORKERS != 1:
-        raise ValueError(
-            "BERT D3Tok requires PREPROCESS_NUM_WORKERS=1 to avoid duplicating "
-            "the disambiguation model across processes"
-        )
-    if config.D3TOK_BERT_BATCH_SIZE <= 0 or config.D3TOK_SENTENCE_CHUNK_SIZE <= 0:
-        raise ValueError("D3Tok BERT batch/chunk sizes must be positive")
 
 
 def main() -> None:

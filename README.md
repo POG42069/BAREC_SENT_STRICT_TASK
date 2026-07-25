@@ -8,7 +8,7 @@ pipeline nằm trong `train.py` và có thể chạy bằng một lệnh:
 python train.py
 ```
 
-Pipeline sử dụng BERT-disambiguated D3Tok của CAMeL Tools, encoder AraBERTv2 từ
+Pipeline sử dụng MLE D3Tok `calima-msa-r13` của CAMeL Tools, encoder AraBERTv2 từ
 checkpoint CE, một regression head 19 mức và ba auxiliary classification head
 7/5/3 mức chạy song song. Khi Kaggle cung
 cấp hai GPU T4, script tự khởi chạy PyTorch DDP;
@@ -119,8 +119,7 @@ git clone --branch Nho --single-branch \
 cd BAREC_SENT_STRICT_TASK
 
 python -m pip install -r requirements.txt
-camel_data -i disambig-bert-unfactored-msa
-camel_data -i morphology-db-msa-r13
+camel_data -i light
 
 python train.py --smoke-test
 python train.py
@@ -130,11 +129,9 @@ python train.py
 Không nên cài lại PyTorch sau đó vì wheel CPU hoặc CUDA không tương thích có thể
 làm mất khả năng sử dụng hai T4.
 
-Hai lệnh `camel_data` cài BERT-Unfactored disambiguator và database r13 công
-khai. Script ưu tiên `calima-msa-s31`, là database dùng trong paper, nếu đã được
-provision; nếu chưa có, nó fallback có cảnh báo sang r13 để Kaggle vẫn chạy.
-Nếu cấu hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng tự cài hai package
-công khai khi thiếu.
+Lệnh `camel_data -i light` cài tài nguyên công khai cần cho
+`MLEDisambiguator.pretrained("calima-msa-r13")`. Nếu cấu hình
+`AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng tự cài package này khi thiếu.
 
 ### Chạy Blind Test 2026 riêng tư
 
@@ -206,7 +203,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
 | Model | `MODEL_NAME` | Checkpoint CE dùng để khởi tạo encoder/tokenizer |
-| Preprocess | `D3TOK_BERT_MODEL="msa"`, `D3TOK_DATABASE="calima-msa-s31"` | BERT-Unfactored D3Tok; fallback công khai là r13 |
+| Preprocess | `D3TOK_RESOURCE="calima-msa-r13"` | MLE D3Tok nhẹ, giống pipeline `Khangtest` |
 | Length | `MAX_LENGTH=256` | Chiều dài sau HF tokenization |
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
@@ -238,40 +235,35 @@ Thứ tự là một invariant của baseline:
 
 ```text
 raw sentence
-→ CAMeL built-in arclean
-→ contextual Alef-Maksura rule
-→ simple_word_tokenize(split_digits=True)
-→ BERTUnfactoredDisambiguator (ưu tiên calima-msa-s31)
-→ lấy analysis["d3tok"] và tách clitic markers
+→ normalize_unicode(compatibility=True)
+→ xóa Tatweel U+0640
+→ simple_word_tokenize
+→ MLEDisambiguator(calima-msa-r13)
+→ MorphologicalTokenizer(scheme="d3tok", split=True)
 → dediac_ar
 → Hugging Face tokenizer
 ```
 
 Chi tiết:
 
-1. `CharMapper.builtin_mapper("arclean")` thực hiện cùng loại cleaning mà
-   pipeline BAREC chính thức sử dụng, gồm bỏ dấu phụ/Kashida và chuẩn hóa các
-   ký tự mở rộng.
-2. Quy tắc `(?<=\B)ى(?=\B) → ي` được áp dụng giống script preprocessing chính
-   thức.
-3. `simple_word_tokenize(..., split_digits=True)` tạo chuỗi word/punctuation.
-4. `BERTUnfactoredDisambiguator.pretrained(model_name="msa", top=1)` chọn phân
-   tích hình thái theo ngữ cảnh. Analyzer ưu tiên `calima-msa-s31`; khi s31
-   chưa được provision, script cảnh báo và dùng `calima-msa-r13`.
-5. D3Tok được lấy trực tiếp từ top `analysis["d3tok"]`; `_+` và `+_` được đổi
-   thành clitic marker có khoảng trắng như pipeline chính thức.
+1. `normalize_unicode(..., compatibility=True)` chuẩn hóa các biểu diễn Unicode.
+2. Tatweel `U+0640` được xóa trước phân tích hình thái.
+3. `simple_word_tokenize` tạo chuỗi word/punctuation.
+4. `MLEDisambiguator.pretrained("calima-msa-r13")` chọn top analysis theo từ.
+5. `MorphologicalTokenizer(..., scheme="d3tok", split=True, diac=True)` sinh
+   các phân đoạn hình thái.
 6. `dediac_ar` loại dấu phụ còn lại nhưng giữ dấu `+`, sau đó câu mới được đưa
    vào Hugging Face tokenizer.
 
 Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
-arclean và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
+Unicode-normalize và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
 fallback; nó không âm thầm thay bằng chuỗi rỗng và không tạo D3Tok giả.
 
 ## 9. Cache preprocessing
 
 Train, Dev và Test có cache Parquet riêng. Fingerprint bao gồm nội dung ID/text,
-split, phiên bản pipeline, CAMeL Tools, BERT model và database D3Tok thực tế.
-Việc chuyển từ MLE sang BERT hoặc từ r13 sang s31 tự tạo cache mới.
+split, phiên bản pipeline, CAMeL Tools và resource D3Tok. Việc chuyển từ
+BERT-D3Tok sang MLE-r13 tự tạo cache mới.
 
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
@@ -440,26 +432,14 @@ thành công. Raw score (và gold Open Test nếu có) chỉ nằm trong diagnos
 
 ## 16. Troubleshooting
 
-### Không tìm thấy BERT D3Tok hoặc morphology database
+### Không tìm thấy MLE D3Tok hoặc morphology database
 
 ```bash
-camel_data -i disambig-bert-unfactored-msa
-camel_data -i morphology-db-msa-r13
+camel_data -i light
 ```
 
 Sau đó chạy lại. Nếu môi trường không có Internet, tải CAMeL data/model vào một
 phiên có Internet hoặc gắn cache hợp lệ; baseline không thay D3Tok bằng regex.
-
-Để khớp chính xác database `calima-msa-s31` của paper, cần có bản SAMA 3.1
-`LDC2010L01.tgz` được cấp phép:
-
-```bash
-camel_data -i morphology-db-msa-s31
-camel_data -p morphology-db-msa-s31 /path/to/LDC2010L01.tgz
-```
-
-Không được commit hoặc phân phối archive/database có giấy phép trong repository.
-Nếu s31 chưa được provision, log sẽ ghi rõ rằng r13 đang được dùng làm fallback.
 
 ### CUDA out of memory
 
