@@ -281,11 +281,13 @@ hai cột này, pipeline dùng token `UNKNOWN` tương ứng. `Document`, `Book`
 thuộc nguồn dữ liệu.
 
 Các field marker là token học được, được thêm vào tokenizer trước khi model
-khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Ngân sách
-512 token được cấp theo thứ tự `D3Tok → feature/metadata → Surface`: toàn bộ
-D3Tok và feature được giữ nguyên, Surface chỉ dùng phần còn lại và là thành phần
-duy nhất bị truncate. Nếu riêng D3Tok cộng feature đã vượt giới hạn, pipeline
-dừng với chẩn đoán cần chunking thay vì âm thầm cắt D3Tok.
+khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Pipeline
+thử giữ nguyên D3Tok, Surface và toàn bộ feature. Nếu tổng vượt 512 token, các
+feature được bỏ nguyên nhóm từ cuối danh sách ưu tiên:
+`Text_Class → Domain → WLS → WLA → DC → WC`. Vì vậy một label như `[WLA]`
+không bao giờ còn lại mà thiếu value đi kèm. Chỉ sau khi đã bỏ mọi feature mà
+input vẫn quá dài, Surface mới bị truncate. D3Tok không bị truncate âm thầm;
+nếu riêng D3Tok đã vượt giới hạn, pipeline dừng với chẩn đoán cần chunking.
 
 Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
 normalize và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
@@ -404,7 +406,7 @@ Các invariant cần đạt:
 - không còn Arabic diacritics sau `dediac_ar`;
 - dấu câu còn trong cả D3Tok và Surface;
 - dấu `+` của D3Tok không bị xóa;
-- D3Tok và feature block không bị truncate; Surface bị cắt trước;
+- D3Tok không bị truncate; feature chỉ bị bỏ theo nhóm atomic rồi mới tới Surface;
 - output model giữ shape `[batch_size]`, kể cả batch size 1;
 - sampler chia đều hai rank và deterministic theo seed/epoch;
 - gather trả đúng số mẫu theo thứ tự gốc;

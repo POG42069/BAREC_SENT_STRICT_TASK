@@ -1205,17 +1205,23 @@ def text_class_token(value: Any) -> str:
     return mapping.get(key, "[TC_UNKNOWN]")
 
 
-def structured_feature_text(row: Mapping[str, Any]) -> str:
-    """Serialize sentence statistics and low-cardinality metadata."""
+def structured_feature_groups(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Serialize features as atomic groups ordered from highest to lowest priority."""
 
     return (
-        f"[WC] {int(row['_word_count'])} "
-        f"[DC] {float(row['_diacritic_coverage']):.3f} "
-        f"[WLA] {float(row['_word_length_mean']):.3f} "
-        f"[WLS] {float(row['_word_length_std']):.3f} "
-        f"{domain_token(row.get('_domain'))} "
-        f"{text_class_token(row.get('_text_class'))}"
+        f"[WC] {int(row['_word_count'])}",
+        f"[DC] {float(row['_diacritic_coverage']):.3f}",
+        f"[WLA] {float(row['_word_length_mean']):.3f}",
+        f"[WLS] {float(row['_word_length_std']):.3f}",
+        domain_token(row.get("_domain")),
+        text_class_token(row.get("_text_class")),
     )
+
+
+def structured_feature_text(row: Mapping[str, Any]) -> str:
+    """Return the complete feature block for logging and diagnostics."""
+
+    return " ".join(structured_feature_groups(row))
 
 
 def validate_structured_tokenizer(tokenizer: Any) -> None:
@@ -1240,39 +1246,68 @@ def encode_structured_pair(
     tokenizer: Any,
     d3tok_text: str,
     surface_text: str,
-    feature_text: str,
+    feature_groups: Sequence[str],
     max_length: int,
 ) -> dict[str, Any]:
-    """Preserve D3Tok/features completely and truncate only the Surface view."""
+    """Keep D3Tok/Surface first, then retain the largest priority feature prefix."""
 
     d3tok_ids = tokenizer.encode(d3tok_text, add_special_tokens=False)
     surface_ids = tokenizer.encode(surface_text, add_special_tokens=False)
-    feature_ids = tokenizer.encode(feature_text, add_special_tokens=False)
-    if not d3tok_ids or not surface_ids or not feature_ids:
+    feature_group_ids = [
+        tokenizer.encode(group, add_special_tokens=False)
+        for group in feature_groups
+    ]
+    if (
+        not d3tok_ids
+        or not surface_ids
+        or not feature_group_ids
+        or any(not group_ids for group_ids in feature_group_ids)
+    ):
         raise ValueError("Structured pair contains an empty tokenized component")
 
     pair_special_tokens = int(tokenizer.num_special_tokens_to_add(pair=True))
-    fixed_length = pair_special_tokens + 1
-    content_budget = max_length - fixed_length
-    if content_budget < 1:
+    d3tok_only_length = pair_special_tokens + len(d3tok_ids)
+    if d3tok_only_length > max_length:
         raise ValueError(
-            "MAX_LENGTH is too small to construct a structured sentence pair: "
-            f"max_length={max_length}, fixed_length={fixed_length}"
+            "D3Tok alone exceeds MAX_LENGTH. D3Tok was not truncated; this "
+            "sample requires a chunking strategy. "
+            f"d3tok_tokens={len(d3tok_ids)}, pair_special_tokens="
+            f"{pair_special_tokens}, max_length={max_length}"
         )
 
-    protected_length = len(d3tok_ids) + len(feature_ids)
-    if protected_length > content_budget:
-        raise ValueError(
-            "D3Tok plus the structured feature block exceeds MAX_LENGTH. "
-            "D3Tok was not truncated; this sample requires a chunking strategy. "
-            f"d3tok_tokens={len(d3tok_ids)}, feature_tokens={len(feature_ids)}, "
-            f"available_content_tokens={content_budget}, max_length={max_length}"
+    # First try the complete Surface and every atomic feature group. If that
+    # overflows, remove whole groups from the lowest-priority end. Only after
+    # every feature is gone may Surface be truncated.
+    selected_group_ids = list(feature_group_ids)
+
+    def encoded_length() -> int:
+        feature_length = sum(len(group_ids) for group_ids in selected_group_ids)
+        feature_separator = 1 if selected_group_ids else 0
+        return (
+            pair_special_tokens
+            + len(d3tok_ids)
+            + len(surface_ids)
+            + feature_separator
+            + feature_length
         )
 
-    surface_budget = content_budget - protected_length
-    surface_ids = surface_ids[:surface_budget]
+    while selected_group_ids and encoded_length() > max_length:
+        selected_group_ids.pop()
 
-    paired_ids = surface_ids + [int(tokenizer.sep_token_id)] + feature_ids
+    if encoded_length() > max_length:
+        surface_budget = max_length - pair_special_tokens - len(d3tok_ids)
+        surface_ids = surface_ids[: max(0, surface_budget)]
+
+    selected_feature_ids = [
+        token_id
+        for group_ids in selected_group_ids
+        for token_id in group_ids
+    ]
+    paired_ids = list(surface_ids)
+    if selected_feature_ids:
+        paired_ids.append(int(tokenizer.sep_token_id))
+        paired_ids.extend(selected_feature_ids)
+
     encoded = dict(
         tokenizer.prepare_for_model(
             d3tok_ids,
@@ -1289,9 +1324,12 @@ def encode_structured_pair(
     encoded_d3tok_ids = encoded["input_ids"][1 : 1 + len(d3tok_ids)]
     if encoded_d3tok_ids != d3tok_ids:
         raise AssertionError("D3Tok was altered or truncated during pair encoding")
-    feature_start = len(encoded["input_ids"]) - 1 - len(feature_ids)
-    if encoded["input_ids"][feature_start:-1] != feature_ids:
-        raise AssertionError("Structured feature block was altered during encoding")
+    if selected_feature_ids:
+        feature_start = len(encoded["input_ids"]) - 1 - len(selected_feature_ids)
+        if encoded["input_ids"][feature_start:-1] != selected_feature_ids:
+            raise AssertionError(
+                "A selected structured feature group was altered during encoding"
+            )
     return encoded
 
 
@@ -1302,7 +1340,7 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.d3tok_texts = frame["_d3tok_text"].astype(str).tolist()
         rows = frame.to_dict(orient="records")
         self.surface_texts = [str(row["_surface_text"]) for row in rows]
-        self.feature_texts = [structured_feature_text(row) for row in rows]
+        self.feature_groups = [structured_feature_groups(row) for row in rows]
         self.ids = frame["_id"].astype(str).tolist()
         self.indices = frame["_original_index"].astype(int).tolist()
         self.has_labels = bool(frame.attrs.get("has_labels", False))
@@ -1320,7 +1358,7 @@ class BARECDataset(Dataset[dict[str, Any]]):
             self.tokenizer,
             self.d3tok_texts[index],
             self.surface_texts[index],
-            self.feature_texts[index],
+            self.feature_groups[index],
             self.max_length,
         )
         item: dict[str, Any] = dict(encoded)
@@ -1638,7 +1676,7 @@ def run_regression_shape_check(
     tokenizer: Any,
     d3tok_text: str,
     surface_text: str,
-    feature_text: str,
+    feature_groups: Sequence[str],
     device: torch.device,
     max_length: int,
 ) -> None:
@@ -1648,7 +1686,7 @@ def run_regression_shape_check(
         tokenizer,
         d3tok_text,
         surface_text,
-        feature_text,
+        feature_groups,
         max_length,
     )
     token_type_ids = encoded.get("token_type_ids")
@@ -2525,7 +2563,7 @@ def train_select_and_predict(
         tokenizer,
         str(probe_row["_d3tok_text"]),
         str(probe_row["_surface_text"]),
-        structured_feature_text(probe_row),
+        structured_feature_groups(probe_row),
         context.device,
         config.MAX_LENGTH,
     )
