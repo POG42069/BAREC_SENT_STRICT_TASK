@@ -55,11 +55,20 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
-PREPROCESSING_VERSION = "barec-structured-pair-v3"
+PREPROCESSING_VERSION = "barec-structured-pair-v4"
 TATWEEL = "\u0640"
-ARABIC_DIACRITICS = frozenset(chr(code) for code in range(0x064B, 0x0653)) | {
-    "\u0670"
-}
+ARABIC_DIACRITICS = frozenset(
+    chr(codepoint)
+    for start, end in (
+        (0x0610, 0x061A),
+        (0x064B, 0x065F),
+        (0x0670, 0x0670),
+        (0x06D6, 0x06ED),
+        (0x08D3, 0x08FF),
+    )
+    for codepoint in range(start, end + 1)
+    if unicodedata.category(chr(codepoint)).startswith("M")
+)
 FIELD_TOKENS = (
     "[WC]",
     "[DC]",
@@ -264,11 +273,16 @@ def maybe_self_launch_ddp(args: argparse.Namespace) -> bool:
         command.append("--smoke-test")
     print("Detected at least two GPUs; launching PyTorch DDP:")
     print(" ".join(command))
+    child_environment = os.environ.copy()
+    # Rank 0 can legitimately spend several minutes building the first D3Tok
+    # cache while rank 1 waits at a collective. PyTorch's default NCCL monitor
+    # may otherwise abort the healthy worker after roughly eight minutes.
+    child_environment.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "3600")
     subprocess.run(
         command,
         check=True,
         cwd=str(SCRIPT_DIR),
-        env=os.environ.copy(),
+        env=child_environment,
     )
     return True
 
@@ -658,30 +672,104 @@ class ArabicD3TokPreprocessor:
             float(lengths.std()),
         )
 
-    def _render_d3tok_sentence(self, sentence_analysis: Sequence[Any]) -> str:
-        """Render CAMeL analyses exactly like the public SBTW preprocessing."""
+    @staticmethod
+    def _is_diacritic_only(token: str) -> bool:
+        """Return whether a tokenizer item contains Arabic marks and no base."""
+
+        return bool(token) and all(char in ARABIC_DIACRITICS for char in token)
+
+    @staticmethod
+    def _contains_arabic_letter(token: str) -> bool:
+        """Return whether a token contains an Arabic-script letter."""
+
+        return any(
+            (
+                "\u0600" <= char <= "\u06ff"
+                or "\u0750" <= char <= "\u077f"
+                or "\u08a0" <= char <= "\u08ff"
+            )
+            and unicodedata.category(char).startswith("L")
+            for char in token
+        )
+
+    def tokenize_for_d3tok(self, normalized_text: str) -> list[str]:
+        """Repair detached marks and remove mark-only items before BERT."""
+
+        raw_tokens = self._simple_word_tokenize(
+            normalized_text,
+            split_digits=True,
+        )
+        repaired_tokens: list[str] = []
+        for token in raw_tokens:
+            if self._is_diacritic_only(token):
+                if (
+                    repaired_tokens
+                    and self._contains_arabic_letter(repaired_tokens[-1])
+                ):
+                    repaired_tokens[-1] += token
+                # A leading mark or a mark after punctuation has no lexical
+                # base for morphological analysis. DC was already computed on
+                # the untouched normalized sentence, so dropping it here does
+                # not alter the orthographic statistic.
+                continue
+            repaired_tokens.append(token)
+        if not repaired_tokens:
+            raise ValueError("D3Tok tokenization produced no lexical content")
+        if any(self._is_diacritic_only(token) for token in repaired_tokens):
+            raise AssertionError("A detached Arabic diacritic reached BERT D3Tok")
+        return repaired_tokens
+
+    def _render_d3tok_sentence(
+        self,
+        sentence_analysis: Sequence[Any],
+        input_tokens: Sequence[str],
+    ) -> tuple[str, Optional[str]]:
+        """Render D3Tok, falling back only for individual unanalyzable tokens."""
 
         rendered_words: list[str] = []
-        for item in sentence_analysis:
-            if not item.analyses:
-                raise ValueError("BERT D3Tok returned a token without analyses")
-            scored_analysis = item.analyses[0]
-            analysis = (
-                scored_analysis.analysis
-                if hasattr(scored_analysis, "analysis")
-                else scored_analysis[1]
+        fallback_positions: list[int] = []
+        if len(sentence_analysis) != len(input_tokens):
+            raise RuntimeError(
+                "BERT D3Tok token/analysis length mismatch: "
+                f"tokens={len(input_tokens)}, analyses={len(sentence_analysis)}"
             )
-            if "d3tok" not in analysis:
-                raise KeyError("BERT D3Tok analysis is missing the 'd3tok' field")
+        for position, (item, input_token) in enumerate(
+            zip(sentence_analysis, input_tokens)
+        ):
+            analysis: Mapping[str, Any] = {}
+            if item.analyses:
+                scored_analysis = item.analyses[0]
+                analysis = (
+                    scored_analysis.analysis
+                    if hasattr(scored_analysis, "analysis")
+                    else scored_analysis[1]
+                )
+            d3tok = analysis.get("d3tok")
+            if d3tok is None:
+                fallback_token = self._dediac_ar(input_token).replace(TATWEEL, "")
+                if not fallback_token.strip():
+                    raise ValueError(
+                        "BERT D3Tok token fallback produced no content at "
+                        f"position {position}"
+                    )
+                rendered_words.append(fallback_token)
+                fallback_positions.append(position)
+                continue
             rendered_words.append(
-                self._dediac_ar(str(analysis["d3tok"]))
+                self._dediac_ar(str(d3tok))
                 .replace("_+", " +")
                 .replace("+_", "+ ")
             )
         processed = " ".join(rendered_words)
         if not processed.strip():
             raise ValueError("BERT D3Tok returned no content")
-        return processed
+        diagnostic = (
+            None
+            if not fallback_positions
+            else "TokenD3TokFallback: positions="
+            + ",".join(str(position) for position in fallback_positions)
+        )
+        return processed, diagnostic
 
     def process_many(self, texts: Sequence[str]) -> list[PreprocessResult]:
         """Process a batch through BERT, isolating any per-row failures."""
@@ -719,9 +807,7 @@ class ArabicD3TokPreprocessor:
             surface_texts[index] = surface
             statistics[index] = self.sentence_statistics(normalized, surface)
             valid_indices.append(index)
-            tokenized_sentences.append(
-                self._simple_word_tokenize(normalized, split_digits=True)
-            )
+            tokenized_sentences.append(self.tokenize_for_d3tok(normalized))
 
         if tokenized_sentences:
             try:
@@ -732,16 +818,24 @@ class ArabicD3TokPreprocessor:
                     raise RuntimeError(
                         "BERT D3Tok returned a different number of sentences"
                     )
-                for index, sentence_analysis in zip(valid_indices, analyzed_sentences):
+                for index, sentence_analysis, words in zip(
+                    valid_indices,
+                    analyzed_sentences,
+                    tokenized_sentences,
+                ):
                     dc, wc, wla, wls = statistics[index]
+                    d3tok_text, diagnostic = self._render_d3tok_sentence(
+                        sentence_analysis,
+                        words,
+                    )
                     results[index] = PreprocessResult(
-                        self._render_d3tok_sentence(sentence_analysis),
+                        d3tok_text,
                         surface_texts[index],
                         dc,
                         wc,
                         wla,
                         wls,
-                        None,
+                        diagnostic,
                     )
             except Exception as batch_error:
                 # A malformed row should not force every row in a BERT batch to
@@ -752,14 +846,18 @@ class ArabicD3TokPreprocessor:
                             [words]
                         )[0]
                         dc, wc, wla, wls = statistics[index]
+                        d3tok_text, diagnostic = self._render_d3tok_sentence(
+                            sentence_analysis,
+                            words,
+                        )
                         results[index] = PreprocessResult(
-                            self._render_d3tok_sentence(sentence_analysis),
+                            d3tok_text,
                             surface_texts[index],
                             dc,
                             wc,
                             wla,
                             wls,
-                            None,
+                            diagnostic,
                         )
                     except Exception as row_error:
                         dc, wc, wla, wls = statistics[index]
@@ -894,7 +992,12 @@ def preprocessing_fingerprint(
         "normalization": "CAMeL normalize_unicode compatibility=True",
         "kashida": "remove U+0640 while retaining Arabic diacritics",
         "disambiguator": "BERTUnfactoredDisambiguator top=1 sees diacritics",
+        "detached_diacritics": (
+            "reattach mark-only tokens to the preceding Arabic word and drop "
+            "residual mark-only tokens before BERT"
+        ),
         "segmentation": "analysis['d3tok'] with _+ and +_ boundary conversion",
+        "token_fallback": "missing d3tok falls back per-token, not per-sentence",
         "dediac": "CAMeL dediac_ar after BERT D3Tok and on Surface view",
         "statistics": "DC before dediac; WC/WLA/WLS on Surface tokens",
         "punctuation": "preserved in D3Tok and Surface views",
@@ -920,6 +1023,25 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
         raise AssertionError("Kashida removal check failed")
     if not any(char in ARABIC_DIACRITICS for char in normalized):
         raise AssertionError("Diacritics must remain available to BERT D3Tok")
+    detached_probe = preprocessor.tokenize_for_d3tok("الله ُ، ِ عَلَى")
+    if not any(
+        token.startswith("الله") and "\u064f" in token
+        for token in detached_probe
+    ):
+        raise AssertionError("Detached diacritic was not reattached to its word")
+    detached_mark_probes = (
+        detached_probe,
+        preprocessor.tokenize_for_d3tok("ِ عَلَى قُوَّةِ المُؤْمِنِ."),
+        preprocessor.tokenize_for_d3tok("(حَدِيثَة)ً تَحْتَ الصّورَةِ"),
+        preprocessor.tokenize_for_d3tok("كلمة ٔ أخرى"),
+        preprocessor.tokenize_for_d3tok("لفظ ۤ آخر"),
+    )
+    if any(
+        preprocessor._is_diacritic_only(token)
+        for tokens in detached_mark_probes
+        for token in tokens
+    ):
+        raise AssertionError("A mark-only token survived D3Tok preparation")
     result = preprocessor.process(sample)
     if not result.d3tok_text.strip() or not result.surface_text.strip():
         raise AssertionError("D3Tok content-preservation check failed")
@@ -944,6 +1066,21 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
     )
     if not math.isclose(result.diacritic_coverage, expected_dc):
         raise AssertionError("Diacritic coverage was not computed before dediac")
+
+    class _MissingD3TokItem:
+        analyses = [
+            type("_ScoredAnalysis", (), {"analysis": {"diac": "كِتاب"}})()
+        ]
+
+    token_fallback_text, token_fallback_error = preprocessor._render_d3tok_sentence(
+        [_MissingD3TokItem()],
+        ["كِتاب"],
+    )
+    if token_fallback_text != "كتاب" or not (
+        token_fallback_error
+        and token_fallback_error.startswith("TokenD3TokFallback:")
+    ):
+        raise AssertionError("Per-token missing-d3tok fallback check failed")
 
     class _ForcedBERTD3TokFailure:
         def disambiguate_sentences(

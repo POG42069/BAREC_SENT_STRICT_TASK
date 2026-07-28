@@ -235,6 +235,7 @@ raw sentence
 → bỏ Kashida U+0640 nhưng vẫn giữ dấu phụ
 → đổi alif-maqsura nội từ thành ya như SBTW
 → simple_word_tokenize(split_digits=True)
+→ gắn dấu phụ đứng riêng vào từ trước; bỏ mark-only token còn sót
 → BERTUnfactoredDisambiguator("msa", top=1)
 → lấy analysis["d3tok"]
 → dediac_ar và chuyển biên `_+`/`+_` → D3Tok view
@@ -251,11 +252,14 @@ Chi tiết:
    nên BERT D3Tok vẫn nhận được dấu phụ của câu gốc.
 2. Alif-maqsura `ى` ở giữa từ được đổi thành ya `ي`, giống code SBTW.
 3. `simple_word_tokenize(..., split_digits=True)` tạo word/punctuation sequence.
-4. `BERTUnfactoredDisambiguator.pretrained(model_name="msa",
+4. Các dạng lỗi khoảng trắng như `الله ُ` được sửa thành token `اللهُ`. Dấu phụ
+   đứng đầu câu hoặc sau dấu câu, không có base letter để phân tích hình thái,
+   bị loại khỏi input D3Tok nhưng vẫn được tính trong `[DC]`.
+5. `BERTUnfactoredDisambiguator.pretrained(model_name="msa",
    pretrained_cache=False, top=1)` chọn phân tích hình thái theo ngữ cảnh.
-5. Pipeline lấy trường `analysis["d3tok"]`, chạy `dediac_ar`, rồi chuyển `_+`
+6. Pipeline lấy trường `analysis["d3tok"]`, chạy `dediac_ar`, rồi chuyển `_+`
    thành ` +` và `+_` thành `+ ` đúng theo preprocessing công khai của SBTW.
-6. Dấu câu được giữ trong cả D3Tok view và Surface view.
+7. Dấu câu được giữ trong cả D3Tok view và Surface view.
 
 Bốn feature số được tính theo đúng thời điểm:
 
@@ -289,9 +293,11 @@ không bao giờ còn lại mà thiếu value đi kèm. Chỉ sau khi đã bỏ 
 input vẫn quá dài, Surface mới bị truncate. D3Tok không bị truncate âm thầm;
 nếu riêng D3Tok đã vượt giới hạn, pipeline dừng với chẩn đoán cần chunking.
 
-Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
-normalize và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
-fallback; nó không âm thầm thay bằng chuỗi rỗng và không tạo D3Tok giả.
+Nếu một token hợp lệ vẫn không có trường `d3tok`, chỉ token đó dùng surface
+fallback; các token khác trong câu vẫn giữ D3Tok. Chỉ khi toàn bộ lời gọi BERT
+cho câu phát sinh exception thì pipeline mới dùng Surface view cho cả câu.
+Script ghi ID/loại lỗi và tổng số fallback; nó không âm thầm thay bằng chuỗi
+rỗng và không tạo D3Tok giả.
 
 ## 9. Cache preprocessing
 
@@ -403,6 +409,7 @@ Các invariant cần đạt:
 
 - không còn `U+0640` sau preprocessing;
 - BERT D3Tok nhận câu còn dấu phụ;
+- không có token chỉ chứa dấu phụ đi vào BERT D3Tok;
 - không còn Arabic diacritics sau `dediac_ar`;
 - dấu câu còn trong cả D3Tok và Surface;
 - dấu `+` của D3Tok không bị xóa;
@@ -485,6 +492,10 @@ không full-train để che một lỗi khởi tạo DDP. Nếu log báo
 `Expected to have finished reduction ... parameters that were not used`, hãy
 `git pull origin Nho` để lấy bản đã loại BERT pooler rồi chạy lại; cache
 D3Tok đã hoàn thành vẫn có thể tái sử dụng.
+
+Khi script tự khởi chạy hai GPU, nó đặt mặc định
+`TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600`. Điều này cho phép rank 1 chờ rank 0
+xây cache D3Tok lâu hơn ngưỡng watchdog mặc định mà không bị `SIGABRT`.
 
 ### `torch.cuda.is_available()` là `False`
 

@@ -434,6 +434,9 @@ def maybe_self_launch_ddp(args: argparse.Namespace, blind_path: Path) -> bool:
 
     child_environment = os.environ.copy()
     child_environment[LOCAL_BLIND_PATH_ENV] = str(blind_path.resolve())
+    # Rank 0 owns the potentially long D3Tok cache build while rank 1 waits.
+    # Keep the NCCL monitor from treating that expected wait as a deadlock.
+    child_environment.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "3600")
     # Workers only need the already materialized Parquet file. Do not propagate
     # the private credential unnecessarily.
     for name in dict.fromkeys((args.hf_token_env, *TOKEN_ENV_ALIASES)):
