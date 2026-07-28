@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BAREC 2026 sentence-level Strict Track multitask regression baseline.
+"""BAREC 2026 sentence-level Strict Track regression baseline.
 
 The complete workflow lives in this file: validation, Arabic D3Tok
 preprocessing, distributed fine-tuning, model selection, inference, and
@@ -17,7 +17,6 @@ import inspect
 import json
 import logging
 import math
-import multiprocessing
 import os
 import random
 import re
@@ -29,7 +28,6 @@ import time
 import unicodedata
 import uuid
 import zipfile
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -40,7 +38,6 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.metrics import cohen_kappa_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -56,7 +53,7 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
-PREPROCESSING_VERSION = "barec-d3tok-v1"
+PREPROCESSING_VERSION = "barec-d3tok-bert-v2"
 TATWEEL = "\u0640"
 ARABIC_DIACRITICS = frozenset(chr(code) for code in range(0x064B, 0x0653)) | {
     "\u0670"
@@ -85,10 +82,21 @@ class Config:
     MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
     MAX_LENGTH: int = 256
     DROPOUT: float = 0.1
-    D3TOK_RESOURCE: str = "calima-msa-r13"
+    D3TOK_BERT_MODEL: str = "msa"
+    D3TOK_DATABASE: str = "calima-msa-s31"
+    D3TOK_FALLBACK_DATABASE: str = "calima-msa-r13"
+    D3TOK_ALLOW_DATABASE_FALLBACK: bool = True
+    D3TOK_BERT_BATCH_SIZE: int = 32
+    D3TOK_SENTENCE_CHUNK_SIZE: int = 256
+    D3TOK_BERT_USE_GPU: bool = True
     AUTO_DOWNLOAD_CAMEL_DATA: bool = True
-    CAMEL_DATA_PACKAGE: str = "light"
+    CAMEL_DATA_PACKAGES: tuple[str, ...] = (
+        "disambig-bert-unfactored-msa",
+        "morphology-db-msa-r13",
+    )
     FORCE_REPROCESS: bool = False
+    # BERT disambiguation batches sentences internally. Multiple Python
+    # workers would duplicate the 445 MB tagger and can exhaust RAM/VRAM.
     PREPROCESS_NUM_WORKERS: int = 1
 
     # Training.
@@ -102,17 +110,6 @@ class Config:
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
     EARLY_STOPPING_PATIENCE: int = 2
-    AUXILIARY_7_LOSS_WEIGHT: float = 0.30
-    AUXILIARY_5_LOSS_WEIGHT: float = 0.20
-    AUXILIARY_3_LOSS_WEIGHT: float = 0.10
-    USE_DEV_AFFINE_CALIBRATION: bool = True
-    CALIBRATION_SCALE_MIN: float = 0.80
-    CALIBRATION_SCALE_MAX: float = 1.20
-    CALIBRATION_SCALE_STEP: float = 0.01
-    CALIBRATION_BIAS_MIN: float = -1.00
-    CALIBRATION_BIAS_MAX: float = 1.00
-    CALIBRATION_BIAS_STEP: float = 0.025
-    CALIBRATION_MIN_QWK_GAIN: float = 0.001
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
@@ -349,96 +346,6 @@ ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
 DOCUMENT_ALIASES = ("Document", "document")
-AUXILIARY_LEVELS = (7, 5, 3)
-AUXILIARY_LABEL_COLUMNS = {
-    7: "Readability_Level_7",
-    5: "Readability_Level_5",
-    3: "Readability_Level_3",
-}
-# Inclusive upper boundaries for the official nested 19 -> 7 -> 5 -> 3
-# readability-level collapses.
-AUXILIARY_LEVEL_BOUNDARIES = {
-    7: (4, 7, 9, 11, 13, 15, 19),
-    5: (7, 11, 13, 15, 19),
-    3: (11, 13, 19),
-}
-
-
-def collapse_readability_labels(
-    labels_19: Sequence[int] | np.ndarray,
-    target_levels: int,
-) -> np.ndarray:
-    """Collapse 19-level labels into the official nested coarse label space."""
-
-    if target_levels not in AUXILIARY_LEVEL_BOUNDARIES:
-        raise ValueError(f"Unsupported auxiliary label space: {target_levels}")
-    labels = np.asarray(labels_19, dtype=np.int64)
-    if labels.ndim != 1:
-        raise ValueError("Readability labels must be a one-dimensional sequence")
-    if ((labels < 1) | (labels > 19)).any():
-        raise ValueError("Readability labels must be inside 1..19 before collapsing")
-    boundaries = np.asarray(
-        AUXILIARY_LEVEL_BOUNDARIES[target_levels],
-        dtype=np.int64,
-    )
-    return np.searchsorted(boundaries, labels, side="left") + 1
-
-
-def validate_and_attach_auxiliary_labels(
-    frame: pd.DataFrame,
-    labels_19: np.ndarray,
-    split_name: str,
-) -> None:
-    """Validate supplied coarse labels and attach deterministic internal targets."""
-
-    for target_levels in AUXILIARY_LEVELS:
-        derived = collapse_readability_labels(labels_19, target_levels)
-        source_column = AUXILIARY_LABEL_COLUMNS[target_levels]
-        if source_column in frame.columns:
-            source = frame[source_column]
-            if source.isna().any():
-                rows = frame.index[source.isna()].tolist()[:10]
-                raise ValueError(
-                    f"{split_name}: missing {target_levels}-level labels at rows {rows}"
-                )
-            numeric = pd.to_numeric(source, errors="coerce")
-            values = numeric.to_numpy(dtype=float)
-            invalid = (
-                numeric.isna().to_numpy()
-                | ~np.isfinite(values)
-                | ~np.isclose(values, np.rint(values))
-            )
-            if invalid.any():
-                rows = np.flatnonzero(invalid)[:10].tolist()
-                raise ValueError(
-                    f"{split_name}: invalid {target_levels}-level labels at rows {rows}"
-                )
-            supplied = np.rint(values).astype(np.int64)
-            mismatch = supplied != derived
-            if mismatch.any():
-                rows = np.flatnonzero(mismatch)[:10].tolist()
-                raise ValueError(
-                    f"{split_name}: {source_column} disagrees with the official "
-                    f"19-to-{target_levels} mapping at rows {rows}"
-                )
-        frame[f"_label_{target_levels}"] = derived
-
-
-def run_auxiliary_label_checks() -> None:
-    """Verify all official hierarchy boundaries before loading real data."""
-
-    labels = np.arange(1, 20, dtype=np.int64)
-    expected = {
-        7: [1, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 7, 7],
-        5: [1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 5, 5, 5],
-        3: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3],
-    }
-    for target_levels, expected_labels in expected.items():
-        actual = collapse_readability_labels(labels, target_levels)
-        if actual.tolist() != expected_labels:
-            raise AssertionError(
-                f"Incorrect official 19-to-{target_levels} label collapse"
-            )
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -538,8 +445,6 @@ def load_split(
         )
 
     frame["_label"] = np.nan
-    for target_levels in AUXILIARY_LEVELS:
-        frame[f"_label_{target_levels}"] = np.nan
     if label_column is not None:
         label_source = frame[label_column]
         if not require_label and label_source.isna().all():
@@ -566,7 +471,6 @@ def load_split(
                     f"{config.MAX_LABEL}]: {bad}"
                 )
             frame["_label"] = labels
-            validate_and_attach_auxiliary_labels(frame, labels, split_name)
 
     if document_column is not None:
         frame["_document"] = frame[document_column].map(
@@ -653,71 +557,207 @@ class PreprocessResult:
     error: Optional[str]
 
 
-class ArabicD3TokPreprocessor:
-    """Apply Unicode normalization, Tatweel removal, MLE D3Tok, then dediacritize."""
+def resolve_d3tok_database_name(config: Config) -> str:
+    """Prefer the paper's SAMA 3.1 database and explicitly record any fallback."""
 
-    def __init__(self, resource: str) -> None:
+    cached = getattr(config, "_resolved_d3tok_database", None)
+    if isinstance(cached, str):
+        return cached
+
+    try:
+        from camel_tools.morphology.database import MorphologyDB
+    except ImportError:
+        # Resource installation is handled by create_preprocessor(). Returning
+        # the public fallback here keeps the pre-install cache key deterministic.
+        resolved = config.D3TOK_FALLBACK_DATABASE
+    else:
         try:
-            from camel_tools.disambig.mle import MLEDisambiguator
-            from camel_tools.tokenizers.morphological import MorphologicalTokenizer
+            MorphologyDB.builtin_db(config.D3TOK_DATABASE, "a")
+            resolved = config.D3TOK_DATABASE
+        except Exception as requested_error:
+            if not config.D3TOK_ALLOW_DATABASE_FALLBACK:
+                raise RuntimeError(
+                    f"D3Tok requires {config.D3TOK_DATABASE!r}, but it is unavailable. "
+                    "Provision SAMA 3.1 with `camel_data -i morphology-db-msa-s31` "
+                    "and `camel_data -p morphology-db-msa-s31 /path/LDC2010L01.tgz`."
+                ) from requested_error
+            resolved = config.D3TOK_FALLBACK_DATABASE
+
+    setattr(config, "_resolved_d3tok_database", resolved)
+    return resolved
+
+
+class ArabicD3TokPreprocessor:
+    """Replicate BAREC's BERT-disambiguated D3Tok input construction."""
+
+    def __init__(self, config: Config) -> None:
+        try:
+            from camel_tools.disambig.bert import BERTUnfactoredDisambiguator
+            from camel_tools.morphology.analyzer import Analyzer
+            from camel_tools.morphology.database import MorphologyDB
             from camel_tools.tokenizers.word import simple_word_tokenize
+            from camel_tools.utils.charmap import CharMapper
             from camel_tools.utils.dediac import dediac_ar
-            from camel_tools.utils.normalize import normalize_unicode
+            from camel_tools.utils.transliterate import Transliterator
         except ImportError as error:
             raise RuntimeError(
-                "CAMeL Tools is required for real D3Tok. Install requirements.txt first."
+                "CAMeL Tools with BERT disambiguation is required for D3Tok. "
+                "Install requirements.txt and the configured CAMeL data packages."
             ) from error
 
         self._simple_word_tokenize = simple_word_tokenize
         self._dediac_ar = dediac_ar
-        self._normalize_unicode = normalize_unicode
-        disambiguator = MLEDisambiguator.pretrained(resource)
-        self._d3tok = MorphologicalTokenizer(
-            disambiguator=disambiguator,
-            scheme="d3tok",
-            split=True,
-            diac=True,
+        self._clean_transliterator = Transliterator(
+            CharMapper.builtin_mapper("arclean")
         )
+        self.database_name = resolve_d3tok_database_name(config)
+
+        database = MorphologyDB.builtin_db(self.database_name, "a")
+        analyzer = Analyzer(database, backoff="ADD_PROP", cache_size=100000)
+        self._disambiguator = BERTUnfactoredDisambiguator.pretrained(
+            model_name=config.D3TOK_BERT_MODEL,
+            top=1,
+            use_gpu=config.D3TOK_BERT_USE_GPU,
+            batch_size=config.D3TOK_BERT_BATCH_SIZE,
+            pretrained_cache=False,
+            ranking_cache_size=100000,
+        )
+        if hasattr(self._disambiguator, "set_analyzer"):
+            self._disambiguator.set_analyzer(analyzer)
+        else:
+            # CAMeL Tools 1.5.5 used the same analyzer slot before exposing the
+            # public setter used by newer versions.
+            self._disambiguator._analyzer = analyzer
+        self._sentence_chunk_size = config.D3TOK_SENTENCE_CHUNK_SIZE
 
     def normalize_and_remove_tatweel(self, text: str) -> str:
-        """Perform compatibility Unicode normalization and remove only U+0640."""
+        """Apply the official BAREC arclean map and contextual Alef-Maksura rule."""
 
-        normalized = self._normalize_unicode(text, compatibility=True)
-        return normalized.replace(TATWEEL, "")
+        cleaned = self._clean_transliterator.transliterate(text)
+        return re.sub(r"(?<=\B)ى(?=\B)", "ي", cleaned)
 
     def fallback(self, normalized_text: str) -> str:
-        """Preserve normalized content when morphological tokenization fails."""
+        """Preserve cleaned content when contextual disambiguation fails."""
 
         return self._dediac_ar(normalized_text).replace(TATWEEL, "")
 
-    def process(self, text: str) -> PreprocessResult:
-        """Preprocess one sentence, using a content-preserving per-row fallback."""
-
+    def _prepare(self, text: str) -> tuple[str, list[str]]:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("D3Tok received an empty/non-string sentence")
+        cleaned = self.normalize_and_remove_tatweel(text)
+        words = self._simple_word_tokenize(cleaned, split_digits=True)
+        if not words:
+            raise ValueError("D3Tok word tokenization returned no content")
+        return cleaned, words
+
+    def _render_disambiguated_sentence(self, words: Sequence[Any]) -> str:
+        output_words: list[str] = []
+        for word in words:
+            if not getattr(word, "analyses", None):
+                raise ValueError("BERT disambiguator returned no analysis")
+            scored_analysis = word.analyses[0]
+            analysis = getattr(scored_analysis, "analysis", None)
+            if analysis is None:
+                try:
+                    analysis = scored_analysis[1]
+                except Exception as error:
+                    raise TypeError("Unsupported CAMeL scored-analysis object") from error
+            d3tok = analysis.get("d3tok")
+            if not isinstance(d3tok, str) or not d3tok:
+                raise ValueError("Top BERT analysis does not contain d3tok")
+            rendered = (
+                self._dediac_ar(d3tok)
+                .replace("_+", " +")
+                .replace("+_", "+ ")
+            )
+            output_words.append(rendered)
+        processed = " ".join(output_words)
+        if not processed.strip():
+            raise ValueError("BERT D3Tok returned no content")
+        return processed
+
+    def _disambiguate_chunk(
+        self,
+        prepared: Sequence[tuple[int, str, list[str]]],
+        results: list[Optional[PreprocessResult]],
+    ) -> None:
+        tokenized_sentences = [words for _, _, words in prepared]
         try:
-            normalized = self.normalize_and_remove_tatweel(text)
-        except Exception as error:
-            normalized = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
-            fallback = self._dediac_ar(normalized)
-            return PreprocessResult(
-                fallback,
-                f"UnicodeNormalizationError: {type(error).__name__}: {error}",
+            disambiguated = self._disambiguator.disambiguate_sentences(
+                tokenized_sentences
+            )
+            if len(disambiguated) != len(prepared):
+                raise RuntimeError("BERT disambiguator changed the sentence count")
+            for (index, cleaned, _), sentence in zip(prepared, disambiguated):
+                try:
+                    results[index] = PreprocessResult(
+                        self._render_disambiguated_sentence(sentence),
+                        None,
+                    )
+                except Exception as error:
+                    results[index] = PreprocessResult(
+                        self.fallback(cleaned),
+                        f"D3TokError: {type(error).__name__}: {error}",
+                    )
+        except Exception as chunk_error:
+            # Keep failures auditable per ID. A single malformed sentence must
+            # not force every sentence in its BERT batch through the fallback.
+            for index, cleaned, words in prepared:
+                try:
+                    sentence = self._disambiguator.disambiguate(words)
+                    results[index] = PreprocessResult(
+                        self._render_disambiguated_sentence(sentence),
+                        None,
+                    )
+                except Exception as row_error:
+                    results[index] = PreprocessResult(
+                        self.fallback(cleaned),
+                        "D3TokError: "
+                        f"{type(row_error).__name__}: {row_error}; "
+                        "batch_error="
+                        f"{type(chunk_error).__name__}: {chunk_error}",
+                    )
+
+    def process_many(
+        self,
+        texts: Sequence[str],
+        *,
+        description: str,
+    ) -> list[PreprocessResult]:
+        """Clean, batch-disambiguate, and render many sentences in input order."""
+
+        results: list[Optional[PreprocessResult]] = [None] * len(texts)
+        prepared: list[tuple[int, str, list[str]]] = []
+        for index, text in enumerate(texts):
+            try:
+                cleaned, words = self._prepare(text)
+                prepared.append((index, cleaned, words))
+            except Exception as error:
+                normalized = unicodedata.normalize("NFKC", str(text)).replace(TATWEEL, "")
+                results[index] = PreprocessResult(
+                    self.fallback(normalized),
+                    f"CleaningError: {type(error).__name__}: {error}",
+                )
+
+        chunks = range(0, len(prepared), self._sentence_chunk_size)
+        for start in tqdm(
+            chunks,
+            total=math.ceil(len(prepared) / self._sentence_chunk_size),
+            desc=description,
+        ):
+            self._disambiguate_chunk(
+                prepared[start : start + self._sentence_chunk_size],
+                results,
             )
 
-        try:
-            words = self._simple_word_tokenize(normalized)
-            d3_tokens = self._d3tok.tokenize(words)
-            output_tokens = [self._dediac_ar(str(token)) for token in d3_tokens]
-            processed = " ".join(token for token in output_tokens if token != "")
-            if normalized.strip() and not processed.strip():
-                raise ValueError("D3Tok returned no content")
-            return PreprocessResult(processed, None)
-        except Exception as error:
-            return PreprocessResult(
-                self.fallback(normalized),
-                f"D3TokError: {type(error).__name__}: {error}",
-            )
+        if any(result is None for result in results):
+            raise AssertionError("BERT D3Tok did not return one result per input sentence")
+        return [result for result in results if result is not None]
+
+    def process(self, text: str) -> PreprocessResult:
+        """Preprocess one sentence through the same batched implementation."""
+
+        return self.process_many([text], description="D3Tok check")[0]
 
 
 def camel_data_install_command(package: str) -> list[str]:
@@ -730,49 +770,58 @@ def camel_data_install_command(package: str) -> list[str]:
 
 
 def create_preprocessor(config: Config, *, allow_download: bool) -> ArabicD3TokPreprocessor:
-    """Load MLE D3Tok and optionally install CAMeL's light data bundle once."""
+    """Load BERT D3Tok and optionally install its public data packages once."""
 
     try:
-        return ArabicD3TokPreprocessor(config.D3TOK_RESOURCE)
+        preprocessor = ArabicD3TokPreprocessor(config)
+        if preprocessor.database_name != config.D3TOK_DATABASE:
+            LOGGER.warning(
+                "Requested D3Tok database %s is unavailable; using %s. "
+                "Provision licensed SAMA 3.1 data for exact checkpoint compatibility.",
+                config.D3TOK_DATABASE,
+                preprocessor.database_name,
+            )
+        return preprocessor
     except Exception as first_error:
         if allow_download and config.AUTO_DOWNLOAD_CAMEL_DATA:
-            command = camel_data_install_command(config.CAMEL_DATA_PACKAGE)
             LOGGER.warning(
-                "Could not load CAMeL resource %s; installing data package %s.",
-                config.D3TOK_RESOURCE,
-                config.CAMEL_DATA_PACKAGE,
+                "Could not load BERT D3Tok; installing public CAMeL packages %s.",
+                config.CAMEL_DATA_PACKAGES,
             )
             try:
-                subprocess.run(command, check=True, cwd=str(SCRIPT_DIR))
-                return ArabicD3TokPreprocessor(config.D3TOK_RESOURCE)
+                for package in config.CAMEL_DATA_PACKAGES:
+                    subprocess.run(
+                        camel_data_install_command(package),
+                        check=True,
+                        cwd=str(SCRIPT_DIR),
+                    )
+                # A previously unavailable public fallback may now be loadable.
+                if hasattr(config, "_resolved_d3tok_database"):
+                    delattr(config, "_resolved_d3tok_database")
+                preprocessor = ArabicD3TokPreprocessor(config)
+                LOGGER.warning(
+                    "BERT D3Tok database in use: %s%s",
+                    preprocessor.database_name,
+                    (
+                        " (public fallback; provision calima-msa-s31 for exact "
+                        "paper compatibility)"
+                        if preprocessor.database_name != config.D3TOK_DATABASE
+                        else ""
+                    ),
+                )
+                return preprocessor
             except Exception as install_error:
                 raise RuntimeError(
-                    "Unable to load the required real D3Tok resource "
-                    f"{config.D3TOK_RESOURCE!r}. Run `camel_data -i "
-                    f"{config.CAMEL_DATA_PACKAGE}` with internet access. "
+                    "Unable to load BERT-disambiguated D3Tok. Install "
+                    "`disambig-bert-unfactored-msa` and a compatible morphology "
+                    "database. Exact s31 reproduction additionally requires a "
+                    "licensed LDC2010L01 archive. "
                     f"Initial error: {first_error}. Install error: {install_error}"
                 ) from install_error
         raise RuntimeError(
-            "Unable to load the required real D3Tok resource "
-            f"{config.D3TOK_RESOURCE!r}. Run `camel_data -i "
-            f"{config.CAMEL_DATA_PACKAGE}`. Error: {first_error}"
+            "Unable to load BERT-disambiguated D3Tok and auto-download is disabled. "
+            f"Error: {first_error}"
         ) from first_error
-
-
-_PROCESS_PREPROCESSOR: Optional[ArabicD3TokPreprocessor] = None
-
-
-def _preprocess_worker_init(resource: str) -> None:
-    global _PROCESS_PREPROCESSOR
-    _PROCESS_PREPROCESSOR = ArabicD3TokPreprocessor(resource)
-
-
-def _preprocess_worker_item(item: tuple[str, str]) -> tuple[str, str, Optional[str]]:
-    if _PROCESS_PREPROCESSOR is None:
-        raise RuntimeError("Preprocessing worker was not initialized")
-    row_id, text = item
-    result = _PROCESS_PREPROCESSOR.process(text)
-    return row_id, result.text, result.error
 
 
 def package_version(package: str) -> str:
@@ -799,12 +848,15 @@ def preprocessing_fingerprint(
         "source_path": str(source_path.resolve()),
         "id_column": config.ID_COLUMN,
         "text_column": config.TEXT_COLUMN,
-        "backend": "MLEDisambiguator+MorphologicalTokenizer",
-        "resource": config.D3TOK_RESOURCE,
-        "unicode": "CAMeL normalize_unicode compatibility=True",
-        "tatweel": "remove U+0640 before D3Tok",
-        "word_tokenization": "simple_word_tokenize(default split_digits=False)",
-        "dediac": "CAMeL dediac_ar after D3Tok",
+        "backend": "BERTUnfactoredDisambiguator",
+        "bert_model": config.D3TOK_BERT_MODEL,
+        "requested_database": config.D3TOK_DATABASE,
+        "resolved_database": resolve_d3tok_database_name(config),
+        "database_fallback_allowed": config.D3TOK_ALLOW_DATABASE_FALLBACK,
+        "cleaning": "official BAREC arclean_map + contextual Alef-Maksura rule",
+        "arclean_map": "CAMeL built-in arclean",
+        "word_tokenization": "simple_word_tokenize(split_digits=True)",
+        "dediac": "CAMeL dediac_ar after analysis['d3tok']",
         "camel_tools": package_version("camel-tools"),
     }
     digest.update(json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8"))
@@ -838,16 +890,23 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
         raise AssertionError("Fallback content-preservation check failed")
 
     class _ForcedD3TokFailure:
-        def tokenize(self, words: Sequence[str]) -> list[str]:
-            del words
+        def disambiguate_sentences(
+            self,
+            sentences: Sequence[Sequence[str]],
+        ) -> list[list[Any]]:
+            del sentences
             raise RuntimeError("forced internal fallback check")
 
-    real_d3tok = preprocessor._d3tok
+        def disambiguate(self, sentence: Sequence[str]) -> list[Any]:
+            del sentence
+            raise RuntimeError("forced internal fallback check")
+
+    real_disambiguator = preprocessor._disambiguator
     try:
-        preprocessor._d3tok = _ForcedD3TokFailure()
+        preprocessor._disambiguator = _ForcedD3TokFailure()
         forced_fallback = preprocessor.process(sample)
     finally:
-        preprocessor._d3tok = real_d3tok
+        preprocessor._disambiguator = real_disambiguator
     if not forced_fallback.error or not forced_fallback.error.startswith("D3TokError:"):
         raise AssertionError("Forced D3Tok failure was not diagnosed")
     if not forced_fallback.text.strip() or any(
@@ -865,32 +924,25 @@ def build_preprocessing_cache(
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     items = list(zip(frame["_id"].astype(str), frame["_text"].astype(str)))
-    rows: list[tuple[str, str, Optional[str]]]
-
-    if config.PREPROCESS_NUM_WORKERS > 1:
-        probe = create_preprocessor(config, allow_download=True)
-        run_arabic_preprocessing_checks(probe)
-        del probe
-        with ProcessPoolExecutor(
-            max_workers=config.PREPROCESS_NUM_WORKERS,
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_preprocess_worker_init,
-            initargs=(config.D3TOK_RESOURCE,),
-        ) as executor:
-            rows = list(
-                tqdm(
-                    executor.map(_preprocess_worker_item, items, chunksize=32),
-                    total=len(items),
-                    desc=f"D3Tok {cache_path.stem}",
-                )
-            )
-    else:
-        preprocessor = create_preprocessor(config, allow_download=True)
-        run_arabic_preprocessing_checks(preprocessor)
-        rows = []
-        for row_id, text in tqdm(items, desc=f"D3Tok {cache_path.stem}"):
-            result = preprocessor.process(text)
-            rows.append((row_id, result.text, result.error))
+    preprocessor = create_preprocessor(config, allow_download=True)
+    LOGGER.info(
+        "D3Tok backend: BERT-Unfactored model=%s database=%s batch=%d.",
+        config.D3TOK_BERT_MODEL,
+        preprocessor.database_name,
+        config.D3TOK_BERT_BATCH_SIZE,
+    )
+    run_arabic_preprocessing_checks(preprocessor)
+    processed = preprocessor.process_many(
+        [text for _, text in items],
+        description=f"BERT D3Tok {cache_path.stem}",
+    )
+    rows = [
+        (row_id, result.text, result.error)
+        for (row_id, _), result in zip(items, processed)
+    ]
+    del preprocessor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     cache_frame = pd.DataFrame(
         {
@@ -963,8 +1015,9 @@ def preprocess_split_cached(
         "rows": len(processed),
         "cache": str(cache_path),
         "fingerprint": fingerprint,
-        "d3tok_backend": "MLEDisambiguator+MorphologicalTokenizer",
-        "d3tok_resource": config.D3TOK_RESOURCE,
+        "d3tok_backend": "BERTUnfactoredDisambiguator",
+        "d3tok_bert_model": config.D3TOK_BERT_MODEL,
+        "d3tok_database": resolve_d3tok_database_name(config),
         "fallback_count": len(failures),
         # Keep every affected ID/error so preprocessing failures are auditable.
         "fallback_errors": failures.to_dict(orient="records"),
@@ -985,7 +1038,7 @@ def preprocess_split_cached(
 
 
 class BARECDataset(Dataset[dict[str, Any]]):
-    """Tokenize D3Tok text and retain primary/coarse multitask targets."""
+    """Tokenize cached D3Tok sentences lazily while retaining IDs and row indices."""
 
     def __init__(self, frame: pd.DataFrame, tokenizer: Any, max_length: int) -> None:
         self.texts = frame["_processed_text"].astype(str).tolist()
@@ -994,16 +1047,6 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.has_labels = bool(frame.attrs.get("has_labels", False))
         self.labels = (
             frame["_label"].astype(float).tolist() if self.has_labels else None
-        )
-        self.auxiliary_labels = (
-            {
-                target_levels: (
-                    frame[f"_label_{target_levels}"].astype(int).sub(1).tolist()
-                )
-                for target_levels in AUXILIARY_LEVELS
-            }
-            if self.has_labels
-            else None
         )
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -1023,11 +1066,6 @@ class BARECDataset(Dataset[dict[str, Any]]):
         item["original_index"] = self.indices[index]
         if self.labels is not None:
             item["label"] = self.labels[index]
-            assert self.auxiliary_labels is not None
-            for target_levels in AUXILIARY_LEVELS:
-                item[f"label_{target_levels}"] = self.auxiliary_labels[target_levels][
-                    index
-                ]
         return item
 
 
@@ -1043,38 +1081,23 @@ class BARECCollator:
         indices: list[int] = []
         labels: list[float] = []
         labels_present = "label" in features[0]
-        auxiliary_labels: dict[int, list[int]] = {
-            target_levels: [] for target_levels in AUXILIARY_LEVELS
-        }
-        metadata_keys = {"sample_id", "original_index", "label"} | {
-            f"label_{target_levels}" for target_levels in AUXILIARY_LEVELS
-        }
         for feature in features:
             model_features.append(
                 {
                     key: value
                     for key, value in feature.items()
-                    if key not in metadata_keys
+                    if key not in {"sample_id", "original_index", "label"}
                 }
             )
             sample_ids.append(str(feature["sample_id"]))
             indices.append(int(feature["original_index"]))
             if labels_present:
                 labels.append(float(feature["label"]))
-                for target_levels in AUXILIARY_LEVELS:
-                    auxiliary_labels[target_levels].append(
-                        int(feature[f"label_{target_levels}"])
-                    )
         batch = dict(self.tokenizer.pad(model_features, padding=True, return_tensors="pt"))
         batch["sample_ids"] = sample_ids
         batch["original_indices"] = torch.tensor(indices, dtype=torch.long)
         if labels_present:
             batch["labels"] = torch.tensor(labels, dtype=torch.float32)
-            for target_levels in AUXILIARY_LEVELS:
-                batch[f"labels_{target_levels}"] = torch.tensor(
-                    auxiliary_labels[target_levels],
-                    dtype=torch.long,
-                )
         return batch
 
 
@@ -1189,18 +1212,18 @@ def run_sampler_checks() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Parallel multitask model and optimization
+# 6. Regression model and optimization
 # ---------------------------------------------------------------------------
 
 
-class ArabicReadabilityMultiTaskModel(nn.Module):
-    """Shared AraBERT encoder with parallel 19/7/5/3 readability heads."""
+class ArabicReadabilityRegressor(nn.Module):
+    """AraBERT encoder with a dropout and scalar sentence-regression head."""
 
     def __init__(self, model_name: str, dropout: float) -> None:
         super().__init__()
-        # The checkpoint's original 19-class CE head is replaced by a scalar
-        # 19-level regressor plus three coarse CE heads. Raw CLS is shared by
-        # every task, so no unused BERT pooler is instantiated under DDP.
+        # The checkpoint's 19-class head is intentionally replaced by a scalar
+        # regression head. Raw CLS is used, so do not instantiate an unused
+        # BERT pooler when DDP expects every trainable parameter to receive grad.
         self.encoder = AutoModel.from_pretrained(
             model_name,
             add_pooling_layer=False,
@@ -1218,20 +1241,14 @@ class ArabicReadabilityMultiTaskModel(nn.Module):
         hidden_size = int(self.encoder.config.hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.regression_head = nn.Linear(hidden_size, 1)
-        self.auxiliary_heads = nn.ModuleDict(
-            {
-                str(target_levels): nn.Linear(hidden_size, target_levels)
-                for target_levels in AUXILIARY_LEVELS
-            }
-        )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         token_type_ids: Optional[torch.Tensor] = None,
-    ) -> dict[str, torch.Tensor]:
-        """Return the scalar score and parallel coarse-class logits."""
+    ) -> torch.Tensor:
+        """Return one unrounded readability score per input sentence."""
 
         encoder_arguments: dict[str, torch.Tensor] = {
             "input_ids": input_ids,
@@ -1241,26 +1258,14 @@ class ArabicReadabilityMultiTaskModel(nn.Module):
             encoder_arguments["token_type_ids"] = token_type_ids
         outputs = self.encoder(**encoder_arguments)
         cls_embedding = outputs.last_hidden_state[:, 0, :]
-        shared_features = self.dropout(cls_embedding)
-        task_outputs = {
-            "regression": self.regression_head(shared_features).squeeze(-1)
-        }
-        task_outputs.update(
-            {
-                f"logits_{target_levels}": self.auxiliary_heads[
-                    str(target_levels)
-                ](shared_features)
-                for target_levels in AUXILIARY_LEVELS
-            }
-        )
-        return task_outputs
+        return self.regression_head(self.dropout(cls_embedding)).squeeze(-1)
 
 
-def unwrap_model(model: nn.Module) -> ArabicReadabilityMultiTaskModel:
+def unwrap_model(model: nn.Module) -> ArabicReadabilityRegressor:
     """Return the underlying model whether or not DDP wraps it."""
 
     unwrapped = model.module if isinstance(model, DDP) else model
-    if not isinstance(unwrapped, ArabicReadabilityMultiTaskModel):
+    if not isinstance(unwrapped, ArabicReadabilityRegressor):
         raise TypeError(f"Unexpected model type: {type(unwrapped)}")
     return unwrapped
 
@@ -1287,7 +1292,7 @@ def create_optimizer(model: nn.Module, config: Config) -> AdamW:
     base = unwrap_model(model)
     encoder_decay, encoder_no_decay = split_decay_parameters(base.encoder)
     head_decay, head_no_decay = split_decay_parameters(
-        nn.ModuleList([base.dropout, base.regression_head, base.auxiliary_heads])
+        nn.ModuleList([base.dropout, base.regression_head])
     )
     groups = [
         {
@@ -1349,41 +1354,14 @@ def scaled_optimizer_step(
     return optimizer_stepped, scale_before, scale_after
 
 
-def model_outputs(
-    model: nn.Module,
-    batch: Mapping[str, Any],
-) -> dict[str, torch.Tensor]:
-    """Run every parallel head and validate its batch/class dimensions."""
+def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
+    """Pass only encoder tensors from a collated batch into the model."""
 
-    outputs = model(
+    predictions = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         token_type_ids=batch.get("token_type_ids"),
     )
-    if not isinstance(outputs, dict):
-        raise TypeError(f"Multitask model must return a dict, got {type(outputs)}")
-    batch_size = batch["input_ids"].shape[0]
-    expected_shapes = {
-        "regression": (batch_size,),
-        **{
-            f"logits_{target_levels}": (batch_size, target_levels)
-            for target_levels in AUXILIARY_LEVELS
-        },
-    }
-    for key, expected_shape in expected_shapes.items():
-        if key not in outputs or tuple(outputs[key].shape) != expected_shape:
-            actual = None if key not in outputs else tuple(outputs[key].shape)
-            raise AssertionError(
-                f"Multitask output {key!r} must have shape {expected_shape}, "
-                f"got {actual}"
-            )
-    return outputs
-
-
-def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
-    """Return only the primary scalar score for evaluation/submission."""
-
-    predictions = model_outputs(model, batch)["regression"]
     if predictions.ndim != 1 or predictions.shape[0] != batch["input_ids"].shape[0]:
         raise AssertionError(
             f"Regression output must have shape [batch_size], got {tuple(predictions.shape)}"
@@ -1391,14 +1369,14 @@ def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
     return predictions
 
 
-def run_multitask_shape_check(
-    model: ArabicReadabilityMultiTaskModel,
+def run_regression_shape_check(
+    model: ArabicReadabilityRegressor,
     tokenizer: Any,
     text: str,
     device: torch.device,
     max_length: int,
 ) -> None:
-    """Verify all head shapes and gradient connectivity before DDP."""
+    """Verify batch-one output shape and gradient connectivity before DDP."""
 
     encoded = tokenizer(
         text,
@@ -1411,22 +1389,13 @@ def run_multitask_shape_check(
     model.train()
     model.zero_grad(set_to_none=True)
     try:
-        outputs = model(**encoded)
-        expected_shapes = {
-            "regression": torch.Size([1]),
-            **{
-                f"logits_{target_levels}": torch.Size([1, target_levels])
-                for target_levels in AUXILIARY_LEVELS
-            },
-        }
-        for key, expected_shape in expected_shapes.items():
-            if key not in outputs or outputs[key].shape != expected_shape:
-                actual = None if key not in outputs else tuple(outputs[key].shape)
-                raise AssertionError(
-                    f"Batch-size-one output {key!r} must have shape "
-                    f"{tuple(expected_shape)}, got {actual}"
-                )
-        sum(output.sum() for output in outputs.values()).backward()
+        output = model(**encoded)
+        if output.shape != torch.Size([1]):
+            raise AssertionError(
+                "Batch-size-one regression output must have shape [1], "
+                f"got {tuple(output.shape)}"
+            )
+        output.sum().backward()
         disconnected = [
             name
             for name, parameter in model.named_parameters()
@@ -1434,7 +1403,7 @@ def run_multitask_shape_check(
         ]
         if disconnected:
             raise AssertionError(
-                "Trainable model parameters are disconnected from the multitask "
+                "Trainable model parameters are disconnected from the regression "
                 f"loss: {disconnected}"
             )
     finally:
@@ -1457,21 +1426,6 @@ class EvaluationOutput:
     final_predictions: np.ndarray
     labels: Optional[np.ndarray]
     metrics: Optional[dict[str, float]]
-    calibrated_predictions: Optional[np.ndarray] = None
-    uncalibrated_metrics: Optional[dict[str, float]] = None
-
-
-@dataclass(frozen=True)
-class AffineCalibration:
-    """Dev-fitted affine transform and its accepted metric improvement."""
-
-    applied: bool
-    scale: float
-    bias: float
-    dev_qwk_before: float
-    dev_qwk_after: float
-    dev_mae_before: float
-    dev_mae_after: float
 
 
 def round_and_clip(raw_predictions: Sequence[float], config: Config) -> np.ndarray:
@@ -1504,159 +1458,6 @@ def calculate_metrics(
         "exact_accuracy": float(np.mean(final == truth)),
         "adjacent_accuracy": float(np.mean(np.abs(final - truth) <= 1)),
     }
-
-
-def inclusive_float_grid(
-    minimum: float,
-    maximum: float,
-    step: float,
-    *,
-    include: Sequence[float] = (),
-) -> np.ndarray:
-    """Build a stable inclusive float grid and force important candidates."""
-
-    if not all(math.isfinite(value) for value in (minimum, maximum, step)):
-        raise ValueError("Calibration grid values must be finite")
-    if maximum < minimum or step <= 0.0:
-        raise ValueError("Calibration grid requires maximum >= minimum and step > 0")
-    count = int(math.floor((maximum - minimum) / step + 1e-9))
-    values = minimum + step * np.arange(count + 1, dtype=np.float64)
-    if values[-1] < maximum - 1e-9:
-        values = np.append(values, maximum)
-    forced = [
-        float(value)
-        for value in include
-        if minimum <= float(value) <= maximum
-    ]
-    if forced:
-        values = np.concatenate((values, np.asarray(forced, dtype=np.float64)))
-    return np.unique(np.round(values, decimals=12))
-
-
-def fit_dev_affine_calibration(
-    labels: Sequence[float],
-    raw_predictions: Sequence[float],
-    config: Config,
-) -> AffineCalibration:
-    """Grid-search scale/bias on Dev only, with identity as the safe fallback."""
-
-    truth = np.asarray(labels, dtype=np.int64)
-    raw = np.asarray(raw_predictions, dtype=np.float64)
-    if truth.ndim != 1 or raw.ndim != 1 or len(truth) != len(raw) or len(truth) == 0:
-        raise ValueError("Dev calibration requires aligned non-empty 1D arrays")
-    if not np.isfinite(raw).all():
-        raise ValueError("Dev calibration received non-finite raw predictions")
-
-    baseline_metrics = calculate_metrics(truth, raw, config)
-    baseline_qwk = float(baseline_metrics["qwk"])
-    baseline_selection_qwk = baseline_qwk if math.isfinite(baseline_qwk) else -math.inf
-    best_scale = 1.0
-    best_bias = 0.0
-    best_qwk = baseline_selection_qwk
-    best_mae = float(baseline_metrics["mae"])
-    best_identity_distance = 0.0
-    label_values = list(range(config.MIN_LABEL, config.MAX_LABEL + 1))
-
-    scales = inclusive_float_grid(
-        config.CALIBRATION_SCALE_MIN,
-        config.CALIBRATION_SCALE_MAX,
-        config.CALIBRATION_SCALE_STEP,
-        include=(1.0,),
-    )
-    biases = inclusive_float_grid(
-        config.CALIBRATION_BIAS_MIN,
-        config.CALIBRATION_BIAS_MAX,
-        config.CALIBRATION_BIAS_STEP,
-        include=(0.0,),
-    )
-    for scale in scales:
-        scaled = float(scale) * raw
-        for bias in biases:
-            final = round_and_clip(scaled + float(bias), config)
-            qwk = float(
-                cohen_kappa_score(
-                    truth,
-                    final,
-                    weights="quadratic",
-                    labels=label_values,
-                )
-            )
-            selection_qwk = qwk if math.isfinite(qwk) else -math.inf
-            mae = float(np.mean(np.abs(final - truth)))
-            identity_distance = abs(float(scale) - 1.0) + abs(float(bias))
-            qwk_better = selection_qwk > best_qwk + 1e-12
-            qwk_tied = abs(selection_qwk - best_qwk) <= 1e-12
-            mae_better = mae < best_mae - 1e-12
-            mae_tied = abs(mae - best_mae) <= 1e-12
-            identity_better = identity_distance < best_identity_distance - 1e-12
-            if (
-                qwk_better
-                or (qwk_tied and mae_better)
-                or (qwk_tied and mae_tied and identity_better)
-            ):
-                best_scale = float(scale)
-                best_bias = float(bias)
-                best_qwk = selection_qwk
-                best_mae = mae
-                best_identity_distance = identity_distance
-
-    qwk_gain = best_qwk - baseline_selection_qwk
-    applied = (
-        math.isfinite(best_qwk)
-        and qwk_gain >= config.CALIBRATION_MIN_QWK_GAIN
-        and (
-            not math.isclose(best_scale, 1.0, abs_tol=1e-12)
-            or not math.isclose(best_bias, 0.0, abs_tol=1e-12)
-        )
-    )
-    if not applied:
-        return AffineCalibration(
-            applied=False,
-            scale=1.0,
-            bias=0.0,
-            dev_qwk_before=baseline_qwk,
-            dev_qwk_after=baseline_qwk,
-            dev_mae_before=float(baseline_metrics["mae"]),
-            dev_mae_after=float(baseline_metrics["mae"]),
-        )
-    return AffineCalibration(
-        applied=True,
-        scale=best_scale,
-        bias=best_bias,
-        dev_qwk_before=baseline_qwk,
-        dev_qwk_after=best_qwk,
-        dev_mae_before=float(baseline_metrics["mae"]),
-        dev_mae_after=best_mae,
-    )
-
-
-def apply_affine_calibration(
-    output: EvaluationOutput,
-    calibration: AffineCalibration,
-    config: Config,
-) -> EvaluationOutput:
-    """Apply fixed Dev parameters without changing stored model-raw scores."""
-
-    calibrated = (
-        calibration.scale * np.asarray(output.raw_predictions, dtype=np.float64)
-        + calibration.bias
-    )
-    final = round_and_clip(calibrated, config)
-    metrics = (
-        calculate_metrics(output.labels, calibrated, config)
-        if output.labels is not None
-        else None
-    )
-    return EvaluationOutput(
-        ids=output.ids,
-        indices=output.indices,
-        raw_predictions=output.raw_predictions,
-        final_predictions=final,
-        labels=output.labels,
-        metrics=metrics,
-        calibrated_predictions=calibrated,
-        uncalibrated_metrics=output.metrics,
-    )
 
 
 def merge_evaluation_payloads(
@@ -2110,42 +1911,6 @@ def learning_rates(optimizer: torch.optim.Optimizer) -> tuple[float, float]:
     return encoder_lr, head_lr
 
 
-MULTITASK_LOSS_KEYS = ("total", "mse_19", "ce_7", "ce_5", "ce_3")
-
-
-def calculate_multitask_losses(
-    outputs: Mapping[str, torch.Tensor],
-    batch: Mapping[str, Any],
-    config: Config,
-) -> dict[str, torch.Tensor]:
-    """Combine primary 19-level MSE with parallel coarse CE objectives."""
-
-    required_batch_keys = {
-        "labels",
-        *(f"labels_{target_levels}" for target_levels in AUXILIARY_LEVELS),
-    }
-    missing = sorted(required_batch_keys.difference(batch))
-    if missing:
-        raise KeyError(f"Training batch is missing multitask targets: {missing}")
-    losses = {
-        "mse_19": F.mse_loss(outputs["regression"], batch["labels"]),
-        **{
-            f"ce_{target_levels}": F.cross_entropy(
-                outputs[f"logits_{target_levels}"],
-                batch[f"labels_{target_levels}"],
-            )
-            for target_levels in AUXILIARY_LEVELS
-        },
-    }
-    losses["total"] = (
-        losses["mse_19"]
-        + config.AUXILIARY_7_LOSS_WEIGHT * losses["ce_7"]
-        + config.AUXILIARY_5_LOSS_WEIGHT * losses["ce_5"]
-        + config.AUXILIARY_3_LOSS_WEIGHT * losses["ce_3"]
-    )
-    return losses
-
-
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
@@ -2158,13 +1923,14 @@ def train_one_epoch(
     global_step: int,
     *,
     max_steps: Optional[int],
-) -> tuple[dict[str, float], int]:
+) -> tuple[float, int]:
     """Train exactly one epoch on Train; Dev/Test never call this function."""
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    loss_function = nn.MSELoss()
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
-    loss_totals = {key: 0.0 for key in MULTITASK_LOSS_KEYS}
+    total_loss = 0.0
     total_examples = 0
     start = time.perf_counter()
     effective_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
@@ -2189,9 +1955,8 @@ def train_one_epoch(
         )
         with synchronization:
             with autocast_context(amp_enabled):
-                outputs = model_outputs(model, batch)
-                losses = calculate_multitask_losses(outputs, batch, config)
-                raw_loss = losses["total"]
+                predictions = model_forward(model, batch)
+                raw_loss = loss_function(predictions, batch["labels"])
                 window_start = (
                     step // config.GRADIENT_ACCUMULATION_STEPS
                 ) * config.GRADIENT_ACCUMULATION_STEPS
@@ -2203,8 +1968,7 @@ def train_one_epoch(
             scaler.scale(scaled_loss).backward()
 
         batch_size = int(batch["labels"].shape[0])
-        for key in MULTITASK_LOSS_KEYS:
-            loss_totals[key] += float(losses[key].detach().item()) * batch_size
+        total_loss += float(raw_loss.detach().item()) * batch_size
         total_examples += batch_size
 
         if is_update_step:
@@ -2240,9 +2004,7 @@ def train_one_epoch(
             ):
                 progress.set_postfix(
                     loss=f"{raw_loss.item():.4f}",
-                    avg=f"{loss_totals['total'] / max(total_examples, 1):.4f}",
-                    mse=f"{losses['mse_19'].item():.4f}",
-                    ce7=f"{losses['ce_7'].item():.4f}",
+                    avg=f"{total_loss / max(total_examples, 1):.4f}",
                     enc_lr=f"{encoder_lr:.2e}",
                     head_lr=f"{head_lr:.2e}",
                     accum=f"{(step % config.GRADIENT_ACCUMULATION_STEPS) + 1}/"
@@ -2253,18 +2015,12 @@ def train_one_epoch(
     progress.close()
 
     totals = torch.tensor(
-        [*(loss_totals[key] for key in MULTITASK_LOSS_KEYS), float(total_examples)],
-        dtype=torch.float64,
-        device=context.device,
+        [total_loss, float(total_examples)], dtype=torch.float64, device=context.device
     )
     if context.distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-    global_examples = max(totals[-1].item(), 1.0)
-    mean_losses = {
-        key: float(totals[index].item() / global_examples)
-        for index, key in enumerate(MULTITASK_LOSS_KEYS)
-    }
-    return mean_losses, global_step
+    mean_loss = float(totals[0].item() / max(totals[1].item(), 1.0))
+    return mean_loss, global_step
 
 
 def write_training_history(history: Sequence[Mapping[str, Any]], config: Config) -> None:
@@ -2408,10 +2164,8 @@ def write_diagnostics(output: EvaluationOutput, config: Config) -> Path:
     data: dict[str, Any] = {
         "Sentence ID": output.ids,
         "raw_prediction": output.raw_predictions,
+        "Prediction": output.final_predictions,
     }
-    if output.calibrated_predictions is not None:
-        data["calibrated_prediction"] = output.calibrated_predictions
-    data["Prediction"] = output.final_predictions
     if output.labels is not None:
         data["gold_label"] = output.labels.astype(np.int64)
     path = (
@@ -2452,8 +2206,10 @@ def write_preprocessing_report(
     atomic_json_dump(
         {
             "preprocessing_version": PREPROCESSING_VERSION,
-            "d3tok_backend": "MLEDisambiguator+MorphologicalTokenizer",
-            "d3tok_resource": config.D3TOK_RESOURCE,
+            "d3tok_backend": "BERTUnfactoredDisambiguator",
+            "d3tok_bert_model": config.D3TOK_BERT_MODEL,
+            "requested_database": config.D3TOK_DATABASE,
+            "resolved_database": resolve_d3tok_database_name(config),
             "reports": list(reports),
             "total_fallback_count": sum(int(report["fallback_count"]) for report in reports),
         },
@@ -2477,9 +2233,9 @@ def train_select_and_predict(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
-    base_model = ArabicReadabilityMultiTaskModel(config.MODEL_NAME, config.DROPOUT)
+    base_model = ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
     base_model.to(context.device)
-    run_multitask_shape_check(
+    run_regression_shape_check(
         base_model,
         tokenizer,
         str(train_frame.iloc[0]["_processed_text"]),
@@ -2524,12 +2280,6 @@ def train_select_and_predict(
         LOGGER.info("Gradient accumulation steps: %d", config.GRADIENT_ACCUMULATION_STEPS)
         LOGGER.info("Effective global batch size: %d", effective_batch)
         LOGGER.info("FP16 enabled: %s", amp_enabled)
-        LOGGER.info(
-            "Multitask loss: MSE19 + %.2f*CE7 + %.2f*CE5 + %.2f*CE3",
-            config.AUXILIARY_7_LOSS_WEIGHT,
-            config.AUXILIARY_5_LOSS_WEIGHT,
-            config.AUXILIARY_3_LOSS_WEIGHT,
-        )
 
     start_epoch = 0
     global_step = 0
@@ -2572,7 +2322,7 @@ def train_select_and_predict(
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
         epoch_start = time.perf_counter()
-        train_losses, global_step = train_one_epoch(
+        train_loss, global_step = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -2623,11 +2373,7 @@ def train_select_and_predict(
             history_row = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
-                "train_loss": train_losses["total"],
-                "train_mse_19": train_losses["mse_19"],
-                "train_ce_7": train_losses["ce_7"],
-                "train_ce_5": train_losses["ce_5"],
-                "train_ce_3": train_losses["ce_3"],
+                "train_loss": train_loss,
                 "dev_mse": metrics["mse"],
                 "dev_mae": metrics["mae"],
                 "dev_qwk": metrics["qwk"],
@@ -2639,15 +2385,10 @@ def train_select_and_predict(
             history.append(history_row)
             write_training_history(history, config)
             LOGGER.info(
-                "Epoch %d | train_loss=%.6f mse19=%.6f ce7=%.6f ce5=%.6f "
-                "ce3=%.6f dev_mse=%.6f dev_mae=%.6f "
+                "Epoch %d | train_loss=%.6f dev_mse=%.6f dev_mae=%.6f "
                 "dev_qwk=%s exact=%.4f adjacent=%.4f time=%.1fs best=%s",
                 epoch + 1,
-                train_losses["total"],
-                train_losses["mse_19"],
-                train_losses["ce_7"],
-                train_losses["ce_5"],
-                train_losses["ce_3"],
+                train_loss,
                 metrics["mse"],
                 metrics["mae"],
                 f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
@@ -2702,65 +2443,6 @@ def train_select_and_predict(
     unwrap_model(model).load_state_dict(best_state, strict=True)
     distributed_barrier(context)
 
-    calibration_payload: Optional[dict[str, Any]] = None
-    if config.USE_DEV_AFFINE_CALIBRATION:
-        calibration_dev_output = evaluate_model(
-            model,
-            dev_loader,
-            len(dev_frame),
-            config,
-            context,
-            description="Dev affine calibration",
-        )
-        if context.is_main:
-            if (
-                calibration_dev_output is None
-                or calibration_dev_output.labels is None
-            ):
-                raise RuntimeError(
-                    "Labeled Dev predictions are required for affine calibration"
-                )
-            calibration = fit_dev_affine_calibration(
-                calibration_dev_output.labels,
-                calibration_dev_output.raw_predictions,
-                config,
-            )
-            calibration_payload = asdict(calibration)
-    elif context.is_main:
-        calibration_payload = asdict(
-            AffineCalibration(
-                applied=False,
-                scale=1.0,
-                bias=0.0,
-                dev_qwk_before=best_qwk,
-                dev_qwk_after=best_qwk,
-                dev_mae_before=best_mae,
-                dev_mae_after=best_mae,
-            )
-        )
-    calibration_payload = broadcast_object(calibration_payload, context)
-    if not isinstance(calibration_payload, dict):
-        raise RuntimeError("Failed to broadcast Dev affine calibration")
-    calibration = AffineCalibration(**calibration_payload)
-    if context.is_main:
-        calibration_path = (
-            config.resolve(config.OUTPUT_DIR)
-            / "logs"
-            / "dev_affine_calibration.json"
-        )
-        atomic_json_dump(calibration_payload, calibration_path)
-        LOGGER.info(
-            "Dev affine calibration: applied=%s scale=%.4f bias=%.4f "
-            "qwk=%.6f->%.6f mae=%.6f->%.6f",
-            calibration.applied,
-            calibration.scale,
-            calibration.bias,
-            calibration.dev_qwk_before,
-            calibration.dev_qwk_after,
-            calibration.dev_mae_before,
-            calibration.dev_mae_after,
-        )
-
     test_output = evaluate_model(
         model,
         test_loader,
@@ -2772,7 +2454,6 @@ def train_select_and_predict(
     if context.is_main:
         if test_output is None:
             raise RuntimeError("Rank 0 did not receive Test predictions")
-        test_output = apply_affine_calibration(test_output, calibration, config)
         expected_ids = test_frame.sort_values("_original_index")["_id"].astype(str).tolist()
         if test_output.ids != expected_ids:
             raise RuntimeError("Test predictions are not in the original ID order")
@@ -2780,12 +2461,7 @@ def train_select_and_predict(
         LOGGER.info("Test diagnostics: %s", diagnostics_path)
         if test_output.metrics is not None:
             LOGGER.info(
-                "Open-Test uncalibrated metrics (diagnostic only): %s",
-                test_output.uncalibrated_metrics,
-            )
-            LOGGER.info(
-                "Open-Test calibrated metrics (diagnostic only; never used for "
-                "selection/calibration): %s",
+                "Open-Test metrics (diagnostic only; never used for selection): %s",
                 test_output.metrics,
             )
         create_submission(test_output.ids, test_output.final_predictions, config)
@@ -2798,7 +2474,6 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
     prepare_output_directories(config, context)
     if context.is_main:
         run_submission_validator_checks(config)
-        run_auxiliary_label_checks()
     distributed_barrier(context)
     train_path = config.resolve(config.TRAIN_PATH)
     dev_path = config.resolve(config.DEV_PATH)
@@ -2877,41 +2552,13 @@ def validate_config(config: Config) -> None:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
     if config.SAMPLER_ALPHA < 0.0:
         raise ValueError("SAMPLER_ALPHA cannot be negative")
-    auxiliary_weights = {
-        "AUXILIARY_7_LOSS_WEIGHT": config.AUXILIARY_7_LOSS_WEIGHT,
-        "AUXILIARY_5_LOSS_WEIGHT": config.AUXILIARY_5_LOSS_WEIGHT,
-        "AUXILIARY_3_LOSS_WEIGHT": config.AUXILIARY_3_LOSS_WEIGHT,
-    }
-    invalid_auxiliary_weights = {
-        name: value
-        for name, value in auxiliary_weights.items()
-        if not math.isfinite(value) or value < 0.0
-    }
-    if invalid_auxiliary_weights:
+    if config.PREPROCESS_NUM_WORKERS != 1:
         raise ValueError(
-            "Auxiliary loss weights must be finite and non-negative: "
-            f"{invalid_auxiliary_weights}"
+            "BERT D3Tok requires PREPROCESS_NUM_WORKERS=1 to avoid duplicating "
+            "the disambiguation model across processes"
         )
-    calibration_values = {
-        "CALIBRATION_SCALE_MIN": config.CALIBRATION_SCALE_MIN,
-        "CALIBRATION_SCALE_MAX": config.CALIBRATION_SCALE_MAX,
-        "CALIBRATION_SCALE_STEP": config.CALIBRATION_SCALE_STEP,
-        "CALIBRATION_BIAS_MIN": config.CALIBRATION_BIAS_MIN,
-        "CALIBRATION_BIAS_MAX": config.CALIBRATION_BIAS_MAX,
-        "CALIBRATION_BIAS_STEP": config.CALIBRATION_BIAS_STEP,
-        "CALIBRATION_MIN_QWK_GAIN": config.CALIBRATION_MIN_QWK_GAIN,
-    }
-    if any(not math.isfinite(value) for value in calibration_values.values()):
-        raise ValueError(f"Calibration settings must be finite: {calibration_values}")
-    if (
-        config.CALIBRATION_SCALE_MIN <= 0.0
-        or config.CALIBRATION_SCALE_MAX < config.CALIBRATION_SCALE_MIN
-        or config.CALIBRATION_SCALE_STEP <= 0.0
-        or config.CALIBRATION_BIAS_MAX < config.CALIBRATION_BIAS_MIN
-        or config.CALIBRATION_BIAS_STEP <= 0.0
-        or config.CALIBRATION_MIN_QWK_GAIN < 0.0
-    ):
-        raise ValueError(f"Invalid Dev calibration settings: {calibration_values}")
+    if config.D3TOK_BERT_BATCH_SIZE <= 0 or config.D3TOK_SENTENCE_CHUNK_SIZE <= 0:
+        raise ValueError("D3Tok BERT batch/chunk sizes must be positive")
 
 
 def main() -> None:
