@@ -96,7 +96,7 @@ class Config:
 
     # Model and Arabic preprocessing.
     MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
-    MAX_LENGTH: int = 256
+    MAX_LENGTH: int = 512
     DROPOUT: float = 0.1
     D3TOK_RESOURCE: str = "msa"
     AUTO_DOWNLOAD_CAMEL_DATA: bool = True
@@ -157,7 +157,9 @@ class Config:
         self.PER_DEVICE_BATCH_SIZE = 2
         self.EVAL_BATCH_SIZE = 2
         self.GRADIENT_ACCUMULATION_STEPS = 1
-        self.MAX_LENGTH = 64
+        # Keep the production sequence budget so smoke mode exercises the same
+        # no-D3Tok-truncation invariant.
+        self.MAX_LENGTH = 512
         self.NUM_WORKERS = 0
         self.PREPROCESS_NUM_WORKERS = 1
         self.EARLY_STOPPING_PATIENCE = 1
@@ -1241,7 +1243,7 @@ def encode_structured_pair(
     feature_text: str,
     max_length: int,
 ) -> dict[str, Any]:
-    """Encode two views while reserving space for the complete feature block."""
+    """Preserve D3Tok/features completely and truncate only the Surface view."""
 
     d3tok_ids = tokenizer.encode(d3tok_text, add_special_tokens=False)
     surface_ids = tokenizer.encode(surface_text, add_special_tokens=False)
@@ -1250,27 +1252,25 @@ def encode_structured_pair(
         raise ValueError("Structured pair contains an empty tokenized component")
 
     pair_special_tokens = int(tokenizer.num_special_tokens_to_add(pair=True))
-    fixed_length = pair_special_tokens + 1 + len(feature_ids)
-    text_budget = max_length - fixed_length
-    if text_budget < 2:
+    fixed_length = pair_special_tokens + 1
+    content_budget = max_length - fixed_length
+    if content_budget < 1:
         raise ValueError(
-            "MAX_LENGTH is too small to retain D3Tok, Surface, and all structured "
-            f"features: max_length={max_length}, fixed_length={fixed_length}"
+            "MAX_LENGTH is too small to construct a structured sentence pair: "
+            f"max_length={max_length}, fixed_length={fixed_length}"
         )
 
-    if len(d3tok_ids) + len(surface_ids) > text_budget:
-        # Balance the two text views like longest-first truncation. D3Tok gets
-        # the odd token because it matches the checkpoint's native input.
-        keep_d3tok = min(len(d3tok_ids), (text_budget + 1) // 2)
-        keep_surface = min(len(surface_ids), text_budget - keep_d3tok)
-        remaining = text_budget - keep_d3tok - keep_surface
-        if remaining:
-            add_d3tok = min(remaining, len(d3tok_ids) - keep_d3tok)
-            keep_d3tok += add_d3tok
-            remaining -= add_d3tok
-            keep_surface += min(remaining, len(surface_ids) - keep_surface)
-        d3tok_ids = d3tok_ids[:keep_d3tok]
-        surface_ids = surface_ids[:keep_surface]
+    protected_length = len(d3tok_ids) + len(feature_ids)
+    if protected_length > content_budget:
+        raise ValueError(
+            "D3Tok plus the structured feature block exceeds MAX_LENGTH. "
+            "D3Tok was not truncated; this sample requires a chunking strategy. "
+            f"d3tok_tokens={len(d3tok_ids)}, feature_tokens={len(feature_ids)}, "
+            f"available_content_tokens={content_budget}, max_length={max_length}"
+        )
+
+    surface_budget = content_budget - protected_length
+    surface_ids = surface_ids[:surface_budget]
 
     paired_ids = surface_ids + [int(tokenizer.sep_token_id)] + feature_ids
     encoded = dict(
@@ -1286,9 +1286,11 @@ def encode_structured_pair(
     )
     if len(encoded["input_ids"]) > max_length:
         raise AssertionError("Reserved structured input exceeded MAX_LENGTH")
-    if not {int(tokenizer.sep_token_id), *feature_ids}.issubset(
-        set(encoded["input_ids"])
-    ):
+    encoded_d3tok_ids = encoded["input_ids"][1 : 1 + len(d3tok_ids)]
+    if encoded_d3tok_ids != d3tok_ids:
+        raise AssertionError("D3Tok was altered or truncated during pair encoding")
+    feature_start = len(encoded["input_ids"]) - 1 - len(feature_ids)
+    if encoded["input_ids"][feature_start:-1] != feature_ids:
         raise AssertionError("Structured feature block was altered during encoding")
     return encoded
 

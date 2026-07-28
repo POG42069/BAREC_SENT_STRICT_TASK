@@ -203,7 +203,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
 | Preprocess | `D3TOK_RESOURCE="msa"` | BERT unfactored disambiguator cho D3Tok |
 | D3Tok batch | `D3TOK_BATCH_SIZE=256` | Số câu đưa qua BERT disambiguator mỗi lượt |
-| Length | `MAX_LENGTH=256` | Chiều dài sau HF tokenization |
+| Length | `MAX_LENGTH=512` | Giới hạn đầy đủ của BERT; D3Tok không bị truncate âm thầm |
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
@@ -281,9 +281,11 @@ hai cột này, pipeline dùng token `UNKNOWN` tương ứng. `Document`, `Book`
 thuộc nguồn dữ liệu.
 
 Các field marker là token học được, được thêm vào tokenizer trước khi model
-khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Khi câu
-dài, pipeline giữ nguyên toàn bộ block feature/metadata và chia ngân sách token
-còn lại cho D3Tok và Surface, ưu tiên D3Tok khi có một token lẻ.
+khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Ngân sách
+512 token được cấp theo thứ tự `D3Tok → feature/metadata → Surface`: toàn bộ
+D3Tok và feature được giữ nguyên, Surface chỉ dùng phần còn lại và là thành phần
+duy nhất bị truncate. Nếu riêng D3Tok cộng feature đã vượt giới hạn, pipeline
+dừng với chẩn đoán cần chunking thay vì âm thầm cắt D3Tok.
 
 Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
 normalize và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
@@ -402,7 +404,7 @@ Các invariant cần đạt:
 - không còn Arabic diacritics sau `dediac_ar`;
 - dấu câu còn trong cả D3Tok và Surface;
 - dấu `+` của D3Tok không bị xóa;
-- field token là atomic và feature block không bị truncate;
+- D3Tok và feature block không bị truncate; Surface bị cắt trước;
 - output model giữ shape `[batch_size]`, kể cả batch size 1;
 - sampler chia đều hai rank và deterministic theo seed/epoch;
 - gather trả đúng số mẫu theo thứ tự gốc;
