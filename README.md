@@ -91,7 +91,6 @@ lưu bản CSV không thay đổi yêu cầu attribution/share-alike của dữ 
 .
 ├── train.py
 ├── train_blind.py
-├── arclean_map.json
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
@@ -232,40 +231,75 @@ Thứ tự là một invariant của baseline:
 
 ```text
 raw sentence
-→ CAMeL arclean
+→ normalize_unicode(compatibility=True)
+→ bỏ Kashida U+0640 nhưng vẫn giữ dấu phụ
 → đổi alif-maqsura nội từ thành ya như SBTW
 → simple_word_tokenize(split_digits=True)
 → BERTUnfactoredDisambiguator("msa", top=1)
 → lấy analysis["d3tok"]
-→ dediac_ar và chuyển biên `_+`/`+_` như SBTW
-→ Hugging Face tokenizer
+→ dediac_ar và chuyển biên `_+`/`+_` → D3Tok view
+
+song song từ câu đã normalize:
+→ tính DC trước khi bỏ dấu phụ
+→ dediac_ar, giữ dấu câu → Surface view
+→ tính WC, WLA, WLS trên token của Surface view
 ```
 
 Chi tiết:
 
-1. `CharMapper.mapper_from_json("arclean_map.json")` dùng đúng bản đồ arclean
-   được public trong repository SBTW để chuẩn hóa ký tự, khoảng trắng, dấu câu,
-   presentation forms, Kashida và dấu phụ.
+1. Unicode được chuẩn hóa ở compatibility mode; chỉ Kashida bị xóa ở bước đầu,
+   nên BERT D3Tok vẫn nhận được dấu phụ của câu gốc.
 2. Alif-maqsura `ى` ở giữa từ được đổi thành ya `ي`, giống code SBTW.
 3. `simple_word_tokenize(..., split_digits=True)` tạo word/punctuation sequence.
 4. `BERTUnfactoredDisambiguator.pretrained(model_name="msa",
    pretrained_cache=False, top=1)` chọn phân tích hình thái theo ngữ cảnh.
 5. Pipeline lấy trường `analysis["d3tok"]`, chạy `dediac_ar`, rồi chuyển `_+`
    thành ` +` và `+_` thành `+ ` đúng theo preprocessing công khai của SBTW.
-6. Các biểu diễn từng từ được ghép bằng khoảng trắng trước HF tokenizer.
+6. Dấu câu được giữ trong cả D3Tok view và Surface view.
+
+Bốn feature số được tính theo đúng thời điểm:
+
+- `[DC]`: số Arabic diacritics chia cho số ký tự của câu đã normalize, trước
+  `dediac_ar`;
+- `[WC]`: số token trong Surface view;
+- `[WLA]`: độ dài token trung bình trong Surface view;
+- `[WLS]`: độ lệch chuẩn độ dài token trong Surface view.
+
+Input cuối cùng là một sentence pair:
+
+```text
+[CLS] D3Tok view [SEP]
+Surface view [SEP]
+[WC] value [DC] value [WLA] value [WLS] value
+[DOM_*] [TC_*] [SEP]
+```
+
+`Domain` được ánh xạ vào `DOM_AH`, `DOM_SS`, `DOM_STEM`; `Text_Class` được ánh
+xạ vào `TC_FOUNDATIONAL`, `TC_ADVANCED`, `TC_SPECIALIZED`. Nếu Blind Test thiếu
+hai cột này, pipeline dùng token `UNKNOWN` tương ứng. `Document`, `Book`,
+`Author` và `Annotator` không được concat vì cardinality cao hoặc có nguy cơ học
+thuộc nguồn dữ liệu.
+
+Các field marker là token học được, được thêm vào tokenizer trước khi model
+khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Khi câu
+dài, pipeline giữ nguyên toàn bộ block feature/metadata và chia ngân sách token
+còn lại cho D3Tok và Surface, ưu tiên D3Tok khi có một token lẻ.
 
 Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
-arclean và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
+normalize và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
 fallback; nó không âm thầm thay bằng chuỗi rỗng và không tạo D3Tok giả.
 
 ## 9. Cache preprocessing
 
 Train, Dev và Test có cache Parquet riêng. Fingerprint bao gồm nội dung ID/text,
 split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Việc chuyển
-từ MLE D3Tok sang BERT D3Tok làm toàn bộ cache cũ tự động mất hiệu lực.
+sang hai text view cùng feature mới làm toàn bộ cache cũ tự động mất hiệu lực.
 
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
+
+Checkpoint cũ có kích thước embedding trước khi thêm field token nên không tương
+thích để resume. Hãy bắt đầu một output/checkpoint mới cho pipeline này.
 
 ## 10. Kiến trúc và objective
 
@@ -356,15 +390,19 @@ Smoke test thật (mẫu nhỏ, D3Tok/checkpoint thật, output riêng):
 python train.py --smoke-test
 ```
 
-Smoke mode kiểm tra pipeline đọc dữ liệu, arclean, BERT D3Tok, dediac, HF
-tokenization, sampler, forward/backward, metric, checkpoint/reload, inference và
-submission ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
+Smoke mode kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi dấu
+phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
+sampler, forward/backward, metric, checkpoint/reload, inference và submission
+ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
 
 Các invariant cần đạt:
 
 - không còn `U+0640` sau preprocessing;
+- BERT D3Tok nhận câu còn dấu phụ;
 - không còn Arabic diacritics sau `dediac_ar`;
+- dấu câu còn trong cả D3Tok và Surface;
 - dấu `+` của D3Tok không bị xóa;
+- field token là atomic và feature block không bị truncate;
 - output model giữ shape `[batch_size]`, kể cả batch size 1;
 - sampler chia đều hai rank và deterministic theo seed/epoch;
 - gather trả đúng số mẫu theo thứ tự gốc;

@@ -55,11 +55,25 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
-PREPROCESSING_VERSION = "barec-bert-d3tok-v2"
+PREPROCESSING_VERSION = "barec-structured-pair-v3"
 TATWEEL = "\u0640"
 ARABIC_DIACRITICS = frozenset(chr(code) for code in range(0x064B, 0x0653)) | {
     "\u0670"
 }
+FIELD_TOKENS = (
+    "[WC]",
+    "[DC]",
+    "[WLA]",
+    "[WLS]",
+    "[DOM_AH]",
+    "[DOM_SS]",
+    "[DOM_STEM]",
+    "[DOM_UNKNOWN]",
+    "[TC_FOUNDATIONAL]",
+    "[TC_ADVANCED]",
+    "[TC_SPECIALIZED]",
+    "[TC_UNKNOWN]",
+)
 
 
 @dataclass
@@ -338,6 +352,8 @@ ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
 DOCUMENT_ALIASES = ("Document", "document")
+DOMAIN_ALIASES = ("Domain", "domain")
+TEXT_CLASS_ALIASES = ("Text_Class", "Text Class", "text_class", "text class")
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -409,6 +425,12 @@ def load_split(
     document_column = resolve_column(
         columns, "Document", DOCUMENT_ALIASES, "document", required=False
     )
+    domain_column = resolve_column(
+        columns, "Domain", DOMAIN_ALIASES, "domain", required=False
+    )
+    text_class_column = resolve_column(
+        columns, "Text_Class", TEXT_CLASS_ALIASES, "text class", required=False
+    )
     assert id_column is not None and text_column is not None
 
     if frame[id_column].isna().any():
@@ -470,6 +492,18 @@ def load_split(
         )
     else:
         frame["_document"] = None
+    frame["_domain"] = (
+        frame[domain_column].map(lambda value: None if pd.isna(value) else str(value))
+        if domain_column is not None
+        else None
+    )
+    frame["_text_class"] = (
+        frame[text_class_column].map(
+            lambda value: None if pd.isna(value) else str(value)
+        )
+        if text_class_column is not None
+        else None
+    )
     frame["_original_index"] = np.arange(len(frame), dtype=np.int64)
     frame.attrs["has_labels"] = label_column is not None
     frame.attrs["source_path"] = str(path)
@@ -543,21 +577,26 @@ def smoke_subset(frame: pd.DataFrame, size: int) -> pd.DataFrame:
 
 @dataclass(frozen=True)
 class PreprocessResult:
-    """One preprocessed sentence and an optional fallback diagnostic."""
+    """Parallel text views, sentence statistics, and an optional diagnostic."""
 
-    text: str
+    d3tok_text: str
+    surface_text: str
+    diacritic_coverage: float
+    word_count: int
+    word_length_mean: float
+    word_length_std: float
     error: Optional[str]
 
 
 class ArabicD3TokPreprocessor:
-    """Reproduce SBTW's arclean + BERT-unfactored D3Tok preprocessing."""
+    """Keep diacritics for BERT D3Tok, then build normalized model views."""
 
     def __init__(self, resource: str, *, use_gpu: Optional[bool] = None) -> None:
         try:
             from camel_tools.disambig.bert import BERTUnfactoredDisambiguator
             from camel_tools.tokenizers.word import simple_word_tokenize
-            from camel_tools.utils.charmap import CharMapper
             from camel_tools.utils.dediac import dediac_ar
+            from camel_tools.utils.normalize import normalize_unicode
         except ImportError as error:
             raise RuntimeError(
                 "CAMeL Tools with the BERT unfactored disambiguator is required "
@@ -566,9 +605,7 @@ class ArabicD3TokPreprocessor:
 
         self._simple_word_tokenize = simple_word_tokenize
         self._dediac_ar = dediac_ar
-        self._arclean = CharMapper.mapper_from_json(
-            str(SCRIPT_DIR / "arclean_map.json")
-        )
+        self._normalize_unicode = normalize_unicode
         use_gpu = torch.cuda.is_available() if use_gpu is None else use_gpu
         self._disambiguator = BERTUnfactoredDisambiguator.pretrained(
             model_name=resource,
@@ -577,16 +614,47 @@ class ArabicD3TokPreprocessor:
             use_gpu=use_gpu,
         )
 
-    def clean(self, text: str) -> str:
-        """Apply CAMeL's arclean map and SBTW's internal alif-maqsura rule."""
+    def normalize_keep_diacritics(self, text: str) -> str:
+        """Normalize Unicode and remove Kashida without deleting diacritics."""
 
-        cleaned = self._arclean(text)
-        return re.sub(r"(?<=\B)ى(?=\B)", "ي", cleaned)
+        normalized = self._normalize_unicode(text, compatibility=True)
+        normalized = normalized.replace(TATWEEL, "")
+        return re.sub(r"(?<=\B)ى(?=\B)", "ي", normalized)
 
-    def fallback(self, cleaned_text: str) -> str:
-        """Preserve cleaned content when BERT morphological analysis fails."""
+    def surface_view(self, normalized_text: str) -> str:
+        """Remove Arabic diacritics while preserving words and punctuation."""
 
-        return self._dediac_ar(cleaned_text).replace(TATWEEL, "")
+        return self._dediac_ar(normalized_text).replace(TATWEEL, "")
+
+    def sentence_statistics(
+        self,
+        normalized_text: str,
+        surface_text: str,
+    ) -> tuple[float, int, float, float]:
+        """Compute DC before dediacritization and length stats on Surface view."""
+
+        diacritic_count = sum(char in ARABIC_DIACRITICS for char in normalized_text)
+        diacritic_coverage = (
+            0.0
+            if not normalized_text
+            else float(diacritic_count / len(normalized_text))
+        )
+        surface_tokens = self._simple_word_tokenize(
+            surface_text,
+            split_digits=True,
+        )
+        lengths = np.asarray(
+            [len(token) for token in surface_tokens],
+            dtype=np.float32,
+        )
+        if not len(lengths):
+            return diacritic_coverage, 0, 0.0, 0.0
+        return (
+            diacritic_coverage,
+            int(len(lengths)),
+            float(lengths.mean()),
+            float(lengths.std()),
+        )
 
     def _render_d3tok_sentence(self, sentence_analysis: Sequence[Any]) -> str:
         """Render CAMeL analyses exactly like the public SBTW preprocessing."""
@@ -618,25 +686,39 @@ class ArabicD3TokPreprocessor:
 
         results: list[Optional[PreprocessResult]] = [None] * len(texts)
         valid_indices: list[int] = []
-        cleaned_texts: list[str] = [""] * len(texts)
+        surface_texts: list[str] = [""] * len(texts)
+        statistics: list[tuple[float, int, float, float]] = [
+            (0.0, 0, 0.0, 0.0)
+        ] * len(texts)
         tokenized_sentences: list[list[str]] = []
 
         for index, text in enumerate(texts):
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("D3Tok received an empty/non-string sentence")
             try:
-                cleaned = self.clean(text)
+                normalized = self.normalize_keep_diacritics(text)
             except Exception as error:
-                cleaned = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
+                normalized = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
+                surface = self.surface_view(normalized)
+                dc, wc, wla, wls = self.sentence_statistics(normalized, surface)
                 results[index] = PreprocessResult(
-                    self.fallback(cleaned),
-                    f"ArabicCleaningError: {type(error).__name__}: {error}",
+                    surface,
+                    surface,
+                    dc,
+                    wc,
+                    wla,
+                    wls,
+                    f"UnicodeNormalizationError: {type(error).__name__}: {error}",
                 )
                 continue
-            cleaned_texts[index] = cleaned
+            surface = self.surface_view(normalized)
+            if not surface.strip():
+                raise ValueError("Surface preprocessing produced no content")
+            surface_texts[index] = surface
+            statistics[index] = self.sentence_statistics(normalized, surface)
             valid_indices.append(index)
             tokenized_sentences.append(
-                self._simple_word_tokenize(cleaned, split_digits=True)
+                self._simple_word_tokenize(normalized, split_digits=True)
             )
 
         if tokenized_sentences:
@@ -649,8 +731,14 @@ class ArabicD3TokPreprocessor:
                         "BERT D3Tok returned a different number of sentences"
                     )
                 for index, sentence_analysis in zip(valid_indices, analyzed_sentences):
+                    dc, wc, wla, wls = statistics[index]
                     results[index] = PreprocessResult(
                         self._render_d3tok_sentence(sentence_analysis),
+                        surface_texts[index],
+                        dc,
+                        wc,
+                        wla,
+                        wls,
                         None,
                     )
             except Exception as batch_error:
@@ -661,13 +749,25 @@ class ArabicD3TokPreprocessor:
                         sentence_analysis = self._disambiguator.disambiguate_sentences(
                             [words]
                         )[0]
+                        dc, wc, wla, wls = statistics[index]
                         results[index] = PreprocessResult(
                             self._render_d3tok_sentence(sentence_analysis),
+                            surface_texts[index],
+                            dc,
+                            wc,
+                            wla,
+                            wls,
                             None,
                         )
                     except Exception as row_error:
+                        dc, wc, wla, wls = statistics[index]
                         results[index] = PreprocessResult(
-                            self.fallback(cleaned_texts[index]),
+                            surface_texts[index],
+                            surface_texts[index],
+                            dc,
+                            wc,
+                            wla,
+                            wls,
                             "D3TokError: "
                             f"{type(row_error).__name__}: {row_error}; "
                             "batch_error="
@@ -724,6 +824,16 @@ def create_preprocessor(config: Config, *, allow_download: bool) -> ArabicD3TokP
 
 
 _PROCESS_PREPROCESSOR: Optional[ArabicD3TokPreprocessor] = None
+PreprocessedRow = tuple[
+    str,
+    str,
+    str,
+    float,
+    int,
+    float,
+    float,
+    Optional[str],
+]
 
 
 def _preprocess_worker_init(resource: str) -> None:
@@ -735,12 +845,21 @@ def _preprocess_worker_init(resource: str) -> None:
 
 def _preprocess_worker_batch(
     items: Sequence[tuple[str, str]],
-) -> list[tuple[str, str, Optional[str]]]:
+) -> list[PreprocessedRow]:
     if _PROCESS_PREPROCESSOR is None:
         raise RuntimeError("Preprocessing worker was not initialized")
     results = _PROCESS_PREPROCESSOR.process_many([text for _, text in items])
     return [
-        (row_id, result.text, result.error)
+        (
+            row_id,
+            result.d3tok_text,
+            result.surface_text,
+            result.diacritic_coverage,
+            result.word_count,
+            result.word_length_mean,
+            result.word_length_std,
+            result.error,
+        )
         for (row_id, _), result in zip(items, results)
     ]
 
@@ -770,13 +889,13 @@ def preprocessing_fingerprint(
         "id_column": config.ID_COLUMN,
         "text_column": config.TEXT_COLUMN,
         "resource": config.D3TOK_RESOURCE,
-        "cleaning": "bundled SBTW arclean_map.json + internal alif-maqsura to ya",
-        "arclean_sha256": hashlib.sha256(
-            (SCRIPT_DIR / "arclean_map.json").read_bytes()
-        ).hexdigest(),
-        "disambiguator": "BERTUnfactoredDisambiguator top=1",
+        "normalization": "CAMeL normalize_unicode compatibility=True",
+        "kashida": "remove U+0640 while retaining Arabic diacritics",
+        "disambiguator": "BERTUnfactoredDisambiguator top=1 sees diacritics",
         "segmentation": "analysis['d3tok'] with _+ and +_ boundary conversion",
-        "dediac": "CAMeL dediac_ar on analysis['d3tok']",
+        "dediac": "CAMeL dediac_ar after BERT D3Tok and on Surface view",
+        "statistics": "DC before dediac; WC/WLA/WLS on Surface tokens",
+        "punctuation": "preserved in D3Tok and Surface views",
         "camel_tools": package_version("camel-tools"),
     }
     digest.update(json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8"))
@@ -791,23 +910,38 @@ def preprocessing_fingerprint(
 
 
 def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> None:
-    """Exercise arclean, BERT D3Tok, dediacritization, and fallback."""
+    """Exercise the fixed diacritics-aware preprocessing order and fallback."""
 
     sample = "الكتــــابُ مفيدٌ."
-    cleaned = preprocessor.clean(sample)
-    if TATWEEL in cleaned:
-        raise AssertionError("arclean Tatweel removal check failed")
+    normalized = preprocessor.normalize_keep_diacritics(sample)
+    if TATWEEL in normalized:
+        raise AssertionError("Kashida removal check failed")
+    if not any(char in ARABIC_DIACRITICS for char in normalized):
+        raise AssertionError("Diacritics must remain available to BERT D3Tok")
     result = preprocessor.process(sample)
-    if not result.text.strip():
+    if not result.d3tok_text.strip() or not result.surface_text.strip():
         raise AssertionError("D3Tok content-preservation check failed")
-    if TATWEEL in result.text or any(char in ARABIC_DIACRITICS for char in result.text):
+    if TATWEEL in result.d3tok_text or any(
+        char in ARABIC_DIACRITICS for char in result.d3tok_text
+    ):
         raise AssertionError("Post-D3Tok Tatweel/diacritic check failed")
-    plus_probe = preprocessor.fallback("ال+كِتَابُ")
+    if any(char in ARABIC_DIACRITICS for char in result.surface_text):
+        raise AssertionError("Surface view must be dediacritized")
+    if "." not in result.d3tok_text or "." not in result.surface_text:
+        raise AssertionError("Punctuation must be preserved in both text views")
+    plus_probe = preprocessor.surface_view("ال+كِتَابُ")
     if "+" not in plus_probe or any(char in ARABIC_DIACRITICS for char in plus_probe):
         raise AssertionError("dediac_ar must retain D3Tok's '+' marker")
-    fallback_probe = preprocessor.fallback(cleaned)
+    fallback_probe = preprocessor.surface_view(normalized)
     if not fallback_probe.strip() or TATWEEL in fallback_probe:
         raise AssertionError("Fallback content-preservation check failed")
+    if result.word_count <= 0 or result.word_length_mean <= 0.0:
+        raise AssertionError("Surface statistics must be positive for the probe")
+    expected_dc = sum(char in ARABIC_DIACRITICS for char in normalized) / len(
+        normalized
+    )
+    if not math.isclose(result.diacritic_coverage, expected_dc):
+        raise AssertionError("Diacritic coverage was not computed before dediac")
 
     class _ForcedBERTD3TokFailure:
         def disambiguate_sentences(
@@ -824,8 +958,8 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
         preprocessor._disambiguator = real_disambiguator
     if not forced_fallback.error or not forced_fallback.error.startswith("D3TokError:"):
         raise AssertionError("Forced D3Tok failure was not diagnosed")
-    if not forced_fallback.text.strip() or any(
-        char in ARABIC_DIACRITICS for char in forced_fallback.text
+    if not forced_fallback.d3tok_text.strip() or any(
+        char in ARABIC_DIACRITICS for char in forced_fallback.d3tok_text
     ):
         raise AssertionError("Forced D3Tok fallback did not preserve clean content")
 
@@ -843,7 +977,7 @@ def build_preprocessing_cache(
         items[start : start + config.D3TOK_BATCH_SIZE]
         for start in range(0, len(items), config.D3TOK_BATCH_SIZE)
     ]
-    rows: list[tuple[str, str, Optional[str]]]
+    rows: list[PreprocessedRow]
 
     if config.PREPROCESS_NUM_WORKERS > 1:
         probe = create_preprocessor(config, allow_download=True)
@@ -876,7 +1010,16 @@ def build_preprocessing_cache(
         ):
             results = preprocessor.process_many([text for _, text in item_batch])
             rows.extend(
-                (row_id, result.text, result.error)
+                (
+                    row_id,
+                    result.d3tok_text,
+                    result.surface_text,
+                    result.diacritic_coverage,
+                    result.word_count,
+                    result.word_length_mean,
+                    result.word_length_std,
+                    result.error,
+                )
                 for (row_id, _), result in zip(item_batch, results)
             )
         del preprocessor
@@ -887,12 +1030,23 @@ def build_preprocessing_cache(
         {
             "_id": [row[0] for row in rows],
             "_original_index": frame["_original_index"].to_numpy(dtype=np.int64),
-            "_processed_text": [row[1] for row in rows],
-            "_fallback_error": [row[2] for row in rows],
+            "_d3tok_text": [row[1] for row in rows],
+            "_surface_text": [row[2] for row in rows],
+            "_diacritic_coverage": [row[3] for row in rows],
+            "_word_count": [row[4] for row in rows],
+            "_word_length_mean": [row[5] for row in rows],
+            "_word_length_std": [row[6] for row in rows],
+            "_fallback_error": [row[7] for row in rows],
         }
     )
-    if cache_frame["_processed_text"].isna().any() or cache_frame["_processed_text"].eq("").any():
-        raise RuntimeError("Preprocessing produced an empty cached sentence")
+    for text_column in ("_d3tok_text", "_surface_text"):
+        if (
+            cache_frame[text_column].isna().any()
+            or cache_frame[text_column].astype(str).str.strip().eq("").any()
+        ):
+            raise RuntimeError(
+                f"Preprocessing produced an empty cached field: {text_column}"
+            )
     temporary_path = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         cache_frame.to_parquet(temporary_path, index=False)
@@ -913,8 +1067,52 @@ def load_cached_preprocessing(frame: pd.DataFrame, cache_path: Path) -> pd.DataF
     cached_indices = cache_frame["_original_index"].astype(int).tolist()
     if cached_indices != expected_indices:
         raise RuntimeError(f"Cache index mismatch: {cache_path}")
+    required_cache_columns = (
+        "_d3tok_text",
+        "_surface_text",
+        "_diacritic_coverage",
+        "_word_count",
+        "_word_length_mean",
+        "_word_length_std",
+        "_fallback_error",
+    )
+    missing_cache_columns = [
+        column for column in required_cache_columns if column not in cache_frame
+    ]
+    if missing_cache_columns:
+        raise RuntimeError(
+            f"Cache schema is missing {missing_cache_columns}: {cache_path}"
+        )
     output = frame.copy()
-    output["_processed_text"] = cache_frame["_processed_text"].astype(str).to_numpy()
+    output["_d3tok_text"] = cache_frame["_d3tok_text"].astype(str).to_numpy()
+    output["_surface_text"] = cache_frame["_surface_text"].astype(str).to_numpy()
+    output["_diacritic_coverage"] = pd.to_numeric(
+        cache_frame["_diacritic_coverage"],
+        errors="raise",
+    ).to_numpy(dtype=np.float64)
+    output["_word_count"] = pd.to_numeric(
+        cache_frame["_word_count"],
+        errors="raise",
+    ).to_numpy(dtype=np.int64)
+    output["_word_length_mean"] = pd.to_numeric(
+        cache_frame["_word_length_mean"],
+        errors="raise",
+    ).to_numpy(dtype=np.float64)
+    output["_word_length_std"] = pd.to_numeric(
+        cache_frame["_word_length_std"],
+        errors="raise",
+    ).to_numpy(dtype=np.float64)
+    numeric_feature_columns = (
+        "_diacritic_coverage",
+        "_word_length_mean",
+        "_word_length_std",
+    )
+    for column in numeric_feature_columns:
+        values = output[column].to_numpy(dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise RuntimeError(f"Cache contains non-finite values in {column}")
+    if (output["_word_count"].to_numpy(dtype=np.int64) <= 0).any():
+        raise RuntimeError("Cache contains non-positive Surface word counts")
     output["_fallback_error"] = cache_frame["_fallback_error"].to_numpy()
     output.attrs.update(frame.attrs)
     return output
@@ -973,11 +1171,136 @@ def preprocess_split_cached(
 # ---------------------------------------------------------------------------
 
 
+def normalized_metadata_key(value: Any) -> str:
+    """Normalize a small categorical metadata value without leaking row IDs."""
+
+    if value is None or pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip().casefold()).replace("&", "and")
+
+
+def domain_token(value: Any) -> str:
+    """Map the three stable BAREC domains to compact learned tokens."""
+
+    key = normalized_metadata_key(value)
+    mapping = {
+        "arts and humanities": "[DOM_AH]",
+        "social sciences": "[DOM_SS]",
+        "stem": "[DOM_STEM]",
+    }
+    return mapping.get(key, "[DOM_UNKNOWN]")
+
+
+def text_class_token(value: Any) -> str:
+    """Map BAREC readership groups to compact learned tokens."""
+
+    key = normalized_metadata_key(value)
+    mapping = {
+        "foundational": "[TC_FOUNDATIONAL]",
+        "advanced": "[TC_ADVANCED]",
+        "specialized": "[TC_SPECIALIZED]",
+    }
+    return mapping.get(key, "[TC_UNKNOWN]")
+
+
+def structured_feature_text(row: Mapping[str, Any]) -> str:
+    """Serialize sentence statistics and low-cardinality metadata."""
+
+    return (
+        f"[WC] {int(row['_word_count'])} "
+        f"[DC] {float(row['_diacritic_coverage']):.3f} "
+        f"[WLA] {float(row['_word_length_mean']):.3f} "
+        f"[WLS] {float(row['_word_length_std']):.3f} "
+        f"{domain_token(row.get('_domain'))} "
+        f"{text_class_token(row.get('_text_class'))}"
+    )
+
+
+def validate_structured_tokenizer(tokenizer: Any) -> None:
+    """Ensure every field marker is atomic and the pair separator is available."""
+
+    if tokenizer.sep_token is None or tokenizer.sep_token_id is None:
+        raise RuntimeError("The tokenizer must define a [SEP] token for paired input")
+    for token in FIELD_TOKENS:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        encoded = tokenizer.encode(token, add_special_tokens=False)
+        if (
+            token_id is None
+            or token_id == tokenizer.unk_token_id
+            or encoded != [token_id]
+        ):
+            raise RuntimeError(
+                f"Structured field token is not encoded atomically: {token}"
+            )
+
+
+def encode_structured_pair(
+    tokenizer: Any,
+    d3tok_text: str,
+    surface_text: str,
+    feature_text: str,
+    max_length: int,
+) -> dict[str, Any]:
+    """Encode two views while reserving space for the complete feature block."""
+
+    d3tok_ids = tokenizer.encode(d3tok_text, add_special_tokens=False)
+    surface_ids = tokenizer.encode(surface_text, add_special_tokens=False)
+    feature_ids = tokenizer.encode(feature_text, add_special_tokens=False)
+    if not d3tok_ids or not surface_ids or not feature_ids:
+        raise ValueError("Structured pair contains an empty tokenized component")
+
+    pair_special_tokens = int(tokenizer.num_special_tokens_to_add(pair=True))
+    fixed_length = pair_special_tokens + 1 + len(feature_ids)
+    text_budget = max_length - fixed_length
+    if text_budget < 2:
+        raise ValueError(
+            "MAX_LENGTH is too small to retain D3Tok, Surface, and all structured "
+            f"features: max_length={max_length}, fixed_length={fixed_length}"
+        )
+
+    if len(d3tok_ids) + len(surface_ids) > text_budget:
+        # Balance the two text views like longest-first truncation. D3Tok gets
+        # the odd token because it matches the checkpoint's native input.
+        keep_d3tok = min(len(d3tok_ids), (text_budget + 1) // 2)
+        keep_surface = min(len(surface_ids), text_budget - keep_d3tok)
+        remaining = text_budget - keep_d3tok - keep_surface
+        if remaining:
+            add_d3tok = min(remaining, len(d3tok_ids) - keep_d3tok)
+            keep_d3tok += add_d3tok
+            remaining -= add_d3tok
+            keep_surface += min(remaining, len(surface_ids) - keep_surface)
+        d3tok_ids = d3tok_ids[:keep_d3tok]
+        surface_ids = surface_ids[:keep_surface]
+
+    paired_ids = surface_ids + [int(tokenizer.sep_token_id)] + feature_ids
+    encoded = dict(
+        tokenizer.prepare_for_model(
+            d3tok_ids,
+            pair_ids=paired_ids,
+            add_special_tokens=True,
+            padding=False,
+            truncation=False,
+            return_attention_mask=True,
+            return_token_type_ids=True,
+        )
+    )
+    if len(encoded["input_ids"]) > max_length:
+        raise AssertionError("Reserved structured input exceeded MAX_LENGTH")
+    if not {int(tokenizer.sep_token_id), *feature_ids}.issubset(
+        set(encoded["input_ids"])
+    ):
+        raise AssertionError("Structured feature block was altered during encoding")
+    return encoded
+
+
 class BARECDataset(Dataset[dict[str, Any]]):
-    """Tokenize cached D3Tok sentences lazily while retaining IDs and row indices."""
+    """Encode D3Tok as segment A and Surface/features as segment B."""
 
     def __init__(self, frame: pd.DataFrame, tokenizer: Any, max_length: int) -> None:
-        self.texts = frame["_processed_text"].astype(str).tolist()
+        self.d3tok_texts = frame["_d3tok_text"].astype(str).tolist()
+        rows = frame.to_dict(orient="records")
+        self.surface_texts = [str(row["_surface_text"]) for row in rows]
+        self.feature_texts = [structured_feature_text(row) for row in rows]
         self.ids = frame["_id"].astype(str).tolist()
         self.indices = frame["_original_index"].astype(int).tolist()
         self.has_labels = bool(frame.attrs.get("has_labels", False))
@@ -988,14 +1311,15 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.max_length = max_length
 
     def __len__(self) -> int:
-        return len(self.texts)
+        return len(self.d3tok_texts)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        encoded = self.tokenizer(
-            self.texts[index],
-            truncation=True,
-            max_length=self.max_length,
-            padding=False,
+        encoded = encode_structured_pair(
+            self.tokenizer,
+            self.d3tok_texts[index],
+            self.surface_texts[index],
+            self.feature_texts[index],
+            self.max_length,
         )
         item: dict[str, Any] = dict(encoded)
         item["sample_id"] = self.ids[index]
@@ -1310,17 +1634,26 @@ def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
 def run_regression_shape_check(
     model: ArabicReadabilityRegressor,
     tokenizer: Any,
-    text: str,
+    d3tok_text: str,
+    surface_text: str,
+    feature_text: str,
     device: torch.device,
     max_length: int,
 ) -> None:
     """Verify batch-one output shape and gradient connectivity before DDP."""
 
-    encoded = tokenizer(
-        text,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
+    encoded = encode_structured_pair(
+        tokenizer,
+        d3tok_text,
+        surface_text,
+        feature_text,
+        max_length,
+    )
+    token_type_ids = encoded.get("token_type_ids")
+    if token_type_ids is None or not {0, 1}.issubset(set(token_type_ids)):
+        raise AssertionError("Paired input must contain both BERT token-type segments")
+    encoded = dict(
+        tokenizer.pad([encoded], padding=True, return_tensors="pt")
     )
     encoded = {key: value.to(device) for key, value in encoded.items()}
     was_training = model.training
@@ -2163,16 +2496,34 @@ def train_select_and_predict(
     """Fine-tune on Train, select only on Dev, then infer Test once."""
 
     tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, use_fast=True)
+    added_tokens = tokenizer.add_tokens(list(FIELD_TOKENS), special_tokens=False)
+    validate_structured_tokenizer(tokenizer)
+    if context.is_main:
+        LOGGER.info(
+            "Structured field tokens added to tokenizer: %d/%d",
+            added_tokens,
+            len(FIELD_TOKENS),
+        )
     train_loader, dev_loader, test_loader, train_sampler = make_data_loaders(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
     base_model = ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
+    embedding_count = int(
+        base_model.encoder.get_input_embeddings().num_embeddings
+    )
+    if embedding_count != len(tokenizer):
+        base_model.encoder.resize_token_embeddings(len(tokenizer))
+    if int(base_model.encoder.get_input_embeddings().num_embeddings) != len(tokenizer):
+        raise RuntimeError("Tokenizer/model vocabulary sizes remain inconsistent")
     base_model.to(context.device)
+    probe_row = train_frame.iloc[0].to_dict()
     run_regression_shape_check(
         base_model,
         tokenizer,
-        str(train_frame.iloc[0]["_processed_text"]),
+        str(probe_row["_d3tok_text"]),
+        str(probe_row["_surface_text"]),
+        structured_feature_text(probe_row),
         context.device,
         config.MAX_LENGTH,
     )
