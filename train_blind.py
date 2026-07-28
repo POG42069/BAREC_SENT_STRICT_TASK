@@ -78,6 +78,7 @@ import train as baseline  # noqa: E402
 
 
 BLIND_DATASET_ID = "CAMeL-Lab/BAREC-Shared-Task-2026-BlindTest-sent"
+BLIND_MATERIALIZATION_VERSION = "structured-metadata-v2"
 LOCAL_BLIND_PATH_ENV = "BAREC_2026_BLIND_SENT_LOCAL_PATH"
 KAGGLE_SECRET_BROKER_ENV = "KAGGLE_USER_SECRETS_TOKEN"
 DEFAULT_TOKEN_ENV = "HF_TOKEN"
@@ -93,7 +94,10 @@ def private_blind_path(preferred_split: str) -> Path:
     """Key the private scratch table by dataset and requested split."""
 
     key = hashlib.sha256(
-        f"{BLIND_DATASET_ID}\0{preferred_split}".encode("utf-8")
+        (
+            f"{BLIND_DATASET_ID}\0{preferred_split}\0"
+            f"{BLIND_MATERIALIZATION_VERSION}"
+        ).encode("utf-8")
     ).hexdigest()[:16]
     return PRIVATE_DOWNLOAD_DIR / f"blind_test_{key}.parquet"
 
@@ -354,24 +358,35 @@ def materialize_blind_dataset(
         "text",
         required=True,
     )
-    document_column = baseline.resolve_column(
-        list(frame.columns),
-        "Document",
-        baseline.DOCUMENT_ALIASES,
-        "document",
-        required=False,
+    metadata_specs = (
+        ("Annotator", baseline.ANNOTATOR_ALIASES, "annotator"),
+        ("Document", baseline.DOCUMENT_ALIASES, "document"),
+        ("Book", baseline.BOOK_ALIASES, "book"),
+        ("Author", baseline.AUTHOR_ALIASES, "author"),
+        ("Domain", baseline.DOMAIN_ALIASES, "domain"),
+        ("Text_Class", baseline.TEXT_CLASS_ALIASES, "text class"),
     )
+    metadata_columns = {
+        canonical_name: baseline.resolve_column(
+            list(frame.columns),
+            canonical_name,
+            aliases,
+            role,
+            required=False,
+        )
+        for canonical_name, aliases, role in metadata_specs
+    }
     assert id_column is not None and text_column is not None
 
-    # Materialize only what inference/isolation validation needs. This both
-    # canonicalizes aliases and prevents labels or unrelated private metadata
-    # from reaching Config, checkpoints, diagnostics, or the model pipeline.
+    # Materialize only the sentence and explicitly modeled SBTW metadata.
+    # Label-like and unrelated private columns never reach the model pipeline.
     canonical_data: dict[str, Any] = {
         config.ID_COLUMN: frame[id_column].astype("string"),
         config.TEXT_COLUMN: frame[text_column],
     }
-    if document_column is not None:
-        canonical_data["Document"] = frame[document_column]
+    for canonical_name, source_column in metadata_columns.items():
+        if source_column is not None:
+            canonical_data[canonical_name] = frame[source_column]
     frame = pd.DataFrame(canonical_data)
 
     temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp.parquet")

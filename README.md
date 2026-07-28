@@ -275,23 +275,26 @@ Input cuối cùng là một sentence pair:
 [CLS] D3Tok view [SEP]
 Surface view [SEP]
 [WC] value [DC] value [WLA] value [WLS] value
-[DOM_*] [TC_*] [SEP]
+[DOM_*] [TC_*]
+[ANN] Annotator [DOC] Document [BOOK] Book [AUTH] Author [SEP]
 ```
 
 `Domain` được ánh xạ vào `DOM_AH`, `DOM_SS`, `DOM_STEM`; `Text_Class` được ánh
 xạ vào `TC_FOUNDATIONAL`, `TC_ADVANCED`, `TC_SPECIALIZED`. Nếu Blind Test thiếu
-hai cột này, pipeline dùng token `UNKNOWN` tương ứng. `Document`, `Book`,
-`Author` và `Annotator` không được concat vì cardinality cao hoặc có nguy cơ học
-thuộc nguồn dữ liệu.
+metadata nào, pipeline dùng `[UNK]` hoặc token `UNKNOWN` tương ứng. Theo input
+công khai của SBTW, `Annotator`, `Document`, `Book` và `Author` cũng được concat
+sau marker học được `[ANN]`, `[DOC]`, `[BOOK]`, `[AUTH]`. `Source` không được
+thêm vì nó không nằm trong block concat công khai của SBTW.
 
 Các field marker là token học được, được thêm vào tokenizer trước khi model
 khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Pipeline
 thử giữ nguyên D3Tok, Surface và toàn bộ feature. Nếu tổng vượt 512 token, các
 feature được bỏ nguyên nhóm từ cuối danh sách ưu tiên:
-`Text_Class → Domain → WLS → WLA → DC → WC`. Vì vậy một label như `[WLA]`
-không bao giờ còn lại mà thiếu value đi kèm. Chỉ sau khi đã bỏ mọi feature mà
-input vẫn quá dài, Surface mới bị truncate. D3Tok không bị truncate âm thầm;
-nếu riêng D3Tok đã vượt giới hạn, pipeline dừng với chẩn đoán cần chunking.
+`Author → Book → Document → Annotator → Text_Class → Domain → WLS → WLA → DC
+→ WC`. Vì vậy một marker như `[WLA]` hoặc `[DOC]` không bao giờ còn lại mà thiếu
+value đi kèm. Chỉ sau khi đã bỏ mọi feature mà input vẫn quá dài, Surface mới bị
+truncate. D3Tok không bị truncate âm thầm; nếu riêng D3Tok đã vượt giới hạn,
+pipeline dừng với chẩn đoán cần chunking.
 
 Nếu một token hợp lệ vẫn không có trường `d3tok`, chỉ token đó dùng surface
 fallback; các token khác trong câu vẫn giữ D3Tok. Chỉ khi toàn bộ lời gọi BERT

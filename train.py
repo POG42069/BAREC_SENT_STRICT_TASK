@@ -82,6 +82,10 @@ FIELD_TOKENS = (
     "[TC_ADVANCED]",
     "[TC_SPECIALIZED]",
     "[TC_UNKNOWN]",
+    "[ANN]",
+    "[DOC]",
+    "[BOOK]",
+    "[AUTH]",
 )
 
 
@@ -368,6 +372,9 @@ ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
 DOCUMENT_ALIASES = ("Document", "document")
+ANNOTATOR_ALIASES = ("Annotator", "annotator")
+BOOK_ALIASES = ("Book", "book")
+AUTHOR_ALIASES = ("Author", "author")
 DOMAIN_ALIASES = ("Domain", "domain")
 TEXT_CLASS_ALIASES = ("Text_Class", "Text Class", "text_class", "text class")
 
@@ -441,6 +448,15 @@ def load_split(
     document_column = resolve_column(
         columns, "Document", DOCUMENT_ALIASES, "document", required=False
     )
+    annotator_column = resolve_column(
+        columns, "Annotator", ANNOTATOR_ALIASES, "annotator", required=False
+    )
+    book_column = resolve_column(
+        columns, "Book", BOOK_ALIASES, "book", required=False
+    )
+    author_column = resolve_column(
+        columns, "Author", AUTHOR_ALIASES, "author", required=False
+    )
     domain_column = resolve_column(
         columns, "Domain", DOMAIN_ALIASES, "domain", required=False
     )
@@ -508,6 +524,23 @@ def load_split(
         )
     else:
         frame["_document"] = None
+    frame["_annotator"] = (
+        frame[annotator_column].map(
+            lambda value: None if pd.isna(value) else str(value)
+        )
+        if annotator_column is not None
+        else None
+    )
+    frame["_book"] = (
+        frame[book_column].map(lambda value: None if pd.isna(value) else str(value))
+        if book_column is not None
+        else None
+    )
+    frame["_author"] = (
+        frame[author_column].map(lambda value: None if pd.isna(value) else str(value))
+        if author_column is not None
+        else None
+    )
     frame["_domain"] = (
         frame[domain_column].map(lambda value: None if pd.isna(value) else str(value))
         if domain_column is not None
@@ -1342,6 +1375,16 @@ def text_class_token(value: Any) -> str:
     return mapping.get(key, "[TC_UNKNOWN]")
 
 
+def free_text_metadata_group(marker: str, value: Any) -> str:
+    """Serialize a SBTW metadata value after an atomic learned field marker."""
+
+    if value is None or pd.isna(value):
+        normalized_value = "[UNK]"
+    else:
+        normalized_value = re.sub(r"\s+", " ", str(value).strip())
+    return f"{marker} {normalized_value or '[UNK]'}"
+
+
 def structured_feature_groups(row: Mapping[str, Any]) -> tuple[str, ...]:
     """Serialize features as atomic groups ordered from highest to lowest priority."""
 
@@ -1352,6 +1395,10 @@ def structured_feature_groups(row: Mapping[str, Any]) -> tuple[str, ...]:
         f"[WLS] {float(row['_word_length_std']):.3f}",
         domain_token(row.get("_domain")),
         text_class_token(row.get("_text_class")),
+        free_text_metadata_group("[ANN]", row.get("_annotator")),
+        free_text_metadata_group("[DOC]", row.get("_document")),
+        free_text_metadata_group("[BOOK]", row.get("_book")),
+        free_text_metadata_group("[AUTH]", row.get("_author")),
     )
 
 
