@@ -55,7 +55,7 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
-PREPROCESSING_VERSION = "barec-d3tok-v1"
+PREPROCESSING_VERSION = "barec-bert-d3tok-v2"
 TATWEEL = "\u0640"
 ARABIC_DIACRITICS = frozenset(chr(code) for code in range(0x064B, 0x0653)) | {
     "\u0670"
@@ -84,11 +84,12 @@ class Config:
     MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
     MAX_LENGTH: int = 256
     DROPOUT: float = 0.1
-    D3TOK_RESOURCE: str = "calima-msa-r13"
+    D3TOK_RESOURCE: str = "msa"
     AUTO_DOWNLOAD_CAMEL_DATA: bool = True
-    CAMEL_DATA_PACKAGE: str = "light"
+    CAMEL_DATA_PACKAGE: str = "disambig-bert-unfactored-msa"
     FORCE_REPROCESS: bool = False
     PREPROCESS_NUM_WORKERS: int = 1
+    D3TOK_BATCH_SIZE: int = 256
 
     # Training.
     NUM_EPOCHS: int = 5
@@ -549,70 +550,138 @@ class PreprocessResult:
 
 
 class ArabicD3TokPreprocessor:
-    """Apply Unicode normalization, Tatweel removal, D3Tok, then dediacritize."""
+    """Reproduce SBTW's arclean + BERT-unfactored D3Tok preprocessing."""
 
-    def __init__(self, resource: str) -> None:
+    def __init__(self, resource: str, *, use_gpu: Optional[bool] = None) -> None:
         try:
-            from camel_tools.disambig.mle import MLEDisambiguator
-            from camel_tools.tokenizers.morphological import MorphologicalTokenizer
+            from camel_tools.disambig.bert import BERTUnfactoredDisambiguator
             from camel_tools.tokenizers.word import simple_word_tokenize
+            from camel_tools.utils.charmap import CharMapper
             from camel_tools.utils.dediac import dediac_ar
-            from camel_tools.utils.normalize import normalize_unicode
         except ImportError as error:
             raise RuntimeError(
-                "CAMeL Tools is required for real D3Tok. Install requirements.txt first."
+                "CAMeL Tools with the BERT unfactored disambiguator is required "
+                "for official D3Tok. Install requirements.txt first."
             ) from error
 
         self._simple_word_tokenize = simple_word_tokenize
         self._dediac_ar = dediac_ar
-        self._normalize_unicode = normalize_unicode
-        disambiguator = MLEDisambiguator.pretrained(resource)
-        self._d3tok = MorphologicalTokenizer(
-            disambiguator=disambiguator,
-            scheme="d3tok",
-            split=True,
-            diac=True,
+        self._arclean = CharMapper.mapper_from_json(
+            str(SCRIPT_DIR / "arclean_map.json")
+        )
+        use_gpu = torch.cuda.is_available() if use_gpu is None else use_gpu
+        self._disambiguator = BERTUnfactoredDisambiguator.pretrained(
+            model_name=resource,
+            pretrained_cache=False,
+            top=1,
+            use_gpu=use_gpu,
         )
 
-    def normalize_and_remove_tatweel(self, text: str) -> str:
-        """Perform compatibility Unicode normalization and remove only U+0640."""
+    def clean(self, text: str) -> str:
+        """Apply CAMeL's arclean map and SBTW's internal alif-maqsura rule."""
 
-        normalized = self._normalize_unicode(text, compatibility=True)
-        return normalized.replace(TATWEEL, "")
+        cleaned = self._arclean(text)
+        return re.sub(r"(?<=\B)ى(?=\B)", "ي", cleaned)
 
-    def fallback(self, normalized_text: str) -> str:
-        """Preserve normalized content when morphological tokenization fails."""
+    def fallback(self, cleaned_text: str) -> str:
+        """Preserve cleaned content when BERT morphological analysis fails."""
 
-        return self._dediac_ar(normalized_text).replace(TATWEEL, "")
+        return self._dediac_ar(cleaned_text).replace(TATWEEL, "")
+
+    def _render_d3tok_sentence(self, sentence_analysis: Sequence[Any]) -> str:
+        """Render CAMeL analyses exactly like the public SBTW preprocessing."""
+
+        rendered_words: list[str] = []
+        for item in sentence_analysis:
+            if not item.analyses:
+                raise ValueError("BERT D3Tok returned a token without analyses")
+            scored_analysis = item.analyses[0]
+            analysis = (
+                scored_analysis.analysis
+                if hasattr(scored_analysis, "analysis")
+                else scored_analysis[1]
+            )
+            if "d3tok" not in analysis:
+                raise KeyError("BERT D3Tok analysis is missing the 'd3tok' field")
+            rendered_words.append(
+                self._dediac_ar(str(analysis["d3tok"]))
+                .replace("_+", " +")
+                .replace("+_", "+ ")
+            )
+        processed = " ".join(rendered_words)
+        if not processed.strip():
+            raise ValueError("BERT D3Tok returned no content")
+        return processed
+
+    def process_many(self, texts: Sequence[str]) -> list[PreprocessResult]:
+        """Process a batch through BERT, isolating any per-row failures."""
+
+        results: list[Optional[PreprocessResult]] = [None] * len(texts)
+        valid_indices: list[int] = []
+        cleaned_texts: list[str] = [""] * len(texts)
+        tokenized_sentences: list[list[str]] = []
+
+        for index, text in enumerate(texts):
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("D3Tok received an empty/non-string sentence")
+            try:
+                cleaned = self.clean(text)
+            except Exception as error:
+                cleaned = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
+                results[index] = PreprocessResult(
+                    self.fallback(cleaned),
+                    f"ArabicCleaningError: {type(error).__name__}: {error}",
+                )
+                continue
+            cleaned_texts[index] = cleaned
+            valid_indices.append(index)
+            tokenized_sentences.append(
+                self._simple_word_tokenize(cleaned, split_digits=True)
+            )
+
+        if tokenized_sentences:
+            try:
+                analyzed_sentences = self._disambiguator.disambiguate_sentences(
+                    tokenized_sentences
+                )
+                if len(analyzed_sentences) != len(tokenized_sentences):
+                    raise RuntimeError(
+                        "BERT D3Tok returned a different number of sentences"
+                    )
+                for index, sentence_analysis in zip(valid_indices, analyzed_sentences):
+                    results[index] = PreprocessResult(
+                        self._render_d3tok_sentence(sentence_analysis),
+                        None,
+                    )
+            except Exception as batch_error:
+                # A malformed row should not force every row in a BERT batch to
+                # fall back. Retry individually so diagnostics remain exact.
+                for index, words in zip(valid_indices, tokenized_sentences):
+                    try:
+                        sentence_analysis = self._disambiguator.disambiguate_sentences(
+                            [words]
+                        )[0]
+                        results[index] = PreprocessResult(
+                            self._render_d3tok_sentence(sentence_analysis),
+                            None,
+                        )
+                    except Exception as row_error:
+                        results[index] = PreprocessResult(
+                            self.fallback(cleaned_texts[index]),
+                            "D3TokError: "
+                            f"{type(row_error).__name__}: {row_error}; "
+                            "batch_error="
+                            f"{type(batch_error).__name__}: {batch_error}",
+                        )
+
+        if any(result is None for result in results):
+            raise RuntimeError("BERT D3Tok preprocessing left an unresolved row")
+        return [result for result in results if result is not None]
 
     def process(self, text: str) -> PreprocessResult:
-        """Preprocess one sentence, using a content-preserving per-row fallback."""
+        """Preprocess one sentence using the same path as batched inference."""
 
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("D3Tok received an empty/non-string sentence")
-        try:
-            normalized = self.normalize_and_remove_tatweel(text)
-        except Exception as error:
-            normalized = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
-            fallback = self._dediac_ar(normalized)
-            return PreprocessResult(
-                fallback,
-                f"UnicodeNormalizationError: {type(error).__name__}: {error}",
-            )
-
-        try:
-            words = self._simple_word_tokenize(normalized)
-            d3_tokens = self._d3tok.tokenize(words)
-            output_tokens = [self._dediac_ar(str(token)) for token in d3_tokens]
-            processed = " ".join(token for token in output_tokens if token != "")
-            if normalized.strip() and not processed.strip():
-                raise ValueError("D3Tok returned no content")
-            return PreprocessResult(processed, None)
-        except Exception as error:
-            return PreprocessResult(
-                self.fallback(normalized),
-                f"D3TokError: {type(error).__name__}: {error}",
-            )
+        return self.process_many([text])[0]
 
 
 def camel_data_install_command(package: str) -> list[str]:
@@ -625,7 +694,7 @@ def camel_data_install_command(package: str) -> list[str]:
 
 
 def create_preprocessor(config: Config, *, allow_download: bool) -> ArabicD3TokPreprocessor:
-    """Load D3Tok and optionally install CAMeL's light data bundle once."""
+    """Load BERT D3Tok and optionally install its CAMeL data package once."""
 
     try:
         return ArabicD3TokPreprocessor(config.D3TOK_RESOURCE)
@@ -659,15 +728,21 @@ _PROCESS_PREPROCESSOR: Optional[ArabicD3TokPreprocessor] = None
 
 def _preprocess_worker_init(resource: str) -> None:
     global _PROCESS_PREPROCESSOR
-    _PROCESS_PREPROCESSOR = ArabicD3TokPreprocessor(resource)
+    # Multiple spawned workers must not each allocate a full BERT tagger on
+    # the same GPU. The default single-process path still uses CUDA when present.
+    _PROCESS_PREPROCESSOR = ArabicD3TokPreprocessor(resource, use_gpu=False)
 
 
-def _preprocess_worker_item(item: tuple[str, str]) -> tuple[str, str, Optional[str]]:
+def _preprocess_worker_batch(
+    items: Sequence[tuple[str, str]],
+) -> list[tuple[str, str, Optional[str]]]:
     if _PROCESS_PREPROCESSOR is None:
         raise RuntimeError("Preprocessing worker was not initialized")
-    row_id, text = item
-    result = _PROCESS_PREPROCESSOR.process(text)
-    return row_id, result.text, result.error
+    results = _PROCESS_PREPROCESSOR.process_many([text for _, text in items])
+    return [
+        (row_id, result.text, result.error)
+        for (row_id, _), result in zip(items, results)
+    ]
 
 
 def package_version(package: str) -> str:
@@ -695,9 +770,13 @@ def preprocessing_fingerprint(
         "id_column": config.ID_COLUMN,
         "text_column": config.TEXT_COLUMN,
         "resource": config.D3TOK_RESOURCE,
-        "unicode": "CAMeL normalize_unicode compatibility=True",
-        "tatweel": "remove U+0640 before D3Tok",
-        "dediac": "CAMeL dediac_ar after D3Tok",
+        "cleaning": "bundled SBTW arclean_map.json + internal alif-maqsura to ya",
+        "arclean_sha256": hashlib.sha256(
+            (SCRIPT_DIR / "arclean_map.json").read_bytes()
+        ).hexdigest(),
+        "disambiguator": "BERTUnfactoredDisambiguator top=1",
+        "segmentation": "analysis['d3tok'] with _+ and +_ boundary conversion",
+        "dediac": "CAMeL dediac_ar on analysis['d3tok']",
         "camel_tools": package_version("camel-tools"),
     }
     digest.update(json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8"))
@@ -712,12 +791,12 @@ def preprocessing_fingerprint(
 
 
 def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> None:
-    """Exercise Tatweel removal, true D3Tok, dediacritization, and fallback."""
+    """Exercise arclean, BERT D3Tok, dediacritization, and fallback."""
 
     sample = "الكتــــابُ مفيدٌ."
-    normalized = preprocessor.normalize_and_remove_tatweel(sample)
-    if TATWEEL in normalized:
-        raise AssertionError("Tatweel removal check failed")
+    cleaned = preprocessor.clean(sample)
+    if TATWEEL in cleaned:
+        raise AssertionError("arclean Tatweel removal check failed")
     result = preprocessor.process(sample)
     if not result.text.strip():
         raise AssertionError("D3Tok content-preservation check failed")
@@ -726,21 +805,23 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
     plus_probe = preprocessor.fallback("ال+كِتَابُ")
     if "+" not in plus_probe or any(char in ARABIC_DIACRITICS for char in plus_probe):
         raise AssertionError("dediac_ar must retain D3Tok's '+' marker")
-    fallback_probe = preprocessor.fallback(normalized)
+    fallback_probe = preprocessor.fallback(cleaned)
     if not fallback_probe.strip() or TATWEEL in fallback_probe:
         raise AssertionError("Fallback content-preservation check failed")
 
-    class _ForcedD3TokFailure:
-        def tokenize(self, words: Sequence[str]) -> list[str]:
-            del words
+    class _ForcedBERTD3TokFailure:
+        def disambiguate_sentences(
+            self, sentences: Sequence[Sequence[str]]
+        ) -> list[Any]:
+            del sentences
             raise RuntimeError("forced internal fallback check")
 
-    real_d3tok = preprocessor._d3tok
+    real_disambiguator = preprocessor._disambiguator
     try:
-        preprocessor._d3tok = _ForcedD3TokFailure()
+        preprocessor._disambiguator = _ForcedBERTD3TokFailure()
         forced_fallback = preprocessor.process(sample)
     finally:
-        preprocessor._d3tok = real_d3tok
+        preprocessor._disambiguator = real_disambiguator
     if not forced_fallback.error or not forced_fallback.error.startswith("D3TokError:"):
         raise AssertionError("Forced D3Tok failure was not diagnosed")
     if not forced_fallback.text.strip() or any(
@@ -758,32 +839,49 @@ def build_preprocessing_cache(
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     items = list(zip(frame["_id"].astype(str), frame["_text"].astype(str)))
+    item_batches = [
+        items[start : start + config.D3TOK_BATCH_SIZE]
+        for start in range(0, len(items), config.D3TOK_BATCH_SIZE)
+    ]
     rows: list[tuple[str, str, Optional[str]]]
 
     if config.PREPROCESS_NUM_WORKERS > 1:
         probe = create_preprocessor(config, allow_download=True)
         run_arabic_preprocessing_checks(probe)
         del probe
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         with ProcessPoolExecutor(
             max_workers=config.PREPROCESS_NUM_WORKERS,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_preprocess_worker_init,
             initargs=(config.D3TOK_RESOURCE,),
         ) as executor:
-            rows = list(
-                tqdm(
-                    executor.map(_preprocess_worker_item, items, chunksize=32),
-                    total=len(items),
-                    desc=f"D3Tok {cache_path.stem}",
+            rows = [
+                row
+                for batch_rows in tqdm(
+                    executor.map(_preprocess_worker_batch, item_batches, chunksize=1),
+                    total=len(item_batches),
+                    desc=f"BERT D3Tok {cache_path.stem}",
                 )
-            )
+                for row in batch_rows
+            ]
     else:
         preprocessor = create_preprocessor(config, allow_download=True)
         run_arabic_preprocessing_checks(preprocessor)
         rows = []
-        for row_id, text in tqdm(items, desc=f"D3Tok {cache_path.stem}"):
-            result = preprocessor.process(text)
-            rows.append((row_id, result.text, result.error))
+        for item_batch in tqdm(
+            item_batches,
+            desc=f"BERT D3Tok {cache_path.stem}",
+        ):
+            results = preprocessor.process_many([text for _, text in item_batch])
+            rows.extend(
+                (row_id, result.text, result.error)
+                for (row_id, _), result in zip(item_batch, results)
+            )
+        del preprocessor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     cache_frame = pd.DataFrame(
         {
@@ -2369,6 +2467,7 @@ def validate_config(config: Config) -> None:
         "EARLY_STOPPING_PATIENCE": config.EARLY_STOPPING_PATIENCE,
         "DDP_TIMEOUT_MINUTES": config.DDP_TIMEOUT_MINUTES,
         "LOG_EVERY_N_STEPS": config.LOG_EVERY_N_STEPS,
+        "D3TOK_BATCH_SIZE": config.D3TOK_BATCH_SIZE,
         "SMOKE_TRAIN_SAMPLES": config.SMOKE_TRAIN_SAMPLES,
         "SMOKE_EVAL_SAMPLES": config.SMOKE_EVAL_SAMPLES,
         "SMOKE_MAX_TRAIN_STEPS": config.SMOKE_MAX_TRAIN_STEPS,

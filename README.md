@@ -91,6 +91,7 @@ lưu bản CSV không thay đổi yêu cầu attribution/share-alike của dữ 
 .
 ├── train.py
 ├── train_blind.py
+├── arclean_map.json
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
@@ -112,12 +113,12 @@ Trong Kaggle Notebook, chọn accelerator **GPU T4 x2**, bật Internet trong gi
 đoạn cài dependency/tải model và chạy:
 
 ```bash
-git clone --branch Khangtest --single-branch \
+git clone --branch Nho --single-branch \
   https://github.com/POG42069/BAREC_SENT_STRICT_TASK.git
 cd BAREC_SENT_STRICT_TASK
 
 python -m pip install -r requirements.txt
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
 
 python train.py --smoke-test
 python train.py
@@ -127,9 +128,10 @@ python train.py
 Không nên cài lại PyTorch sau đó vì wheel CPU hoặc CUDA không tương thích có thể
 làm mất khả năng sử dụng hai T4.
 
-Lệnh `camel_data -i light` cài morphology database và MLE disambiguator cần cho
-`calima-msa-r13`. Nếu cấu hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng thử
-chuẩn bị resource khi thiếu; cài thủ công trước vẫn là cách dễ chẩn đoán nhất.
+Lệnh `camel_data -i disambig-bert-unfactored-msa` cài BERT unfactored
+disambiguator MSA dùng để tạo D3Tok giống pipeline công khai của SBTW. Nếu cấu
+hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng thử chuẩn bị resource khi
+thiếu; cài thủ công trước vẫn là cách dễ chẩn đoán nhất.
 
 ### Chạy Blind Test 2026 riêng tư
 
@@ -182,7 +184,7 @@ python -m venv .venv
 
 # Cài torch theo hướng dẫn tại https://pytorch.org/get-started/locally/
 python -m pip install -r requirements.txt
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
 python train.py --smoke-test
 ```
 
@@ -200,7 +202,8 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
 | Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
-| Preprocess | `D3TOK_RESOURCE="calima-msa-r13"` | MLE disambiguator cho D3Tok |
+| Preprocess | `D3TOK_RESOURCE="msa"` | BERT unfactored disambiguator cho D3Tok |
+| D3Tok batch | `D3TOK_BATCH_SIZE=256` | Số câu đưa qua BERT disambiguator mỗi lượt |
 | Length | `MAX_LENGTH=256` | Chiều dài sau HF tokenization |
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
@@ -229,36 +232,37 @@ Thứ tự là một invariant của baseline:
 
 ```text
 raw sentence
-→ Unicode NFKC-compatible normalization
-→ xóa Kashida/Tatweel U+0640
-→ simple_word_tokenize
-→ D3Tok thật (calima-msa-r13)
-→ dediac_ar sau D3Tok
+→ CAMeL arclean
+→ đổi alif-maqsura nội từ thành ya như SBTW
+→ simple_word_tokenize(split_digits=True)
+→ BERTUnfactoredDisambiguator("msa", top=1)
+→ lấy analysis["d3tok"]
+→ dediac_ar và chuyển biên `_+`/`+_` như SBTW
 → Hugging Face tokenizer
 ```
 
 Chi tiết:
 
-1. `normalize_unicode(text, compatibility=True)` chuẩn hóa Unicode.
-2. `text.replace("\u0640", "")` xóa đúng Kashida/Tatweel `ـ`; không xóa chữ,
-   số hoặc dấu câu.
-3. `simple_word_tokenize` tạo word/punctuation sequence.
-4. `MLEDisambiguator.pretrained("calima-msa-r13")` kết hợp
-   `MorphologicalTokenizer(..., scheme="d3tok", split=True, diac=True)` thực
-   hiện D3Tok thật. Không có regex giả lập segmentation.
-5. `dediac_ar` chạy **sau D3Tok** để loại tanwin, fatha, damma, kasra, shadda,
-   sukun và dagger alif. Dấu `+` do D3Tok tạo ra được giữ nguyên.
-6. Các token được ghép lại bằng một khoảng trắng rồi mới đưa vào HF tokenizer.
+1. `CharMapper.mapper_from_json("arclean_map.json")` dùng đúng bản đồ arclean
+   được public trong repository SBTW để chuẩn hóa ký tự, khoảng trắng, dấu câu,
+   presentation forms, Kashida và dấu phụ.
+2. Alif-maqsura `ى` ở giữa từ được đổi thành ya `ي`, giống code SBTW.
+3. `simple_word_tokenize(..., split_digits=True)` tạo word/punctuation sequence.
+4. `BERTUnfactoredDisambiguator.pretrained(model_name="msa",
+   pretrained_cache=False, top=1)` chọn phân tích hình thái theo ngữ cảnh.
+5. Pipeline lấy trường `analysis["d3tok"]`, chạy `dediac_ar`, rồi chuyển `_+`
+   thành ` +` và `+_` thành `+ ` đúng theo preprocessing công khai của SBTW.
+6. Các biểu diễn từng từ được ghép bằng khoảng trắng trước HF tokenizer.
 
 Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
-Unicode-normalized, bỏ Kashida và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
+arclean và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
 fallback; nó không âm thầm thay bằng chuỗi rỗng và không tạo D3Tok giả.
 
 ## 9. Cache preprocessing
 
 Train, Dev và Test có cache Parquet riêng. Fingerprint bao gồm nội dung ID/text,
-split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Thay đổi
-Kashida/dediac/D3Tok sẽ làm cache cũ mất hiệu lực.
+split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Việc chuyển
+từ MLE D3Tok sang BERT D3Tok làm toàn bộ cache cũ tự động mất hiệu lực.
 
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
@@ -352,7 +356,7 @@ Smoke test thật (mẫu nhỏ, D3Tok/checkpoint thật, output riêng):
 python train.py --smoke-test
 ```
 
-Smoke mode kiểm tra pipeline đọc dữ liệu, Kashida removal, D3Tok, dediac, HF
+Smoke mode kiểm tra pipeline đọc dữ liệu, arclean, BERT D3Tok, dediac, HF
 tokenization, sampler, forward/backward, metric, checkpoint/reload, inference và
 submission ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
 
@@ -407,10 +411,10 @@ thành công. Raw score (và gold Open Test nếu có) chỉ nằm trong diagnos
 
 ## 16. Troubleshooting
 
-### Không tìm thấy `calima-msa-r13`
+### Không tìm thấy BERT D3Tok MSA
 
 ```bash
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
 ```
 
 Sau đó chạy lại. Nếu môi trường không có Internet, tải CAMeL data/model vào một
@@ -437,7 +441,7 @@ Kiểm tra hai process dùng cùng code/cache, không để nhiều rank cùng p
 hoặc ghi output, và xem log rank đầu tiên phát sinh lỗi. Chạy smoke test trước;
 không full-train để che một lỗi khởi tạo DDP. Nếu log báo
 `Expected to have finished reduction ... parameters that were not used`, hãy
-`git pull origin Khangtest` để lấy bản đã loại BERT pooler rồi chạy lại; cache
+`git pull origin Nho` để lấy bản đã loại BERT pooler rồi chạy lại; cache
 D3Tok đã hoàn thành vẫn có thể tái sử dụng.
 
 ### `torch.cuda.is_available()` là `False`
