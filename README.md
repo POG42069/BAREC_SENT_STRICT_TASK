@@ -112,12 +112,12 @@ Trong Kaggle Notebook, chọn accelerator **GPU T4 x2**, bật Internet trong gi
 đoạn cài dependency/tải model và chạy:
 
 ```bash
-git clone --branch Khangtest --single-branch \
+git clone --branch Nho --single-branch \
   https://github.com/POG42069/BAREC_SENT_STRICT_TASK.git
 cd BAREC_SENT_STRICT_TASK
 
 python -m pip install -r requirements.txt
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
 
 python train.py --smoke-test
 python train.py
@@ -127,9 +127,10 @@ python train.py
 Không nên cài lại PyTorch sau đó vì wheel CPU hoặc CUDA không tương thích có thể
 làm mất khả năng sử dụng hai T4.
 
-Lệnh `camel_data -i light` cài morphology database và MLE disambiguator cần cho
-`calima-msa-r13`. Nếu cấu hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng thử
-chuẩn bị resource khi thiếu; cài thủ công trước vẫn là cách dễ chẩn đoán nhất.
+Lệnh `camel_data -i disambig-bert-unfactored-msa` cài BERT unfactored
+disambiguator MSA dùng để tạo D3Tok giống pipeline công khai của SBTW. Nếu cấu
+hình `AUTO_DOWNLOAD_CAMEL_DATA=True`, script cũng thử chuẩn bị resource khi
+thiếu; cài thủ công trước vẫn là cách dễ chẩn đoán nhất.
 
 ### Chạy Blind Test 2026 riêng tư
 
@@ -182,7 +183,7 @@ python -m venv .venv
 
 # Cài torch theo hướng dẫn tại https://pytorch.org/get-started/locally/
 python -m pip install -r requirements.txt
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
 python train.py --smoke-test
 ```
 
@@ -200,8 +201,9 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
 | Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
-| Preprocess | `D3TOK_RESOURCE="calima-msa-r13"` | MLE disambiguator cho D3Tok |
-| Length | `MAX_LENGTH=256` | Chiều dài sau HF tokenization |
+| Preprocess | `D3TOK_RESOURCE="msa"` | BERT unfactored disambiguator cho D3Tok |
+| D3Tok batch | `D3TOK_BATCH_SIZE=256` | Số câu đưa qua BERT disambiguator mỗi lượt |
+| Length | `MAX_LENGTH=512` | Giới hạn đầy đủ của BERT; D3Tok không bị truncate âm thầm |
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
@@ -229,39 +231,85 @@ Thứ tự là một invariant của baseline:
 
 ```text
 raw sentence
-→ Unicode NFKC-compatible normalization
-→ xóa Kashida/Tatweel U+0640
-→ simple_word_tokenize
-→ D3Tok thật (calima-msa-r13)
-→ dediac_ar sau D3Tok
-→ Hugging Face tokenizer
+→ normalize_unicode(compatibility=True)
+→ bỏ Kashida U+0640 nhưng vẫn giữ dấu phụ
+→ đổi alif-maqsura nội từ thành ya như SBTW
+→ simple_word_tokenize(split_digits=True)
+→ gắn dấu phụ đứng riêng vào từ trước; bỏ mark-only token còn sót
+→ BERTUnfactoredDisambiguator("msa", top=1)
+→ lấy analysis["d3tok"]
+→ dediac_ar và chuyển biên `_+`/`+_` → D3Tok view
+
+song song từ câu đã normalize:
+→ tính DC trước khi bỏ dấu phụ
+→ dediac_ar, giữ dấu câu → Surface view
+→ tính WC, WLA, WLS trên token của Surface view
 ```
 
 Chi tiết:
 
-1. `normalize_unicode(text, compatibility=True)` chuẩn hóa Unicode.
-2. `text.replace("\u0640", "")` xóa đúng Kashida/Tatweel `ـ`; không xóa chữ,
-   số hoặc dấu câu.
-3. `simple_word_tokenize` tạo word/punctuation sequence.
-4. `MLEDisambiguator.pretrained("calima-msa-r13")` kết hợp
-   `MorphologicalTokenizer(..., scheme="d3tok", split=True, diac=True)` thực
-   hiện D3Tok thật. Không có regex giả lập segmentation.
-5. `dediac_ar` chạy **sau D3Tok** để loại tanwin, fatha, damma, kasra, shadda,
-   sukun và dagger alif. Dấu `+` do D3Tok tạo ra được giữ nguyên.
-6. Các token được ghép lại bằng một khoảng trắng rồi mới đưa vào HF tokenizer.
+1. Unicode được chuẩn hóa ở compatibility mode; chỉ Kashida bị xóa ở bước đầu,
+   nên BERT D3Tok vẫn nhận được dấu phụ của câu gốc.
+2. Alif-maqsura `ى` ở giữa từ được đổi thành ya `ي`, giống code SBTW.
+3. `simple_word_tokenize(..., split_digits=True)` tạo word/punctuation sequence.
+4. Các dạng lỗi khoảng trắng như `الله ُ` được sửa thành token `اللهُ`. Dấu phụ
+   đứng đầu câu hoặc sau dấu câu, không có base letter để phân tích hình thái,
+   bị loại khỏi input D3Tok nhưng vẫn được tính trong `[DC]`.
+5. `BERTUnfactoredDisambiguator.pretrained(model_name="msa",
+   pretrained_cache=False, top=1)` chọn phân tích hình thái theo ngữ cảnh.
+6. Pipeline lấy trường `analysis["d3tok"]`, chạy `dediac_ar`, rồi chuyển `_+`
+   thành ` +` và `+_` thành `+ ` đúng theo preprocessing công khai của SBTW.
+7. Dấu câu được giữ trong cả D3Tok view và Surface view.
 
-Nếu riêng một câu làm D3Tok phát sinh exception, fallback bảo toàn câu đã được
-Unicode-normalized, bỏ Kashida và bỏ dấu phụ. Script ghi ID/loại lỗi và tổng số
-fallback; nó không âm thầm thay bằng chuỗi rỗng và không tạo D3Tok giả.
+Bốn feature số được tính theo đúng thời điểm:
+
+- `[DC]`: số Arabic diacritics chia cho số ký tự của câu đã normalize, trước
+  `dediac_ar`;
+- `[WC]`: số token trong Surface view;
+- `[WLA]`: độ dài token trung bình trong Surface view;
+- `[WLS]`: độ lệch chuẩn độ dài token trong Surface view.
+
+Input cuối cùng là một sentence pair:
+
+```text
+[CLS] D3Tok view [SEP]
+Surface view [SEP]
+[WC] value [DC] value [WLA] value [WLS] value
+[DOM_*] [TC_*] [SEP]
+```
+
+`Domain` được ánh xạ vào `DOM_AH`, `DOM_SS`, `DOM_STEM`; `Text_Class` được ánh
+xạ vào `TC_FOUNDATIONAL`, `TC_ADVANCED`, `TC_SPECIALIZED`. Nếu Blind Test thiếu
+hai cột này, pipeline dùng token `UNKNOWN` tương ứng. `Document`, `Book`,
+`Author` và `Annotator` không được concat vì cardinality cao hoặc có nguy cơ học
+thuộc nguồn dữ liệu.
+
+Các field marker là token học được, được thêm vào tokenizer trước khi model
+khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Pipeline
+thử giữ nguyên D3Tok, Surface và toàn bộ feature. Nếu tổng vượt 512 token, các
+feature được bỏ nguyên nhóm từ cuối danh sách ưu tiên:
+`Text_Class → Domain → WLS → WLA → DC → WC`. Vì vậy một label như `[WLA]`
+không bao giờ còn lại mà thiếu value đi kèm. Chỉ sau khi đã bỏ mọi feature mà
+input vẫn quá dài, Surface mới bị truncate. D3Tok không bị truncate âm thầm;
+nếu riêng D3Tok đã vượt giới hạn, pipeline dừng với chẩn đoán cần chunking.
+
+Nếu một token hợp lệ vẫn không có trường `d3tok`, chỉ token đó dùng surface
+fallback; các token khác trong câu vẫn giữ D3Tok. Chỉ khi toàn bộ lời gọi BERT
+cho câu phát sinh exception thì pipeline mới dùng Surface view cho cả câu.
+Script ghi ID/loại lỗi và tổng số fallback; nó không âm thầm thay bằng chuỗi
+rỗng và không tạo D3Tok giả.
 
 ## 9. Cache preprocessing
 
 Train, Dev và Test có cache Parquet riêng. Fingerprint bao gồm nội dung ID/text,
-split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Thay đổi
-Kashida/dediac/D3Tok sẽ làm cache cũ mất hiệu lực.
+split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Việc chuyển
+sang hai text view cùng feature mới làm toàn bộ cache cũ tự động mất hiệu lực.
 
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
+
+Checkpoint cũ có kích thước embedding trước khi thêm field token nên không tương
+thích để resume. Hãy bắt đầu một output/checkpoint mới cho pipeline này.
 
 ## 10. Kiến trúc và objective
 
@@ -352,15 +400,20 @@ Smoke test thật (mẫu nhỏ, D3Tok/checkpoint thật, output riêng):
 python train.py --smoke-test
 ```
 
-Smoke mode kiểm tra pipeline đọc dữ liệu, Kashida removal, D3Tok, dediac, HF
-tokenization, sampler, forward/backward, metric, checkpoint/reload, inference và
-submission ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
+Smoke mode kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi dấu
+phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
+sampler, forward/backward, metric, checkpoint/reload, inference và submission
+ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
 
 Các invariant cần đạt:
 
 - không còn `U+0640` sau preprocessing;
+- BERT D3Tok nhận câu còn dấu phụ;
+- không có token chỉ chứa dấu phụ đi vào BERT D3Tok;
 - không còn Arabic diacritics sau `dediac_ar`;
+- dấu câu còn trong cả D3Tok và Surface;
 - dấu `+` của D3Tok không bị xóa;
+- D3Tok không bị truncate; feature chỉ bị bỏ theo nhóm atomic rồi mới tới Surface;
 - output model giữ shape `[batch_size]`, kể cả batch size 1;
 - sampler chia đều hai rank và deterministic theo seed/epoch;
 - gather trả đúng số mẫu theo thứ tự gốc;
@@ -407,10 +460,10 @@ thành công. Raw score (và gold Open Test nếu có) chỉ nằm trong diagnos
 
 ## 16. Troubleshooting
 
-### Không tìm thấy `calima-msa-r13`
+### Không tìm thấy BERT D3Tok MSA
 
 ```bash
-camel_data -i light
+camel_data -i disambig-bert-unfactored-msa
 ```
 
 Sau đó chạy lại. Nếu môi trường không có Internet, tải CAMeL data/model vào một
@@ -437,8 +490,12 @@ Kiểm tra hai process dùng cùng code/cache, không để nhiều rank cùng p
 hoặc ghi output, và xem log rank đầu tiên phát sinh lỗi. Chạy smoke test trước;
 không full-train để che một lỗi khởi tạo DDP. Nếu log báo
 `Expected to have finished reduction ... parameters that were not used`, hãy
-`git pull origin Khangtest` để lấy bản đã loại BERT pooler rồi chạy lại; cache
+`git pull origin Nho` để lấy bản đã loại BERT pooler rồi chạy lại; cache
 D3Tok đã hoàn thành vẫn có thể tái sử dụng.
+
+Khi script tự khởi chạy hai GPU, nó đặt mặc định
+`TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600`. Điều này cho phép rank 1 chờ rank 0
+xây cache D3Tok lâu hơn ngưỡng watchdog mặc định mà không bị `SIGABRT`.
 
 ### `torch.cuda.is_available()` là `False`
 
