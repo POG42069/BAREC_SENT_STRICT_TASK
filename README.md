@@ -261,18 +261,13 @@ Chi tiết:
    thành ` +` và `+_` thành `+ ` đúng theo preprocessing công khai của SBTW.
 7. Dấu câu được giữ trong cả D3Tok view và Surface view.
 
-Tám feature số được tính theo đúng thời điểm:
+Bốn feature số được tính theo đúng thời điểm:
 
 - `[DC]`: số Arabic diacritics chia cho số ký tự của câu đã normalize, trước
   `dediac_ar`;
 - `[WC]`: số token trong Surface view;
 - `[WLA]`: độ dài token trung bình trong Surface view;
-- `[WLS]`: độ lệch chuẩn độ dài token trong Surface view;
-- `[WPW]`: số WordPiece trung bình trên mỗi lexical word của Surface view,
-  dùng đúng fast tokenizer của checkpoint;
-- `[MWPR]`: tỷ lệ lexical word bị checkpoint tách thành nhiều WordPiece;
-- `[MSPW]`: số segment D3Tok trung bình trên mỗi từ Ả Rập đầu vào;
-- `[MSR]`: tỷ lệ từ Ả Rập được D3Tok tách thành nhiều segment.
+- `[WLS]`: độ lệch chuẩn độ dài token trong Surface view.
 
 Input cuối cùng là một sentence pair:
 
@@ -280,8 +275,7 @@ Input cuối cùng là một sentence pair:
 [CLS] D3Tok view [SEP]
 Surface view [SEP]
 [WC] value [DC] value [WLA] value [WLS] value
-[DOM_*] [TC_*]
-[WPW] value [MWPR] value [MSPW] value [MSR] value [SEP]
+[DOM_*] [TC_*] [SEP]
 ```
 
 `Domain` được ánh xạ vào `DOM_AH`, `DOM_SS`, `DOM_STEM`; `Text_Class` được ánh
@@ -294,12 +288,10 @@ Các field marker là token học được, được thêm vào tokenizer trư�
 khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Pipeline
 thử giữ nguyên D3Tok, Surface và toàn bộ feature. Nếu tổng vượt 512 token, các
 feature được bỏ nguyên nhóm từ cuối danh sách ưu tiên:
-`MSR → MSPW → MWPR → WPW → Text_Class → Domain → WLS → WLA → DC → WC`.
-Nói cách khác, encoder chỉ nhận prefix feature lớn nhất còn vừa ngân sách; một
-nhóm như `[WLA] value` hoặc `[MSPW] value` luôn được giữ hoặc bỏ trọn vẹn. Chỉ
-sau khi đã bỏ mọi feature mà input vẫn quá dài, Surface mới bị truncate. D3Tok
-không bị truncate âm thầm; nếu riêng D3Tok đã vượt giới hạn, pipeline dừng với
-chẩn đoán cần chunking.
+`Text_Class → Domain → WLS → WLA → DC → WC`. Vì vậy một label như `[WLA]`
+không bao giờ còn lại mà thiếu value đi kèm. Chỉ sau khi đã bỏ mọi feature mà
+input vẫn quá dài, Surface mới bị truncate. D3Tok không bị truncate âm thầm;
+nếu riêng D3Tok đã vượt giới hạn, pipeline dừng với chẩn đoán cần chunking.
 
 Nếu một token hợp lệ vẫn không có trường `d3tok`, chỉ token đó dùng surface
 fallback; các token khác trong câu vẫn giữ D3Tok. Chỉ khi toàn bộ lời gọi BERT
@@ -310,9 +302,8 @@ rỗng và không tạo D3Tok giả.
 ## 9. Cache preprocessing
 
 Train, Dev và Test có cache Parquet riêng. Fingerprint bao gồm nội dung ID/text,
-split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Cache `v5`
-lưu thêm MSPW/MSR nên cache cũ tự động mất hiệu lực; WPW/MWPR được tính từ
-Surface cache bằng tokenizer checkpoint khi Dataset được khởi tạo.
+split, tên cột, phiên bản pipeline, CAMeL Tools và resource D3Tok. Việc chuyển
+sang hai text view cùng feature mới làm toàn bộ cache cũ tự động mất hiệu lực.
 
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
@@ -422,7 +413,6 @@ Các invariant cần đạt:
 - không còn Arabic diacritics sau `dediac_ar`;
 - dấu câu còn trong cả D3Tok và Surface;
 - dấu `+` của D3Tok không bị xóa;
-- WPW/MSPW không nhỏ hơn 1; MWPR/MSR luôn nằm trong `[0, 1]`;
 - D3Tok không bị truncate; feature chỉ bị bỏ theo nhóm atomic rồi mới tới Surface;
 - output model giữ shape `[batch_size]`, kể cả batch size 1;
 - sampler chia đều hai rank và deterministic theo seed/epoch;

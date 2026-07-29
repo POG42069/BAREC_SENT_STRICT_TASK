@@ -55,7 +55,7 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
-PREPROCESSING_VERSION = "barec-structured-pair-v5"
+PREPROCESSING_VERSION = "barec-structured-pair-v4"
 TATWEEL = "\u0640"
 ARABIC_DIACRITICS = frozenset(
     chr(codepoint)
@@ -82,10 +82,6 @@ FIELD_TOKENS = (
     "[TC_ADVANCED]",
     "[TC_SPECIALIZED]",
     "[TC_UNKNOWN]",
-    "[WPW]",
-    "[MWPR]",
-    "[MSPW]",
-    "[MSR]",
 )
 
 
@@ -605,8 +601,6 @@ class PreprocessResult:
     word_count: int
     word_length_mean: float
     word_length_std: float
-    morph_segments_per_word: float
-    multi_segment_word_ratio: float
     error: Optional[str]
 
 
@@ -729,12 +723,11 @@ class ArabicD3TokPreprocessor:
         self,
         sentence_analysis: Sequence[Any],
         input_tokens: Sequence[str],
-    ) -> tuple[str, Optional[str], float, float]:
+    ) -> tuple[str, Optional[str]]:
         """Render D3Tok, falling back only for individual unanalyzable tokens."""
 
         rendered_words: list[str] = []
         fallback_positions: list[int] = []
-        lexical_segment_counts: list[int] = []
         if len(sentence_analysis) != len(input_tokens):
             raise RuntimeError(
                 "BERT D3Tok token/analysis length mismatch: "
@@ -753,29 +746,20 @@ class ArabicD3TokPreprocessor:
                 )
             d3tok = analysis.get("d3tok")
             if d3tok is None:
-                rendered_word = self._dediac_ar(input_token).replace(TATWEEL, "")
-                if not rendered_word.strip():
+                fallback_token = self._dediac_ar(input_token).replace(TATWEEL, "")
+                if not fallback_token.strip():
                     raise ValueError(
                         "BERT D3Tok token fallback produced no content at "
                         f"position {position}"
                     )
+                rendered_words.append(fallback_token)
                 fallback_positions.append(position)
-            else:
-                rendered_word = (
-                    self._dediac_ar(str(d3tok))
-                    .replace("_+", " +")
-                    .replace("+_", "+ ")
-                )
-            rendered_words.append(rendered_word)
-            if self._contains_arabic_letter(input_token):
-                segment_count = len(
-                    [
-                        segment
-                        for segment in rendered_word.split()
-                        if segment.strip("+")
-                    ]
-                )
-                lexical_segment_counts.append(max(1, segment_count))
+                continue
+            rendered_words.append(
+                self._dediac_ar(str(d3tok))
+                .replace("_+", " +")
+                .replace("+_", "+ ")
+            )
         processed = " ".join(rendered_words)
         if not processed.strip():
             raise ValueError("BERT D3Tok returned no content")
@@ -785,22 +769,7 @@ class ArabicD3TokPreprocessor:
             else "TokenD3TokFallback: positions="
             + ",".join(str(position) for position in fallback_positions)
         )
-        if lexical_segment_counts:
-            morph_segments_per_word = float(np.mean(lexical_segment_counts))
-            multi_segment_word_ratio = float(
-                np.mean(
-                    np.asarray(lexical_segment_counts, dtype=np.int64) > 1
-                )
-            )
-        else:
-            morph_segments_per_word = 1.0
-            multi_segment_word_ratio = 0.0
-        return (
-            processed,
-            diagnostic,
-            morph_segments_per_word,
-            multi_segment_word_ratio,
-        )
+        return processed, diagnostic
 
     def process_many(self, texts: Sequence[str]) -> list[PreprocessResult]:
         """Process a batch through BERT, isolating any per-row failures."""
@@ -829,8 +798,6 @@ class ArabicD3TokPreprocessor:
                     wc,
                     wla,
                     wls,
-                    1.0,
-                    0.0,
                     f"UnicodeNormalizationError: {type(error).__name__}: {error}",
                 )
                 continue
@@ -857,12 +824,10 @@ class ArabicD3TokPreprocessor:
                     tokenized_sentences,
                 ):
                     dc, wc, wla, wls = statistics[index]
-                    (
-                        d3tok_text,
-                        diagnostic,
-                        mspw,
-                        msr,
-                    ) = self._render_d3tok_sentence(sentence_analysis, words)
+                    d3tok_text, diagnostic = self._render_d3tok_sentence(
+                        sentence_analysis,
+                        words,
+                    )
                     results[index] = PreprocessResult(
                         d3tok_text,
                         surface_texts[index],
@@ -870,8 +835,6 @@ class ArabicD3TokPreprocessor:
                         wc,
                         wla,
                         wls,
-                        mspw,
-                        msr,
                         diagnostic,
                     )
             except Exception as batch_error:
@@ -883,12 +846,10 @@ class ArabicD3TokPreprocessor:
                             [words]
                         )[0]
                         dc, wc, wla, wls = statistics[index]
-                        (
-                            d3tok_text,
-                            diagnostic,
-                            mspw,
-                            msr,
-                        ) = self._render_d3tok_sentence(sentence_analysis, words)
+                        d3tok_text, diagnostic = self._render_d3tok_sentence(
+                            sentence_analysis,
+                            words,
+                        )
                         results[index] = PreprocessResult(
                             d3tok_text,
                             surface_texts[index],
@@ -896,8 +857,6 @@ class ArabicD3TokPreprocessor:
                             wc,
                             wla,
                             wls,
-                            mspw,
-                            msr,
                             diagnostic,
                         )
                     except Exception as row_error:
@@ -909,8 +868,6 @@ class ArabicD3TokPreprocessor:
                             wc,
                             wla,
                             wls,
-                            1.0,
-                            0.0,
                             "D3TokError: "
                             f"{type(row_error).__name__}: {row_error}; "
                             "batch_error="
@@ -975,8 +932,6 @@ PreprocessedRow = tuple[
     int,
     float,
     float,
-    float,
-    float,
     Optional[str],
 ]
 
@@ -1003,8 +958,6 @@ def _preprocess_worker_batch(
             result.word_count,
             result.word_length_mean,
             result.word_length_std,
-            result.morph_segments_per_word,
-            result.multi_segment_word_ratio,
             result.error,
         )
         for (row_id, _), result in zip(items, results)
@@ -1046,10 +999,7 @@ def preprocessing_fingerprint(
         "segmentation": "analysis['d3tok'] with _+ and +_ boundary conversion",
         "token_fallback": "missing d3tok falls back per-token, not per-sentence",
         "dediac": "CAMeL dediac_ar after BERT D3Tok and on Surface view",
-        "statistics": (
-            "DC before dediac; WC/WLA/WLS on Surface tokens; "
-            "MSPW/MSR on rendered D3Tok segments per Arabic input word"
-        ),
+        "statistics": "DC before dediac; WC/WLA/WLS on Surface tokens",
         "punctuation": "preserved in D3Tok and Surface views",
         "camel_tools": package_version("camel-tools"),
     }
@@ -1111,11 +1061,6 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
         raise AssertionError("Fallback content-preservation check failed")
     if result.word_count <= 0 or result.word_length_mean <= 0.0:
         raise AssertionError("Surface statistics must be positive for the probe")
-    if (
-        result.morph_segments_per_word < 1.0
-        or not 0.0 <= result.multi_segment_word_ratio <= 1.0
-    ):
-        raise AssertionError("D3Tok morphological statistics are outside their ranges")
     expected_dc = sum(char in ARABIC_DIACRITICS for char in normalized) / len(
         normalized
     )
@@ -1127,35 +1072,15 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
             type("_ScoredAnalysis", (), {"analysis": {"diac": "كِتاب"}})()
         ]
 
-    (
-        token_fallback_text,
-        token_fallback_error,
-        fallback_mspw,
-        fallback_msr,
-    ) = preprocessor._render_d3tok_sentence([_MissingD3TokItem()], ["كِتاب"])
+    token_fallback_text, token_fallback_error = preprocessor._render_d3tok_sentence(
+        [_MissingD3TokItem()],
+        ["كِتاب"],
+    )
     if token_fallback_text != "كتاب" or not (
         token_fallback_error
         and token_fallback_error.startswith("TokenD3TokFallback:")
     ):
         raise AssertionError("Per-token missing-d3tok fallback check failed")
-    if fallback_mspw != 1.0 or fallback_msr != 0.0:
-        raise AssertionError("Per-token fallback distorted D3Tok segment statistics")
-
-    class _SegmentedD3TokItem:
-        analyses = [
-            type(
-                "_ScoredAnalysis",
-                (),
-                {"analysis": {"d3tok": "ب_+ال+_كِتاب"}},
-            )()
-        ]
-
-    _, _, segmented_mspw, segmented_msr = preprocessor._render_d3tok_sentence(
-        [_SegmentedD3TokItem()],
-        ["بِالكتاب"],
-    )
-    if segmented_mspw != 3.0 or segmented_msr != 1.0:
-        raise AssertionError("D3Tok segment statistics check failed")
 
     class _ForcedBERTD3TokFailure:
         def disambiguate_sentences(
@@ -1232,8 +1157,6 @@ def build_preprocessing_cache(
                     result.word_count,
                     result.word_length_mean,
                     result.word_length_std,
-                    result.morph_segments_per_word,
-                    result.multi_segment_word_ratio,
                     result.error,
                 )
                 for (row_id, _), result in zip(item_batch, results)
@@ -1252,9 +1175,7 @@ def build_preprocessing_cache(
             "_word_count": [row[4] for row in rows],
             "_word_length_mean": [row[5] for row in rows],
             "_word_length_std": [row[6] for row in rows],
-            "_morph_segments_per_word": [row[7] for row in rows],
-            "_multi_segment_word_ratio": [row[8] for row in rows],
-            "_fallback_error": [row[9] for row in rows],
+            "_fallback_error": [row[7] for row in rows],
         }
     )
     for text_column in ("_d3tok_text", "_surface_text"):
@@ -1292,8 +1213,6 @@ def load_cached_preprocessing(frame: pd.DataFrame, cache_path: Path) -> pd.DataF
         "_word_count",
         "_word_length_mean",
         "_word_length_std",
-        "_morph_segments_per_word",
-        "_multi_segment_word_ratio",
         "_fallback_error",
     )
     missing_cache_columns = [
@@ -1322,20 +1241,10 @@ def load_cached_preprocessing(frame: pd.DataFrame, cache_path: Path) -> pd.DataF
         cache_frame["_word_length_std"],
         errors="raise",
     ).to_numpy(dtype=np.float64)
-    output["_morph_segments_per_word"] = pd.to_numeric(
-        cache_frame["_morph_segments_per_word"],
-        errors="raise",
-    ).to_numpy(dtype=np.float64)
-    output["_multi_segment_word_ratio"] = pd.to_numeric(
-        cache_frame["_multi_segment_word_ratio"],
-        errors="raise",
-    ).to_numpy(dtype=np.float64)
     numeric_feature_columns = (
         "_diacritic_coverage",
         "_word_length_mean",
         "_word_length_std",
-        "_morph_segments_per_word",
-        "_multi_segment_word_ratio",
     )
     for column in numeric_feature_columns:
         values = output[column].to_numpy(dtype=np.float64)
@@ -1343,15 +1252,6 @@ def load_cached_preprocessing(frame: pd.DataFrame, cache_path: Path) -> pd.DataF
             raise RuntimeError(f"Cache contains non-finite values in {column}")
     if (output["_word_count"].to_numpy(dtype=np.int64) <= 0).any():
         raise RuntimeError("Cache contains non-positive Surface word counts")
-    if (
-        output["_morph_segments_per_word"].to_numpy(dtype=np.float64) < 1.0
-    ).any():
-        raise RuntimeError("Cache contains invalid D3Tok segments-per-word values")
-    multi_segment_ratios = output["_multi_segment_word_ratio"].to_numpy(
-        dtype=np.float64
-    )
-    if ((multi_segment_ratios < 0.0) | (multi_segment_ratios > 1.0)).any():
-        raise RuntimeError("Cache contains invalid D3Tok multi-segment ratios")
     output["_fallback_error"] = cache_frame["_fallback_error"].to_numpy()
     output.attrs.update(frame.attrs)
     return output
@@ -1442,72 +1342,6 @@ def text_class_token(value: Any) -> str:
     return mapping.get(key, "[TC_UNKNOWN]")
 
 
-def surface_word_spans(text: str) -> list[tuple[int, int]]:
-    """Return lexical word spans while excluding punctuation and digit-only runs."""
-
-    return [
-        match.span()
-        for match in re.finditer(r"\w+", text, flags=re.UNICODE)
-        if any(
-            unicodedata.category(char).startswith("L")
-            for char in match.group()
-        )
-    ]
-
-
-def wordpiece_fragmentation_statistics(
-    tokenizer: Any,
-    texts: Sequence[str],
-    *,
-    batch_size: int = 2048,
-) -> list[tuple[float, float]]:
-    """Compute WPW/MWPR from exact fast-tokenizer offsets in bounded batches."""
-
-    if not getattr(tokenizer, "is_fast", False):
-        raise RuntimeError("WPW/MWPR require the configured fast tokenizer")
-    statistics: list[tuple[float, float]] = []
-    for start in range(0, len(texts), batch_size):
-        text_batch = list(texts[start : start + batch_size])
-        encoded = tokenizer(
-            text_batch,
-            add_special_tokens=False,
-            padding=False,
-            truncation=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-            return_offsets_mapping=True,
-        )
-        offset_batches = encoded["offset_mapping"]
-        if len(offset_batches) != len(text_batch):
-            raise RuntimeError("Tokenizer returned the wrong WPW/MWPR batch size")
-        for text, offsets in zip(text_batch, offset_batches):
-            word_spans = surface_word_spans(text)
-            if not word_spans:
-                statistics.append((1.0, 0.0))
-                continue
-            piece_counts: list[int] = []
-            for word_start, word_end in word_spans:
-                piece_count = sum(
-                    int(piece_end > word_start and piece_start < word_end)
-                    for piece_start, piece_end in offsets
-                )
-                if piece_count <= 0:
-                    raise RuntimeError(
-                        "Tokenizer offsets did not cover a Surface lexical word"
-                    )
-                piece_counts.append(piece_count)
-            piece_array = np.asarray(piece_counts, dtype=np.float64)
-            statistics.append(
-                (
-                    float(piece_array.mean()),
-                    float((piece_array > 1.0).mean()),
-                )
-            )
-    if len(statistics) != len(texts):
-        raise RuntimeError("WPW/MWPR preprocessing returned the wrong row count")
-    return statistics
-
-
 def structured_feature_groups(row: Mapping[str, Any]) -> tuple[str, ...]:
     """Serialize features as atomic groups ordered from highest to lowest priority."""
 
@@ -1518,10 +1352,6 @@ def structured_feature_groups(row: Mapping[str, Any]) -> tuple[str, ...]:
         f"[WLS] {float(row['_word_length_std']):.3f}",
         domain_token(row.get("_domain")),
         text_class_token(row.get("_text_class")),
-        f"[WPW] {float(row['_wordpieces_per_word']):.3f}",
-        f"[MWPR] {float(row['_multi_wordpiece_word_ratio']):.3f}",
-        f"[MSPW] {float(row['_morph_segments_per_word']):.3f}",
-        f"[MSR] {float(row['_multi_segment_word_ratio']):.3f}",
     )
 
 
@@ -1647,13 +1477,6 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.d3tok_texts = frame["_d3tok_text"].astype(str).tolist()
         rows = frame.to_dict(orient="records")
         self.surface_texts = [str(row["_surface_text"]) for row in rows]
-        wordpiece_statistics = wordpiece_fragmentation_statistics(
-            tokenizer,
-            self.surface_texts,
-        )
-        for row, (wpw, mwpr) in zip(rows, wordpiece_statistics):
-            row["_wordpieces_per_word"] = wpw
-            row["_multi_wordpiece_word_ratio"] = mwpr
         self.feature_groups = [structured_feature_groups(row) for row in rows]
         self.ids = frame["_id"].astype(str).tolist()
         self.indices = frame["_original_index"].astype(int).tolist()
@@ -2872,12 +2695,6 @@ def train_select_and_predict(
         raise RuntimeError("Tokenizer/model vocabulary sizes remain inconsistent")
     base_model.to(context.device)
     probe_row = train_frame.iloc[0].to_dict()
-    probe_wpw, probe_mwpr = wordpiece_fragmentation_statistics(
-        tokenizer,
-        [str(probe_row["_surface_text"])],
-    )[0]
-    probe_row["_wordpieces_per_word"] = probe_wpw
-    probe_row["_multi_wordpiece_word_ratio"] = probe_mwpr
     run_regression_shape_check(
         base_model,
         tokenizer,
