@@ -124,7 +124,7 @@ class Config:
     WEIGHT_DECAY: float = 0.01
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
-    EARLY_STOPPING_PATIENCE: int = 3
+    EARLY_STOPPING_PATIENCE: int = 2
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
