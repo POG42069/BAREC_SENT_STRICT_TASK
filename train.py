@@ -74,14 +74,6 @@ FIELD_TOKENS = (
     "[DC]",
     "[WLA]",
     "[WLS]",
-    "[DOM_AH]",
-    "[DOM_SS]",
-    "[DOM_STEM]",
-    "[DOM_UNKNOWN]",
-    "[TC_FOUNDATIONAL]",
-    "[TC_ADVANCED]",
-    "[TC_SPECIALIZED]",
-    "[TC_UNKNOWN]",
     "[WPW]",
     "[MWPR]",
     "[MSPW]",
@@ -1410,38 +1402,6 @@ def preprocess_split_cached(
 # ---------------------------------------------------------------------------
 
 
-def normalized_metadata_key(value: Any) -> str:
-    """Normalize a small categorical metadata value without leaking row IDs."""
-
-    if value is None or pd.isna(value):
-        return ""
-    return re.sub(r"\s+", " ", str(value).strip().casefold()).replace("&", "and")
-
-
-def domain_token(value: Any) -> str:
-    """Map the three stable BAREC domains to compact learned tokens."""
-
-    key = normalized_metadata_key(value)
-    mapping = {
-        "arts and humanities": "[DOM_AH]",
-        "social sciences": "[DOM_SS]",
-        "stem": "[DOM_STEM]",
-    }
-    return mapping.get(key, "[DOM_UNKNOWN]")
-
-
-def text_class_token(value: Any) -> str:
-    """Map BAREC readership groups to compact learned tokens."""
-
-    key = normalized_metadata_key(value)
-    mapping = {
-        "foundational": "[TC_FOUNDATIONAL]",
-        "advanced": "[TC_ADVANCED]",
-        "specialized": "[TC_SPECIALIZED]",
-    }
-    return mapping.get(key, "[TC_UNKNOWN]")
-
-
 def surface_word_spans(text: str) -> list[tuple[int, int]]:
     """Return lexical word spans while excluding punctuation and digit-only runs."""
 
@@ -1516,8 +1476,6 @@ def structured_feature_groups(row: Mapping[str, Any]) -> tuple[str, ...]:
         f"[DC] {float(row['_diacritic_coverage']):.3f}",
         f"[WLA] {float(row['_word_length_mean']):.3f}",
         f"[WLS] {float(row['_word_length_std']):.3f}",
-        domain_token(row.get("_domain")),
-        text_class_token(row.get("_text_class")),
         f"[WPW] {float(row['_wordpieces_per_word']):.3f}",
         f"[MWPR] {float(row['_multi_wordpiece_word_ratio']):.3f}",
         f"[MSPW] {float(row['_morph_segments_per_word']):.3f}",

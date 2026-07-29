@@ -280,21 +280,18 @@ Input cuối cùng là một sentence pair:
 [CLS] D3Tok view [SEP]
 Surface view [SEP]
 [WC] value [DC] value [WLA] value [WLS] value
-[DOM_*] [TC_*]
 [WPW] value [MWPR] value [MSPW] value [MSR] value [SEP]
 ```
 
-`Domain` được ánh xạ vào `DOM_AH`, `DOM_SS`, `DOM_STEM`; `Text_Class` được ánh
-xạ vào `TC_FOUNDATIONAL`, `TC_ADVANCED`, `TC_SPECIALIZED`. Nếu Blind Test thiếu
-hai cột này, pipeline dùng token `UNKNOWN` tương ứng. `Document`, `Book`,
-`Author` và `Annotator` không được concat vì cardinality cao hoặc có nguy cơ học
-thuộc nguồn dữ liệu.
+Metadata `Domain`, `Text_Class`, `Document`, `Book`, `Author` và `Annotator`
+không được concat vào input. Bốn feature ban đầu vẫn là `WC`, `DC`, `WLA`,
+`WLS`; bốn statistic tokenizer/D3Tok mới chỉ được nối vào sau chúng.
 
 Các field marker là token học được, được thêm vào tokenizer trước khi model
 khởi tạo; embedding của encoder được resize cho khớp vocabulary mới. Pipeline
 thử giữ nguyên D3Tok, Surface và toàn bộ feature. Nếu tổng vượt 512 token, các
 feature được bỏ nguyên nhóm từ cuối danh sách ưu tiên:
-`MSR → MSPW → MWPR → WPW → Text_Class → Domain → WLS → WLA → DC → WC`.
+`MSR → MSPW → MWPR → WPW → WLS → WLA → DC → WC`.
 Nói cách khác, encoder chỉ nhận prefix feature lớn nhất còn vừa ngân sách; một
 nhóm như `[WLA] value` hoặc `[MSPW] value` luôn được giữ hoặc bỏ trọn vẹn. Chỉ
 sau khi đã bỏ mọi feature mà input vẫn quá dài, Surface mới bị truncate. D3Tok
