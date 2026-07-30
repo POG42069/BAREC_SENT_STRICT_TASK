@@ -404,11 +404,13 @@ def make_blind_config(blind_path: Path, *, smoke_test: bool) -> baseline.Config:
         config.CHECKPOINT_DIR = "outputs/blind/smoke/checkpoints"
         config.CACHE_DIR = str(PRIVATE_DOWNLOAD_DIR / "preprocessed_smoke")
         config.SUBMISSION_DIR = "outputs/blind/smoke"
+        config.SEED_RUNS_DIR = "outputs/blind/smoke/seeds"
     else:
         config.OUTPUT_DIR = "outputs/blind"
         config.CHECKPOINT_DIR = "outputs/blind/checkpoints"
         config.CACHE_DIR = str(PRIVATE_DOWNLOAD_DIR / "preprocessed")
         config.SUBMISSION_DIR = "outputs/blind"
+        config.SEED_RUNS_DIR = "outputs/blind/seeds"
     config.TEST_PATH = str(blind_path.resolve())
     return config
 
