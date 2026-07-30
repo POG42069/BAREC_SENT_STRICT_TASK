@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""BAREC 2026 sentence-level Strict Track regression baseline.
+"""BAREC 2026 sentence-level Strict Track multi-seed regression ensemble.
 
 The complete workflow lives in this file: validation, Arabic D3Tok
-preprocessing, distributed fine-tuning, model selection, inference, and
-submission validation.  Edit :class:`Config` and run ``python train.py``.
+preprocessing, distributed fine-tuning, per-seed model selection, raw-score
+averaging, inference, and submission validation. Edit :class:`Config` and run
+``python train.py``.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import gc
 import hashlib
 import importlib.metadata
 import inspect
@@ -30,7 +32,7 @@ import unicodedata
 import uuid
 import zipfile
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
@@ -97,6 +99,7 @@ class Config:
     CHECKPOINT_DIR: str = "outputs/checkpoints"
     CACHE_DIR: str = "cache"
     SUBMISSION_DIR: str = "outputs"
+    SEED_RUNS_DIR: str = "outputs/seeds"
 
     # Columns.
     ID_COLUMN: str = "ID"
@@ -125,6 +128,9 @@ class Config:
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
     EARLY_STOPPING_PATIENCE: int = 2
+    ENSEMBLE_SEEDS: tuple[int, ...] = (42, 52, 62, 72, 82)
+    # Active seed for one ensemble member. The top-level pipeline overwrites
+    # this field with each value from ENSEMBLE_SEEDS.
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
@@ -161,7 +167,12 @@ class Config:
         self.OUTPUT_DIR = "outputs/smoke"
         self.CHECKPOINT_DIR = "outputs/smoke/checkpoints"
         self.SUBMISSION_DIR = "outputs/smoke"
+        self.SEED_RUNS_DIR = "outputs/smoke/seeds"
         self.CACHE_DIR = "cache/smoke"
+        # Two members are sufficient to exercise aggregation while keeping the
+        # real-model smoke test reasonably short.
+        self.ENSEMBLE_SEEDS = (42, 52)
+        self.SEED = self.ENSEMBLE_SEEDS[0]
         self.NUM_EPOCHS = 1
         self.PER_DEVICE_BATCH_SIZE = 2
         self.EVAL_BATCH_SIZE = 2
@@ -174,6 +185,25 @@ class Config:
         self.EARLY_STOPPING_PATIENCE = 1
         self.LOG_EVERY_N_STEPS = 1
         self.RESUME_FROM_CHECKPOINT = None
+
+
+def config_for_seed(config: Config, seed: int) -> Config:
+    """Create isolated artifact paths for one deterministic ensemble member."""
+
+    member = replace(config)
+    member.SEED = int(seed)
+    member_root = config.resolve(config.SEED_RUNS_DIR) / f"seed_{seed}"
+    member.OUTPUT_DIR = str(member_root)
+    member.CHECKPOINT_DIR = str(member_root / "checkpoints")
+    member.SUBMISSION_DIR = str(member_root)
+    if config.RESUME_FROM_CHECKPOINT:
+        resume_template = str(config.RESUME_FROM_CHECKPOINT)
+        member.RESUME_FROM_CHECKPOINT = (
+            resume_template.format(seed=seed)
+            if "{seed}" in resume_template
+            else resume_template
+        )
+    return member
 
 
 # ---------------------------------------------------------------------------
@@ -2606,8 +2636,13 @@ def create_submission(
     return prediction_path, zip_path
 
 
-def write_diagnostics(output: EvaluationOutput, config: Config) -> Path:
-    """Write raw/final Test scores separately from the submission."""
+def write_diagnostics(
+    output: EvaluationOutput,
+    config: Config,
+    *,
+    split_name: str,
+) -> Path:
+    """Write raw/final scores for one split separately from the submission."""
 
     data: dict[str, Any] = {
         "Sentence ID": output.ids,
@@ -2619,7 +2654,7 @@ def write_diagnostics(output: EvaluationOutput, config: Config) -> Path:
     path = (
         config.resolve(config.OUTPUT_DIR)
         / "diagnostics"
-        / "test_predictions_with_raw_scores.csv"
+        / f"{split_name}_predictions_with_raw_scores.csv"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(data).to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
@@ -2637,9 +2672,9 @@ def prepare_output_directories(config: Config, context: DistributedContext) -> N
     if context.is_main:
         for path in (
             config.resolve(config.OUTPUT_DIR),
-            config.resolve(config.CHECKPOINT_DIR),
             config.resolve(config.CACHE_DIR),
             config.resolve(config.SUBMISSION_DIR),
+            config.resolve(config.SEED_RUNS_DIR),
         ):
             path.mkdir(parents=True, exist_ok=True)
     distributed_barrier(context)
@@ -2661,6 +2696,133 @@ def write_preprocessing_report(
     )
 
 
+@dataclass
+class SeedRunOutput:
+    """Best-checkpoint Dev/Test predictions produced by one random seed."""
+
+    seed: int
+    dev: EvaluationOutput
+    test: EvaluationOutput
+
+
+def average_evaluation_outputs(
+    outputs: Sequence[EvaluationOutput],
+    config: Config,
+) -> EvaluationOutput:
+    """Uniformly average raw scores while preserving exact row alignment."""
+
+    if not outputs:
+        raise ValueError("At least one seed output is required for ensembling")
+    reference = outputs[0]
+    for output in outputs[1:]:
+        if output.ids != reference.ids:
+            raise RuntimeError("Seed outputs contain different ID orders")
+        if not np.array_equal(output.indices, reference.indices):
+            raise RuntimeError("Seed outputs contain different original indices")
+        if (output.labels is None) != (reference.labels is None):
+            raise RuntimeError("Only part of the seed outputs contains labels")
+        if (
+            reference.labels is not None
+            and output.labels is not None
+            and not np.array_equal(output.labels, reference.labels)
+        ):
+            raise RuntimeError("Seed outputs contain different gold labels")
+
+    raw_predictions = np.mean(
+        np.stack(
+            [output.raw_predictions.astype(np.float64) for output in outputs],
+            axis=0,
+        ),
+        axis=0,
+    )
+    final_predictions = round_and_clip(raw_predictions, config)
+    metrics = (
+        calculate_metrics(reference.labels, raw_predictions, config)
+        if reference.labels is not None
+        else None
+    )
+    return EvaluationOutput(
+        ids=list(reference.ids),
+        indices=reference.indices.copy(),
+        raw_predictions=raw_predictions,
+        final_predictions=final_predictions,
+        labels=None if reference.labels is None else reference.labels.copy(),
+        metrics=metrics,
+    )
+
+
+def run_ensemble_averaging_check(config: Config) -> None:
+    """Verify that raw scores are averaged before rounding and clipping."""
+
+    left = EvaluationOutput(
+        ids=["a", "b"],
+        indices=np.asarray([0, 1], dtype=np.int64),
+        raw_predictions=np.asarray([1.2, 3.4], dtype=np.float64),
+        final_predictions=np.asarray([1, 3], dtype=np.int64),
+        labels=np.asarray([1.0, 4.0], dtype=np.float64),
+        metrics=None,
+    )
+    right = EvaluationOutput(
+        ids=["a", "b"],
+        indices=np.asarray([0, 1], dtype=np.int64),
+        raw_predictions=np.asarray([2.0, 4.6], dtype=np.float64),
+        final_predictions=np.asarray([2, 5], dtype=np.int64),
+        labels=np.asarray([1.0, 4.0], dtype=np.float64),
+        metrics=None,
+    )
+    averaged = average_evaluation_outputs([left, right], config)
+    if not np.allclose(averaged.raw_predictions, [1.6, 4.0]):
+        raise AssertionError("Multi-seed raw-score averaging check failed")
+    if averaged.final_predictions.tolist() != [2, 4]:
+        raise AssertionError("Multi-seed round-after-average check failed")
+
+
+def write_ensemble_report(
+    seed_runs: Sequence[SeedRunOutput],
+    ensemble_dev: EvaluationOutput,
+    ensemble_test: EvaluationOutput,
+    config: Config,
+) -> Path:
+    """Record member metrics and the fixed uniform-averaging policy."""
+
+    dev_qwks = np.asarray(
+        [
+            run.dev.metrics["qwk"]
+            for run in seed_runs
+            if run.dev.metrics is not None
+        ],
+        dtype=np.float64,
+    )
+    payload = {
+        "seeds": [run.seed for run in seed_runs],
+        "aggregation": "uniform_mean_of_raw_regression_scores",
+        "discretization": "numpy_rint_then_clip",
+        "threshold_optimization": False,
+        "learned_ensemble_weights": False,
+        "members": [
+            {
+                "seed": run.seed,
+                "dev_metrics": run.dev.metrics,
+                # Open-Test metrics are diagnostic only and never participate
+                # in checkpoint selection or ensemble construction.
+                "open_test_metrics_diagnostic_only": run.test.metrics,
+            }
+            for run in seed_runs
+        ],
+        "member_dev_qwk_mean": (
+            float(dev_qwks.mean()) if len(dev_qwks) else None
+        ),
+        "member_dev_qwk_std": (
+            float(dev_qwks.std()) if len(dev_qwks) else None
+        ),
+        "ensemble_dev_metrics": ensemble_dev.metrics,
+        "ensemble_open_test_metrics_diagnostic_only": ensemble_test.metrics,
+    }
+    path = config.resolve(config.OUTPUT_DIR) / "logs" / "ensemble_report.json"
+    atomic_json_dump(payload, path)
+    return path
+
+
 def train_select_and_predict(
     train_frame: pd.DataFrame,
     dev_frame: pd.DataFrame,
@@ -2669,8 +2831,8 @@ def train_select_and_predict(
     context: DistributedContext,
     *,
     smoke_test: bool,
-) -> None:
-    """Fine-tune on Train, select only on Dev, then infer Test once."""
+) -> Optional[SeedRunOutput]:
+    """Train one seed, select only on Dev, and return best-model predictions."""
 
     tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, use_fast=True)
     added_tokens = tokenizer.add_tokens(list(FIELD_TOKENS), special_tokens=False)
@@ -2905,28 +3067,152 @@ def train_select_and_predict(
     unwrap_model(model).load_state_dict(best_state, strict=True)
     distributed_barrier(context)
 
+    best_dev_output = evaluate_model(
+        model,
+        dev_loader,
+        len(dev_frame),
+        config,
+        context,
+        description=f"Seed {config.SEED} best Dev",
+    )
     test_output = evaluate_model(
         model,
         test_loader,
         len(test_frame),
         config,
         context,
-        description="Test inference",
+        description=f"Seed {config.SEED} Test",
     )
+    seed_output: Optional[SeedRunOutput] = None
     if context.is_main:
+        if best_dev_output is None or best_dev_output.metrics is None:
+            raise RuntimeError("Rank 0 did not receive best-checkpoint Dev metrics")
         if test_output is None:
             raise RuntimeError("Rank 0 did not receive Test predictions")
+        expected_dev_ids = (
+            dev_frame.sort_values("_original_index")["_id"].astype(str).tolist()
+        )
         expected_ids = test_frame.sort_values("_original_index")["_id"].astype(str).tolist()
+        if best_dev_output.ids != expected_dev_ids:
+            raise RuntimeError("Dev predictions are not in the original ID order")
         if test_output.ids != expected_ids:
             raise RuntimeError("Test predictions are not in the original ID order")
-        diagnostics_path = write_diagnostics(test_output, config)
-        LOGGER.info("Test diagnostics: %s", diagnostics_path)
+        dev_diagnostics = write_diagnostics(
+            best_dev_output,
+            config,
+            split_name="dev",
+        )
+        test_diagnostics = write_diagnostics(
+            test_output,
+            config,
+            split_name="test",
+        )
+        LOGGER.info(
+            "Seed %d diagnostics: Dev=%s Test=%s",
+            config.SEED,
+            dev_diagnostics,
+            test_diagnostics,
+        )
+        LOGGER.info(
+            "Seed %d best-checkpoint Dev metrics: %s",
+            config.SEED,
+            best_dev_output.metrics,
+        )
         if test_output.metrics is not None:
             LOGGER.info(
-                "Open-Test metrics (diagnostic only; never used for selection): %s",
+                "Seed %d Open-Test metrics (diagnostic only; never used for "
+                "selection or weighting): %s",
+                config.SEED,
                 test_output.metrics,
             )
-        create_submission(test_output.ids, test_output.final_predictions, config)
+        seed_output = SeedRunOutput(config.SEED, best_dev_output, test_output)
+    distributed_barrier(context)
+    return seed_output
+
+
+def train_multiseed_ensemble(
+    train_frame: pd.DataFrame,
+    dev_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    config: Config,
+    context: DistributedContext,
+    *,
+    smoke_test: bool,
+) -> None:
+    """Train every configured seed and uniformly average its raw predictions."""
+
+    seed_runs: list[SeedRunOutput] = []
+    for member_index, seed in enumerate(config.ENSEMBLE_SEEDS, start=1):
+        member_config = config_for_seed(config, seed)
+        prepare_output_directories(member_config, context)
+        seed_everything(seed + context.rank)
+        if context.is_main:
+            LOGGER.info(
+                "Starting ensemble member %d/%d with seed=%d; artifacts=%s",
+                member_index,
+                len(config.ENSEMBLE_SEEDS),
+                seed,
+                member_config.resolve(member_config.OUTPUT_DIR),
+            )
+        member_output = train_select_and_predict(
+            train_frame,
+            dev_frame,
+            test_frame,
+            member_config,
+            context,
+            smoke_test=smoke_test,
+        )
+        if context.is_main:
+            if member_output is None:
+                raise RuntimeError(f"Seed {seed} produced no rank-0 output")
+            seed_runs.append(member_output)
+        distributed_barrier(context)
+        gc.collect()
+        if context.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if context.is_main:
+        if len(seed_runs) != len(config.ENSEMBLE_SEEDS):
+            raise RuntimeError("The multi-seed ensemble is missing member outputs")
+        ensemble_dev = average_evaluation_outputs(
+            [run.dev for run in seed_runs],
+            config,
+        )
+        ensemble_test = average_evaluation_outputs(
+            [run.test for run in seed_runs],
+            config,
+        )
+        dev_diagnostics = write_diagnostics(
+            ensemble_dev,
+            config,
+            split_name="ensemble_dev",
+        )
+        test_diagnostics = write_diagnostics(
+            ensemble_test,
+            config,
+            split_name="test",
+        )
+        report_path = write_ensemble_report(
+            seed_runs,
+            ensemble_dev,
+            ensemble_test,
+            config,
+        )
+        LOGGER.info("Uniform multi-seed ensemble Dev metrics: %s", ensemble_dev.metrics)
+        LOGGER.info("Ensemble Dev diagnostics: %s", dev_diagnostics)
+        LOGGER.info("Ensemble Test diagnostics: %s", test_diagnostics)
+        LOGGER.info("Ensemble report: %s", report_path)
+        if ensemble_test.metrics is not None:
+            LOGGER.info(
+                "Ensemble Open-Test metrics (diagnostic only; never used for "
+                "selection or weighting): %s",
+                ensemble_test.metrics,
+            )
+        create_submission(
+            ensemble_test.ids,
+            ensemble_test.final_predictions,
+            config,
+        )
     distributed_barrier(context)
 
 
@@ -2971,7 +3257,8 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
 
     run_sampler_checks()
     run_gather_order_check()
-    train_select_and_predict(
+    run_ensemble_averaging_check(config)
+    train_multiseed_ensemble(
         train_processed,
         dev_processed,
         test_processed,
@@ -3015,6 +3302,24 @@ def validate_config(config: Config) -> None:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
     if config.SAMPLER_ALPHA < 0.0:
         raise ValueError("SAMPLER_ALPHA cannot be negative")
+    if not config.ENSEMBLE_SEEDS:
+        raise ValueError("ENSEMBLE_SEEDS must contain at least one seed")
+    if any(
+        not isinstance(seed, int) or isinstance(seed, bool) or seed < 0
+        for seed in config.ENSEMBLE_SEEDS
+    ):
+        raise ValueError("ENSEMBLE_SEEDS must contain non-negative integers")
+    if len(set(config.ENSEMBLE_SEEDS)) != len(config.ENSEMBLE_SEEDS):
+        raise ValueError("ENSEMBLE_SEEDS must not contain duplicates")
+    if (
+        config.RESUME_FROM_CHECKPOINT
+        and len(config.ENSEMBLE_SEEDS) > 1
+        and "{seed}" not in str(config.RESUME_FROM_CHECKPOINT)
+    ):
+        raise ValueError(
+            "Multi-seed resume requires a {seed} placeholder in "
+            "RESUME_FROM_CHECKPOINT"
+        )
 
 
 def main() -> None:
@@ -3031,7 +3336,7 @@ def main() -> None:
     validate_config(config)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     context = initialize_distributed(config)
-    seed_everything(config.SEED + context.rank)
+    seed_everything(config.ENSEMBLE_SEEDS[0] + context.rank)
     try:
         run_pipeline(config, context, smoke_test=args.smoke_test)
     finally:

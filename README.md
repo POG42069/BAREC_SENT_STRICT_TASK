@@ -8,9 +8,11 @@ pipeline nằm trong `train.py` và có thể chạy bằng một lệnh:
 python train.py
 ```
 
-Pipeline sử dụng D3Tok thật của CAMeL Tools, một encoder AraBERTv2 và regression
-head một chiều. Khi Kaggle cung cấp hai GPU T4, script tự khởi chạy PyTorch DDP;
-không cần gọi `torchrun` thủ công.
+Pipeline sử dụng D3Tok thật của CAMeL Tools và ensemble năm AraBERTv2 regressor
+cùng kiến trúc, được fine-tune độc lập với seed `42, 52, 62, 72, 82`. Kết quả
+cuối là trung bình đều của năm raw score, sau đó `np.rint` và clip vào `[1, 19]`;
+không tối ưu threshold và không học ensemble weight. Khi Kaggle cung cấp hai GPU
+T4, script tự khởi chạy PyTorch DDP; không cần gọi `torchrun` thủ công.
 
 > [!IMPORTANT]
 > Checkpoint mặc định
@@ -208,9 +210,11 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
 | Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
+| Ensemble | `ENSEMBLE_SEEDS=(42, 52, 62, 72, 82)` | Năm lần fine-tune độc lập trên cùng Train |
+| Seed artifacts | `SEED_RUNS_DIR="outputs/seeds"` | Best model/checkpoint/log riêng của từng seed |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
-| Resume | `RESUME_FROM_CHECKPOINT=None` | Đường dẫn checkpoint để tiếp tục |
+| Resume | `RESUME_FROM_CHECKPOINT=None` | Template checkpoint có placeholder `{seed}` để tiếp tục từng member |
 
 Để dùng Blind Test, chỉ đổi `TEST_PATH` sang CSV/TSV/Parquet mới. File đó phải
 có ID và sentence; label là tùy chọn.
@@ -375,16 +379,29 @@ Chỉ Train DataLoader thực hiện backward. Sau mỗi epoch, Dev được gat
 - adjacent accuracy (sai lệch tối đa 1 mức);
 - Quadratic Weighted Kappa (QWK) với label cố định `1..19`.
 
-Prediction cho metric được tính bằng `np.rint`, clip vào `[1, 19]`, rồi chuyển
-sang integer. Checkpoint có QWK cao nhất được chọn; nếu QWK hòa, MAE thấp hơn
-thắng. Early stopping chỉ dựa trên Dev, không nhìn Test.
+Với mỗi seed trong `ENSEMBLE_SEEDS`, script khởi tạo lại regression head, thứ tự
+DataLoader, dropout và weighted sampler bằng seed đó; toàn bộ năm member vẫn chỉ
+backpropagate trên cùng Train. Checkpoint có Dev QWK cao nhất được chọn riêng cho
+từng seed; nếu QWK hòa, MAE thấp hơn thắng. Early stopping chỉ dựa trên Dev,
+không nhìn Test.
 
-Checkpoint resume lưu model hiện tại, optimizer, scheduler, scaler, epoch/global
-step, best QWK/MAE, config và RNG state. Đặt `RESUME_FROM_CHECKPOINT` tới
-`last.pt` để tiếp tục; model state được lưu sau khi unwrap DDP nên dùng được ở
-một hoặc nhiều GPU. Phải giữ cùng `outputs/best_model/model_state.pt` (nên lưu
-nguyên cây `outputs/`), vì đây là best state sẽ được load để inference sau khi
-resume; script fail fast nếu cặp artifact này không đầy đủ.
+Sau khi có năm best checkpoint, script chạy lại từng member trên Dev/Test, kiểm
+tra ID và thứ tự hoàn toàn trùng nhau, rồi lấy trung bình đều của **raw regression
+score**. Chỉ raw score trung bình mới được `np.rint`, clip vào `[1, 19]` và
+chuyển sang integer. Không threshold optimization, không QWK-weighting và không
+chọn/bỏ seed theo Open Test.
+
+Checkpoint resume của mỗi seed lưu model hiện tại, optimizer, scheduler, scaler,
+epoch/global step, best QWK/MAE, config và RNG state. Để resume ensemble, đặt:
+
+```python
+RESUME_FROM_CHECKPOINT = "outputs/seeds/seed_{seed}/checkpoints/last.pt"
+```
+
+Phải giữ best state tương ứng tại
+`outputs/seeds/seed_<N>/best_model/model_state.pt`; script fail fast nếu cặp
+artifact không đầy đủ. Model state được lưu sau khi unwrap DDP nên dùng được ở
+một hoặc nhiều GPU.
 
 ## 14. Smoke test và kiểm tra tối thiểu
 
@@ -400,10 +417,12 @@ Smoke test thật (mẫu nhỏ, D3Tok/checkpoint thật, output riêng):
 python train.py --smoke-test
 ```
 
-Smoke mode kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi dấu
-phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
-sampler, forward/backward, metric, checkpoint/reload, inference và submission
-ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo QWK.
+Smoke mode dùng hai seed `42, 52` để kiểm tra cả phép ensemble mà không phải chạy
+đủ năm member. Nó kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi
+dấu phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
+sampler, forward/backward, metric, checkpoint/reload, inference, raw-score
+averaging và submission ZIP. Nó không phải một lần huấn luyện hợp lệ để báo cáo
+QWK.
 
 Các invariant cần đạt:
 
@@ -425,13 +444,22 @@ Sau full training:
 
 ```text
 outputs/
-├── best_model/
-├── checkpoints/
-│   └── last.pt
+├── seeds/
+│   ├── seed_42/
+│   │   ├── best_model/
+│   │   ├── checkpoints/
+│   │   │   └── last.pt
+│   │   ├── diagnostics/
+│   │   └── logs/
+│   ├── seed_52/
+│   ├── seed_62/
+│   ├── seed_72/
+│   └── seed_82/
 ├── logs/
-│   ├── training_history.csv
-│   └── preprocessing_report.json
+│   ├── preprocessing_report.json
+│   └── ensemble_report.json
 ├── diagnostics/
+│   ├── ensemble_dev_predictions_with_raw_scores.csv
 │   └── test_predictions_with_raw_scores.csv
 ├── prediction
 └── prediction.zip
@@ -509,8 +537,10 @@ và Dev bắt buộc có label 19 mức.
 
 ### Checkpoint không load được
 
-Đảm bảo checkpoint và config/model name cùng baseline, không trộn checkpoint từ
-ensemble cũ. Nếu không cần resume, đặt `RESUME_FROM_CHECKPOINT=None`.
+Đảm bảo checkpoint và config/model name cùng baseline. Multi-seed resume yêu cầu
+placeholder `{seed}`, ví dụ
+`outputs/seeds/seed_{seed}/checkpoints/last.pt`, và best model tương ứng của từng
+seed. Nếu không cần resume, đặt `RESUME_FROM_CHECKPOINT=None`.
 
 ### ZIP bị hệ thống chấm từ chối
 
@@ -519,9 +549,11 @@ Không tự đổi tên thành `prediction.csv`. Mở ZIP và xác nhận nó ch
 
 ## 17. Reproducibility và báo cáo kết quả
 
-Seed được đặt cho Python, NumPy, PyTorch CPU/CUDA, DataLoader và sampler. Tuy vậy,
-khác biệt CUDA/library vẫn có thể gây sai khác nhỏ. Hãy lưu config, commit hash,
-log và best metrics đi kèm mỗi run.
+Năm seed cố định được đặt cho Python, NumPy, PyTorch CPU/CUDA, DataLoader và
+sampler. `ensemble_report.json` ghi metric từng member, mean/std Dev QWK, metric
+ensemble và xác nhận policy là uniform raw-score mean. Tuy vậy, khác biệt
+CUDA/library vẫn có thể gây sai khác nhỏ. Hãy lưu config, commit hash, log và
+best metrics đi kèm mỗi run.
 
 Repository không ghi QWK hoặc runtime chưa đo, không tuyên bố NCCL/T4 x2 đã đạt
 nếu chưa chạy trên Kaggle, và không dùng metric smoke test như kết quả cuộc thi.
