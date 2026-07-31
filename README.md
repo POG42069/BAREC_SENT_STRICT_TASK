@@ -8,11 +8,11 @@ pipeline nằm trong `train.py` và có thể chạy bằng một lệnh:
 python train.py
 ```
 
-Pipeline sử dụng D3Tok thật của CAMeL Tools và ensemble năm mô hình AraBERTv2
-HMTL cùng kiến trúc, được fine-tune độc lập với seed `42, 52, 62, 72, 82`. Mỗi
+Pipeline sử dụng D3Tok thật của CAMeL Tools và ensemble ba mô hình AraBERTv2
+HMTL cùng kiến trúc, được fine-tune độc lập với seed `42, 52, 62`. Mỗi
 mô hình giữ regression 19 mức làm nhiệm vụ chính và học thêm ba nhiệm vụ phụ
 3/5/7 mức trên cùng biểu diễn CLS. Kết quả
-cuối là trung bình đều của năm raw score, sau đó `np.rint` và clip vào `[1, 19]`;
+cuối là trung bình đều của ba raw score, sau đó `np.rint` và clip vào `[1, 19]`;
 không tối ưu threshold và không học ensemble weight. Khi Kaggle cung cấp hai GPU
 T4, script tự khởi chạy PyTorch DDP; không cần gọi `torchrun` thủ công.
 
@@ -205,7 +205,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
 | HMTL labels | `LABEL_COLUMN_3`, `LABEL_COLUMN_5`, `LABEL_COLUMN_7` | Ba nhãn phân cấp phụ, bắt buộc trên Train/Dev |
-| HMTL loss | `HMTL_AUX_LOSS_WEIGHTS=(0.2, 0.2, 0.2)` | Trọng số CE theo thứ tự nhiệm vụ 3/5/7 mức |
+| HMTL loss | `HMTL_AUX_LOSS_WEIGHTS=(0.5, 0.5, 0.5)` | Trọng số CE theo thứ tự nhiệm vụ 3/5/7 mức |
 | Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
 | Preprocess | `D3TOK_RESOURCE="msa"` | BERT unfactored disambiguator cho D3Tok |
 | D3Tok batch | `D3TOK_BATCH_SIZE=256` | Số câu đưa qua BERT disambiguator mỗi lượt |
@@ -214,7 +214,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
 | Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
-| Ensemble | `ENSEMBLE_SEEDS=(42, 52, 62, 72, 82)` | Năm lần fine-tune độc lập trên cùng Train |
+| Ensemble | `ENSEMBLE_SEEDS=(42, 52, 62)` | Ba lần fine-tune độc lập trên cùng Train |
 | Seed artifacts | `SEED_RUNS_DIR="outputs/seeds"` | Best model/checkpoint/log riêng của từng seed |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
@@ -337,7 +337,7 @@ AutoModel AraBERTv2 encoder
 Objective huấn luyện là:
 
 ```text
-L = MSE_19 + 0.2 × CE_3 + 0.2 × CE_5 + 0.2 × CE_7
+L = MSE_19 + 0.5 × CE_3 + 0.5 × CE_5 + 0.5 × CE_7
 ```
 
 Classification head 19 lớp của checkpoint không được sử dụng. Regression head
@@ -398,11 +398,11 @@ Chỉ Train DataLoader thực hiện backward. Sau mỗi epoch, Dev được gat
 
 Với mỗi seed trong `ENSEMBLE_SEEDS`, script khởi tạo lại regression head, ba
 auxiliary head, thứ tự DataLoader, dropout và weighted sampler bằng seed đó;
-toàn bộ năm member vẫn chỉ backpropagate trên cùng Train. Checkpoint có Dev QWK
+toàn bộ ba member vẫn chỉ backpropagate trên cùng Train. Checkpoint có Dev QWK
 cao nhất được chọn riêng cho từng seed; nếu QWK hòa, MAE thấp hơn thắng. Early
 stopping chỉ dựa trên Dev, không nhìn Test.
 
-Sau khi có năm best checkpoint, script chạy lại từng member trên Dev/Test, kiểm
+Sau khi có ba best checkpoint, script chạy lại từng member trên Dev/Test, kiểm
 tra ID và thứ tự hoàn toàn trùng nhau, rồi lấy trung bình đều của **raw regression
 score**. Chỉ raw score trung bình mới được `np.rint`, clip vào `[1, 19]` và
 chuyển sang integer. Không threshold optimization, không QWK-weighting và không
@@ -435,7 +435,7 @@ python train.py --smoke-test
 ```
 
 Smoke mode dùng hai seed `42, 52` để kiểm tra cả phép ensemble mà không phải chạy
-đủ năm member. Nó kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi
+đủ ba member. Nó kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi
 dấu phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
 sampler, forward/backward của đủ bốn HMTL head, metric, checkpoint/reload,
 inference, raw-score averaging và submission ZIP. Nó không phải một lần huấn
@@ -469,9 +469,7 @@ outputs/
 │   │   ├── diagnostics/
 │   │   └── logs/
 │   ├── seed_52/
-│   ├── seed_62/
-│   ├── seed_72/
-│   └── seed_82/
+│   └── seed_62/
 ├── logs/
 │   ├── hmtl_hierarchy.json
 │   ├── preprocessing_report.json

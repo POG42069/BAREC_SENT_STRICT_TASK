@@ -131,7 +131,7 @@ class Config:
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
     EARLY_STOPPING_PATIENCE: int = 2
-    ENSEMBLE_SEEDS: tuple[int, ...] = (42, 52, 62, 72, 82)
+    ENSEMBLE_SEEDS: tuple[int, ...] = (42, 52, 62)
     # Active seed for one ensemble member. The top-level pipeline overwrites
     # this field with each value from ENSEMBLE_SEEDS.
     SEED: int = 42
@@ -143,7 +143,7 @@ class Config:
     SAMPLER_REPLACEMENT: bool = True
     # Auxiliary CE weights for the 3-, 5-, and 7-level HMTL heads. The
     # 19-level scalar regression remains the main task with MSE weight 1.0.
-    HMTL_AUX_LOSS_WEIGHTS: tuple[float, float, float] = (0.2, 0.2, 0.2)
+    HMTL_AUX_LOSS_WEIGHTS: tuple[float, float, float] = (0.5, 0.5, 0.5)
     DDP_TIMEOUT_MINUTES: int = 180
     LOG_EVERY_N_STEPS: int = 50
     RESUME_FROM_CHECKPOINT: Optional[str] = None
