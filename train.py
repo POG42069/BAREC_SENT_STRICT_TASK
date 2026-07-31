@@ -143,7 +143,7 @@ class Config:
     SAMPLER_REPLACEMENT: bool = True
     # Auxiliary CE weights for the 3-, 5-, and 7-level HMTL heads. The
     # 19-level scalar regression remains the main task with MSE weight 1.0.
-    HMTL_AUX_LOSS_WEIGHTS: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    HMTL_AUX_LOSS_WEIGHTS: tuple[float, float, float] = (0.4, 0.5, 0.6)
     DDP_TIMEOUT_MINUTES: int = 180
     LOG_EVERY_N_STEPS: int = 50
     RESUME_FROM_CHECKPOINT: Optional[str] = None

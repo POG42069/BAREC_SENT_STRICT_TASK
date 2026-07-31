@@ -205,7 +205,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
 | HMTL labels | `LABEL_COLUMN_3`, `LABEL_COLUMN_5`, `LABEL_COLUMN_7` | Ba nhãn phân cấp phụ, bắt buộc trên Train/Dev |
-| HMTL loss | `HMTL_AUX_LOSS_WEIGHTS=(0.5, 0.5, 0.5)` | Trọng số CE theo thứ tự nhiệm vụ 3/5/7 mức |
+| HMTL loss | `HMTL_AUX_LOSS_WEIGHTS=(0.4, 0.5, 0.6)` | Trọng số CE tăng dần theo độ chi tiết của nhiệm vụ 3/5/7 mức |
 | Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
 | Preprocess | `D3TOK_RESOURCE="msa"` | BERT unfactored disambiguator cho D3Tok |
 | D3Tok batch | `D3TOK_BATCH_SIZE=256` | Số câu đưa qua BERT disambiguator mỗi lượt |
@@ -337,7 +337,7 @@ AutoModel AraBERTv2 encoder
 Objective huấn luyện là:
 
 ```text
-L = MSE_19 + 0.5 × CE_3 + 0.5 × CE_5 + 0.5 × CE_7
+L = MSE_19 + 0.4 × CE_3 + 0.5 × CE_5 + 0.6 × CE_7
 ```
 
 Classification head 19 lớp của checkpoint không được sử dụng. Regression head
