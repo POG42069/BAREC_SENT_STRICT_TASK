@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BAREC 2026 sentence-level Strict Track multi-seed regression ensemble.
+"""BAREC 2026 sentence-level Strict Track HMTL regression ensemble.
 
 The complete workflow lives in this file: validation, Arabic D3Tok
 preprocessing, distributed fine-tuning, per-seed model selection, raw-score
@@ -105,6 +105,9 @@ class Config:
     ID_COLUMN: str = "ID"
     TEXT_COLUMN: str = "Sentence"
     LABEL_COLUMN: str = "Readability_Level_19"
+    LABEL_COLUMN_7: str = "Readability_Level_7"
+    LABEL_COLUMN_5: str = "Readability_Level_5"
+    LABEL_COLUMN_3: str = "Readability_Level_3"
 
     # Model and Arabic preprocessing.
     MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
@@ -138,6 +141,9 @@ class Config:
     USE_WEIGHTED_SAMPLER: bool = True
     SAMPLER_ALPHA: float = 0.5
     SAMPLER_REPLACEMENT: bool = True
+    # Auxiliary CE weights for the 3-, 5-, and 7-level HMTL heads. The
+    # 19-level scalar regression remains the main task with MSE weight 1.0.
+    HMTL_AUX_LOSS_WEIGHTS: tuple[float, float, float] = (0.2, 0.2, 0.2)
     DDP_TIMEOUT_MINUTES: int = 180
     LOG_EVERY_N_STEPS: int = 50
     RESUME_FROM_CHECKPOINT: Optional[str] = None
@@ -397,6 +403,12 @@ def distributed_barrier(context: DistributedContext) -> None:
 ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
+HMTL_LEVELS = (3, 5, 7)
+HMTL_LABEL_ALIASES = {
+    3: ("Readability_Level_3", "label_3", "level_3"),
+    5: ("Readability_Level_5", "label_5", "level_5"),
+    7: ("Readability_Level_7", "label_7", "level_7"),
+}
 DOCUMENT_ALIASES = ("Document", "document")
 DOMAIN_ALIASES = ("Domain", "domain")
 TEXT_CLASS_ALIASES = ("Text_Class", "Text Class", "text_class", "text class")
@@ -444,6 +456,52 @@ def resolve_column(
     return matches[0]
 
 
+def hmtl_label_column(config: Config, level: int) -> str:
+    """Return the configured source column for one auxiliary HMTL task."""
+
+    configured = {
+        3: config.LABEL_COLUMN_3,
+        5: config.LABEL_COLUMN_5,
+        7: config.LABEL_COLUMN_7,
+    }
+    try:
+        return configured[level]
+    except KeyError as error:
+        raise ValueError(f"Unsupported HMTL level: {level}") from error
+
+
+def parse_hmtl_labels(
+    frame: pd.DataFrame,
+    column: str,
+    *,
+    level: int,
+    split_name: str,
+) -> np.ndarray:
+    """Validate an auxiliary label column as integers in ``[1, level]``."""
+
+    source = frame[column]
+    if source.isna().any():
+        rows = frame.index[source.isna()].tolist()[:10]
+        raise ValueError(
+            f"{split_name}: missing level-{level} HMTL labels at rows {rows}"
+        )
+    numeric = pd.to_numeric(source, errors="coerce").to_numpy(dtype=np.float64)
+    invalid = ~np.isfinite(numeric) | ~np.isclose(numeric, np.rint(numeric))
+    if invalid.any():
+        rows = np.flatnonzero(invalid)[:10].tolist()
+        raise ValueError(
+            f"{split_name}: invalid level-{level} HMTL labels at rows {rows}"
+        )
+    labels = np.rint(numeric).astype(np.int64)
+    outside = (labels < 1) | (labels > level)
+    if outside.any():
+        values = sorted(set(labels[outside].tolist()))
+        raise ValueError(
+            f"{split_name}: level-{level} labels outside [1, {level}]: {values}"
+        )
+    return labels
+
+
 def load_split(
     path: Path,
     split_name: str,
@@ -468,6 +526,26 @@ def load_split(
         "label",
         required=require_label,
     )
+    hmtl_columns = {
+        level: resolve_column(
+            columns,
+            hmtl_label_column(config, level),
+            HMTL_LABEL_ALIASES[level],
+            f"level-{level} HMTL label",
+            required=require_label,
+        )
+        for level in HMTL_LEVELS
+    }
+    present_hmtl_columns = {
+        level: column
+        for level, column in hmtl_columns.items()
+        if column is not None
+    }
+    if present_hmtl_columns and len(present_hmtl_columns) != len(HMTL_LEVELS):
+        raise ValueError(
+            f"{split_name}: HMTL label columns for levels 3, 5 and 7 must "
+            "be provided together"
+        )
     document_column = resolve_column(
         columns, "Document", DOCUMENT_ALIASES, "document", required=False
     )
@@ -532,6 +610,18 @@ def load_split(
                 )
             frame["_label"] = labels
 
+    for level in HMTL_LEVELS:
+        output_column = f"_label_{level}"
+        source_column = hmtl_columns[level]
+        frame[output_column] = np.nan
+        if source_column is not None:
+            frame[output_column] = parse_hmtl_labels(
+                frame,
+                source_column,
+                level=level,
+                split_name=split_name,
+            )
+
     if document_column is not None:
         frame["_document"] = frame[document_column].map(
             lambda value: None if pd.isna(value) else str(value)
@@ -552,8 +642,96 @@ def load_split(
     )
     frame["_original_index"] = np.arange(len(frame), dtype=np.int64)
     frame.attrs["has_labels"] = label_column is not None
+    frame.attrs["has_hmtl_labels"] = len(present_hmtl_columns) == len(HMTL_LEVELS)
     frame.attrs["source_path"] = str(path)
     return frame
+
+
+def validate_hmtl_hierarchy(
+    train_frame: pd.DataFrame,
+    dev_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    config: Config,
+) -> dict[int, tuple[int, int, int]]:
+    """Validate the deterministic 19 -> 7 -> 5 -> 3 label relationships."""
+
+    if not bool(train_frame.attrs.get("has_hmtl_labels", False)):
+        raise ValueError("Train must contain level-3, level-5 and level-7 HMTL labels")
+    paths_by_leaf: dict[int, tuple[int, int, int]] = {}
+    for row in train_frame[["_label", "_label_3", "_label_5", "_label_7"]].itertuples(
+        index=False,
+        name=None,
+    ):
+        leaf, level_3, level_5, level_7 = (int(value) for value in row)
+        path = (level_3, level_5, level_7)
+        previous = paths_by_leaf.setdefault(leaf, path)
+        if previous != path:
+            raise ValueError(
+                f"Train leaf {leaf} maps to multiple HMTL paths: {previous} and {path}"
+            )
+    expected_leaves = set(range(config.MIN_LABEL, config.MAX_LABEL + 1))
+    if set(paths_by_leaf) != expected_leaves:
+        missing = sorted(expected_leaves - set(paths_by_leaf))
+        extra = sorted(set(paths_by_leaf) - expected_leaves)
+        raise ValueError(
+            f"Train HMTL mapping must cover all 19 leaves; missing={missing}, extra={extra}"
+        )
+
+    observed_by_level = {
+        3: {path[0] for path in paths_by_leaf.values()},
+        5: {path[1] for path in paths_by_leaf.values()},
+        7: {path[2] for path in paths_by_leaf.values()},
+    }
+    for level, observed in observed_by_level.items():
+        expected = set(range(1, level + 1))
+        if observed != expected:
+            raise ValueError(
+                f"Train HMTL level {level} must cover every class; "
+                f"missing={sorted(expected - observed)}, extra={sorted(observed - expected)}"
+            )
+
+    parent_maps: tuple[tuple[str, int, int], ...] = (
+        ("level-7 -> level-5", 2, 1),
+        ("level-5 -> level-3", 1, 0),
+    )
+    for relationship, child_index, parent_index in parent_maps:
+        child_to_parent: dict[int, int] = {}
+        for path in paths_by_leaf.values():
+            child = path[child_index]
+            parent = path[parent_index]
+            previous = child_to_parent.setdefault(child, parent)
+            if previous != parent:
+                raise ValueError(
+                    f"Train HMTL {relationship} is not deterministic: child "
+                    f"{child} maps to both {previous} and {parent}"
+                )
+
+    for split_name, frame in (
+        ("train", train_frame),
+        ("dev", dev_frame),
+        ("test", test_frame),
+    ):
+        if not bool(frame.attrs.get("has_hmtl_labels", False)):
+            continue
+        if not bool(frame.attrs.get("has_labels", False)):
+            raise ValueError(
+                f"{split_name}: auxiliary HMTL labels exist without level-19 labels"
+            )
+        for row_index, row in enumerate(
+            frame[["_label", "_label_3", "_label_5", "_label_7"]].itertuples(
+                index=False,
+                name=None,
+            )
+        ):
+            leaf, level_3, level_5, level_7 = (int(value) for value in row)
+            observed = (level_3, level_5, level_7)
+            expected = paths_by_leaf[leaf]
+            if observed != expected:
+                raise ValueError(
+                    f"{split_name}: HMTL path mismatch at row {row_index}: "
+                    f"leaf={leaf}, observed={observed}, expected={expected}"
+                )
+    return paths_by_leaf
 
 
 def validate_split_isolation(
@@ -605,6 +783,15 @@ def log_split_summary(name: str, frame: pd.DataFrame, config: Config) -> None:
             for label in range(config.MIN_LABEL, config.MAX_LABEL + 1)
         }
         LOGGER.info("%s label distribution: %s", name, distribution)
+    if frame.attrs.get("has_hmtl_labels", False):
+        for level in HMTL_LEVELS:
+            counts = frame[f"_label_{level}"].astype(int).value_counts().sort_index()
+            LOGGER.info(
+                "%s level-%d HMTL distribution: %s",
+                name,
+                level,
+                {label: int(counts.get(label, 0)) for label in range(1, level + 1)},
+            )
 
 
 def smoke_subset(frame: pd.DataFrame, size: int) -> pd.DataFrame:
@@ -1514,6 +1701,15 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.labels = (
             frame["_label"].astype(float).tolist() if self.has_labels else None
         )
+        self.has_hmtl_labels = bool(frame.attrs.get("has_hmtl_labels", False))
+        self.hmtl_labels = (
+            {
+                level: frame[f"_label_{level}"].astype(int).tolist()
+                for level in HMTL_LEVELS
+            }
+            if self.has_hmtl_labels
+            else None
+        )
         self.tokenizer = tokenizer
         self.max_length = max_length
 
@@ -1533,6 +1729,9 @@ class BARECDataset(Dataset[dict[str, Any]]):
         item["original_index"] = self.indices[index]
         if self.labels is not None:
             item["label"] = self.labels[index]
+        if self.hmtl_labels is not None:
+            for level in HMTL_LEVELS:
+                item[f"label_{level}"] = self.hmtl_labels[level][index]
         return item
 
 
@@ -1548,23 +1747,42 @@ class BARECCollator:
         indices: list[int] = []
         labels: list[float] = []
         labels_present = "label" in features[0]
+        hmtl_labels_present = all(
+            f"label_{level}" in features[0] for level in HMTL_LEVELS
+        )
+        hmtl_labels = {level: [] for level in HMTL_LEVELS}
         for feature in features:
             model_features.append(
                 {
                     key: value
                     for key, value in feature.items()
-                    if key not in {"sample_id", "original_index", "label"}
+                    if key
+                    not in {
+                        "sample_id",
+                        "original_index",
+                        "label",
+                        *(f"label_{level}" for level in HMTL_LEVELS),
+                    }
                 }
             )
             sample_ids.append(str(feature["sample_id"]))
             indices.append(int(feature["original_index"]))
             if labels_present:
                 labels.append(float(feature["label"]))
+            if hmtl_labels_present:
+                for level in HMTL_LEVELS:
+                    hmtl_labels[level].append(int(feature[f"label_{level}"]))
         batch = dict(self.tokenizer.pad(model_features, padding=True, return_tensors="pt"))
         batch["sample_ids"] = sample_ids
         batch["original_indices"] = torch.tensor(indices, dtype=torch.long)
         if labels_present:
             batch["labels"] = torch.tensor(labels, dtype=torch.float32)
+        if hmtl_labels_present:
+            for level in HMTL_LEVELS:
+                batch[f"labels_{level}"] = torch.tensor(
+                    hmtl_labels[level],
+                    dtype=torch.long,
+                )
         return batch
 
 
@@ -1679,16 +1897,16 @@ def run_sampler_checks() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Regression model and optimization
+# 6. Hierarchical multi-task model and optimization
 # ---------------------------------------------------------------------------
 
 
-class ArabicReadabilityRegressor(nn.Module):
-    """AraBERT encoder with a dropout and scalar sentence-regression head."""
+class ArabicReadabilityHMTL(nn.Module):
+    """Shared AraBERT with a main regressor and three coarse auxiliary heads."""
 
     def __init__(self, model_name: str, dropout: float) -> None:
         super().__init__()
-        # The regression head consumes raw CLS from last_hidden_state.  A
+        # Every HMTL head consumes raw CLS from last_hidden_state. A
         # BertModel pooler would therefore be trainable but disconnected from
         # the loss, which makes DDP fail on the following iteration when
         # find_unused_parameters=False.  Do not instantiate those two unused
@@ -1704,20 +1922,26 @@ class ArabicReadabilityRegressor(nn.Module):
         ]
         if trainable_pooler_parameters:
             raise RuntimeError(
-                "The CLS regressor must not retain trainable encoder-pooler "
+                "The CLS HMTL model must not retain trainable encoder-pooler "
                 f"parameters: {trainable_pooler_parameters}"
             )
         hidden_size = int(self.encoder.config.hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.regression_head = nn.Linear(hidden_size, 1)
+        self.auxiliary_heads = nn.ModuleDict(
+            {
+                str(level): nn.Linear(hidden_size, level)
+                for level in HMTL_LEVELS
+            }
+        )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         token_type_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Return one unrounded readability score per input sentence."""
+    ) -> dict[str, torch.Tensor]:
+        """Return the ordinal score and logits for all coarse HMTL tasks."""
 
         encoder_arguments: dict[str, torch.Tensor] = {
             "input_ids": input_ids,
@@ -1727,14 +1951,26 @@ class ArabicReadabilityRegressor(nn.Module):
             encoder_arguments["token_type_ids"] = token_type_ids
         outputs = self.encoder(**encoder_arguments)
         cls_embedding = outputs.last_hidden_state[:, 0, :]
-        return self.regression_head(self.dropout(cls_embedding)).squeeze(-1)
+        shared_representation = self.dropout(cls_embedding)
+        output = {
+            "score": self.regression_head(shared_representation).squeeze(-1)
+        }
+        output.update(
+            {
+                f"logits_{level}": self.auxiliary_heads[str(level)](
+                    shared_representation
+                )
+                for level in HMTL_LEVELS
+            }
+        )
+        return output
 
 
-def unwrap_model(model: nn.Module) -> ArabicReadabilityRegressor:
+def unwrap_model(model: nn.Module) -> ArabicReadabilityHMTL:
     """Return the underlying model whether or not DDP wraps it."""
 
     unwrapped = model.module if isinstance(model, DDP) else model
-    if not isinstance(unwrapped, ArabicReadabilityRegressor):
+    if not isinstance(unwrapped, ArabicReadabilityHMTL):
         raise TypeError(f"Unexpected model type: {type(unwrapped)}")
     return unwrapped
 
@@ -1761,7 +1997,7 @@ def create_optimizer(model: nn.Module, config: Config) -> AdamW:
     base = unwrap_model(model)
     encoder_decay, encoder_no_decay = split_decay_parameters(base.encoder)
     head_decay, head_no_decay = split_decay_parameters(
-        nn.ModuleList([base.dropout, base.regression_head])
+        nn.ModuleList([base.dropout, base.regression_head, base.auxiliary_heads])
     )
     groups = [
         {
@@ -1823,31 +2059,83 @@ def scaled_optimizer_step(
     return optimizer_stepped, scale_before, scale_after
 
 
-def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
-    """Pass only encoder tensors from a collated batch into the model."""
+def model_forward(
+    model: nn.Module,
+    batch: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Pass encoder tensors into HMTL and validate every output shape."""
 
-    predictions = model(
+    outputs = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         token_type_ids=batch.get("token_type_ids"),
     )
-    if predictions.ndim != 1 or predictions.shape[0] != batch["input_ids"].shape[0]:
+    if not isinstance(outputs, Mapping):
+        raise AssertionError("HMTL model must return a mapping")
+    batch_size = batch["input_ids"].shape[0]
+    expected_keys = {"score", *(f"logits_{level}" for level in HMTL_LEVELS)}
+    if set(outputs) != expected_keys:
         raise AssertionError(
-            f"Regression output must have shape [batch_size], got {tuple(predictions.shape)}"
+            f"HMTL output keys differ: expected={sorted(expected_keys)}, "
+            f"actual={sorted(outputs)}"
         )
-    return predictions
+    if outputs["score"].ndim != 1 or outputs["score"].shape[0] != batch_size:
+        raise AssertionError(
+            "Regression output must have shape [batch_size], got "
+            f"{tuple(outputs['score'].shape)}"
+        )
+    validated = {"score": outputs["score"]}
+    for level in HMTL_LEVELS:
+        logits = outputs[f"logits_{level}"]
+        if tuple(logits.shape) != (batch_size, level):
+            raise AssertionError(
+                f"Level-{level} HMTL logits must have shape "
+                f"({batch_size}, {level}), got {tuple(logits.shape)}"
+            )
+        validated[f"logits_{level}"] = logits
+    return validated
 
 
-def run_regression_shape_check(
-    model: ArabicReadabilityRegressor,
+def calculate_hmtl_loss(
+    outputs: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    config: Config,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Combine main 19-level MSE with coarse 3/5/7 cross-entropies."""
+
+    required = {"labels", *(f"labels_{level}" for level in HMTL_LEVELS)}
+    missing = sorted(required - set(batch))
+    if missing:
+        raise ValueError(f"HMTL training batch is missing labels: {missing}")
+    components: dict[str, torch.Tensor] = {
+        "mse_19": nn.functional.mse_loss(outputs["score"], batch["labels"])
+    }
+    for level in HMTL_LEVELS:
+        targets = batch[f"labels_{level}"].to(dtype=torch.long) - 1
+        if ((targets < 0) | (targets >= level)).any():
+            raise ValueError(f"Level-{level} HMTL target is outside [1, {level}]")
+        components[f"ce_{level}"] = nn.functional.cross_entropy(
+            outputs[f"logits_{level}"],
+            targets,
+        )
+    total = components["mse_19"]
+    for level, weight in zip(HMTL_LEVELS, config.HMTL_AUX_LOSS_WEIGHTS):
+        total = total + float(weight) * components[f"ce_{level}"]
+    return total, components
+
+
+def run_hmtl_shape_check(
+    model: ArabicReadabilityHMTL,
     tokenizer: Any,
     d3tok_text: str,
     surface_text: str,
     feature_groups: Sequence[str],
     device: torch.device,
     max_length: int,
+    labels_by_level: Mapping[int, int],
+    config: Config,
 ) -> None:
-    """Verify batch-one output shape and gradient connectivity before DDP."""
+    """Verify batch-one HMTL shapes, objective, and gradient connectivity."""
 
     encoded = encode_structured_pair(
         tokenizer,
@@ -1863,17 +2151,26 @@ def run_regression_shape_check(
         tokenizer.pad([encoded], padding=True, return_tensors="pt")
     )
     encoded = {key: value.to(device) for key, value in encoded.items()}
+    encoded["labels"] = torch.tensor(
+        [float(labels_by_level[19])],
+        dtype=torch.float32,
+        device=device,
+    )
+    for level in HMTL_LEVELS:
+        encoded[f"labels_{level}"] = torch.tensor(
+            [int(labels_by_level[level])],
+            dtype=torch.long,
+            device=device,
+        )
     was_training = model.training
     model.train()
     model.zero_grad(set_to_none=True)
     try:
-        output = model(**encoded)
-        if output.shape != torch.Size([1]):
-            raise AssertionError(
-                "Batch-size-one regression output must have shape [1], "
-                f"got {tuple(output.shape)}"
-            )
-        output.sum().backward()
+        outputs = model_forward(model, encoded)
+        loss, components = calculate_hmtl_loss(outputs, encoded, config)
+        if set(components) != {"mse_19", "ce_3", "ce_5", "ce_7"}:
+            raise AssertionError("HMTL objective did not include every task")
+        loss.backward()
         disconnected = [
             name
             for name, parameter in model.named_parameters()
@@ -1881,7 +2178,7 @@ def run_regression_shape_check(
         ]
         if disconnected:
             raise AssertionError(
-                "Trainable model parameters are disconnected from the regression "
+                "Trainable model parameters are disconnected from the HMTL "
                 f"loss: {disconnected}"
             )
     finally:
@@ -2030,7 +2327,7 @@ def evaluate_model(
     for batch in progress:
         batch = move_model_batch(batch, context.device)
         with autocast_context(amp_enabled):
-            predictions = model_forward(model, batch)
+            predictions = model_forward(model, batch)["score"]
         local_indices.extend(batch["original_indices"].cpu().tolist())
         local_ids.extend(batch["sample_ids"])
         local_predictions.extend(predictions.float().cpu().tolist())
@@ -2406,7 +2703,6 @@ def train_one_epoch(
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss_function = nn.MSELoss()
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
     total_loss = 0.0
     total_examples = 0
@@ -2433,8 +2729,12 @@ def train_one_epoch(
         )
         with synchronization:
             with autocast_context(amp_enabled):
-                predictions = model_forward(model, batch)
-                raw_loss = loss_function(predictions, batch["labels"])
+                outputs = model_forward(model, batch)
+                raw_loss, loss_components = calculate_hmtl_loss(
+                    outputs,
+                    batch,
+                    config,
+                )
                 window_start = (
                     step // config.GRADIENT_ACCUMULATION_STEPS
                 ) * config.GRADIENT_ACCUMULATION_STEPS
@@ -2482,6 +2782,10 @@ def train_one_epoch(
             ):
                 progress.set_postfix(
                     loss=f"{raw_loss.item():.4f}",
+                    mse=f"{loss_components['mse_19'].item():.4f}",
+                    ce3=f"{loss_components['ce_3'].item():.3f}",
+                    ce5=f"{loss_components['ce_5'].item():.3f}",
+                    ce7=f"{loss_components['ce_7'].item():.3f}",
                     avg=f"{total_loss / max(total_examples, 1):.4f}",
                     enc_lr=f"{encoder_lr:.2e}",
                     head_lr=f"{head_lr:.2e}",
@@ -2696,6 +3000,34 @@ def write_preprocessing_report(
     )
 
 
+def write_hmtl_hierarchy_report(
+    paths_by_leaf: Mapping[int, tuple[int, int, int]],
+    config: Config,
+) -> Path:
+    """Persist the validated deterministic mapping used by the HMTL tasks."""
+
+    payload = {
+        "main_task": {
+            "type": "scalar_regression",
+            "levels": config.MAX_LABEL - config.MIN_LABEL + 1,
+            "loss": "mse",
+        },
+        "auxiliary_tasks": [
+            {"levels": level, "loss": "cross_entropy", "weight": float(weight)}
+            for level, weight in zip(HMTL_LEVELS, config.HMTL_AUX_LOSS_WEIGHTS)
+        ],
+        "leaf_to_auxiliary_path": {
+            str(leaf): {"level_3": path[0], "level_5": path[1], "level_7": path[2]}
+            for leaf, path in sorted(paths_by_leaf.items())
+        },
+        "inference": "regression_score_only",
+        "ensemble": "uniform_mean_of_raw_seed_scores_then_round_and_clip",
+    }
+    path = config.resolve(config.OUTPUT_DIR) / "logs" / "hmtl_hierarchy.json"
+    atomic_json_dump(payload, path)
+    return path
+
+
 @dataclass
 class SeedRunOutput:
     """Best-checkpoint Dev/Test predictions produced by one random seed."""
@@ -2847,7 +3179,7 @@ def train_select_and_predict(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
-    base_model = ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
+    base_model = ArabicReadabilityHMTL(config.MODEL_NAME, config.DROPOUT)
     embedding_count = int(
         base_model.encoder.get_input_embeddings().num_embeddings
     )
@@ -2857,7 +3189,7 @@ def train_select_and_predict(
         raise RuntimeError("Tokenizer/model vocabulary sizes remain inconsistent")
     base_model.to(context.device)
     probe_row = train_frame.iloc[0].to_dict()
-    run_regression_shape_check(
+    run_hmtl_shape_check(
         base_model,
         tokenizer,
         str(probe_row["_d3tok_text"]),
@@ -2865,6 +3197,13 @@ def train_select_and_predict(
         structured_feature_groups(probe_row),
         context.device,
         config.MAX_LENGTH,
+        {
+            19: int(probe_row["_label"]),
+            3: int(probe_row["_label_3"]),
+            5: int(probe_row["_label_5"]),
+            7: int(probe_row["_label_7"]),
+        },
+        config,
     )
     model: nn.Module = base_model
     if context.distributed:
@@ -3230,6 +3569,15 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
     dev_frame = load_split(dev_path, "dev", config, require_label=True)
     test_frame = load_split(test_path, "test", config, require_label=False)
     validate_split_isolation(train_frame, dev_frame, test_frame)
+    hmtl_paths = validate_hmtl_hierarchy(
+        train_frame,
+        dev_frame,
+        test_frame,
+        config,
+    )
+    if context.is_main:
+        hierarchy_report_path = write_hmtl_hierarchy_report(hmtl_paths, config)
+        LOGGER.info("Validated HMTL hierarchy: %s", hierarchy_report_path)
 
     if smoke_test:
         train_frame = smoke_subset(train_frame, config.SMOKE_TRAIN_SAMPLES)
@@ -3273,6 +3621,15 @@ def validate_config(config: Config) -> None:
 
     if config.MIN_LABEL >= config.MAX_LABEL:
         raise ValueError("MIN_LABEL must be less than MAX_LABEL")
+    if (config.MIN_LABEL, config.MAX_LABEL) != (1, 19):
+        raise ValueError("BAREC HMTL requires MIN_LABEL=1 and MAX_LABEL=19")
+    if len(config.HMTL_AUX_LOSS_WEIGHTS) != len(HMTL_LEVELS):
+        raise ValueError("HMTL_AUX_LOSS_WEIGHTS must contain weights for levels 3, 5, 7")
+    if any(
+        not math.isfinite(float(weight)) or float(weight) <= 0.0
+        for weight in config.HMTL_AUX_LOSS_WEIGHTS
+    ):
+        raise ValueError("Every HMTL auxiliary loss weight must be finite and positive")
     positive_integer_fields = {
         "MAX_LENGTH": config.MAX_LENGTH,
         "NUM_EPOCHS": config.NUM_EPOCHS,
