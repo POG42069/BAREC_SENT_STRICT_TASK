@@ -1278,6 +1278,20 @@ def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> No
         raise AssertionError("Forced D3Tok fallback did not preserve clean content")
 
 
+def d3tok_progress_options(cache_path: Path, total_batches: int) -> dict[str, Any]:
+    """Return a compact progress label that leaves room for Kaggle counters."""
+
+    if total_batches <= 0:
+        raise ValueError("D3Tok progress requires at least one batch")
+    split_name = cache_path.stem.split("-", 1)[0].strip() or "split"
+    return {
+        "total": total_batches,
+        "desc": f"BERT D3Tok {split_name}",
+        "unit": "batch",
+        "dynamic_ncols": True,
+    }
+
+
 def build_preprocessing_cache(
     frame: pd.DataFrame,
     cache_path: Path,
@@ -1291,6 +1305,14 @@ def build_preprocessing_cache(
         items[start : start + config.D3TOK_BATCH_SIZE]
         for start in range(0, len(items), config.D3TOK_BATCH_SIZE)
     ]
+    progress_options = d3tok_progress_options(cache_path, len(item_batches))
+    LOGGER.info(
+        "%s preprocessing: %d sentences in %d batches (up to %d sentences/batch).",
+        progress_options["desc"],
+        len(items),
+        len(item_batches),
+        config.D3TOK_BATCH_SIZE,
+    )
     rows: list[PreprocessedRow]
 
     if config.PREPROCESS_NUM_WORKERS > 1:
@@ -1310,8 +1332,7 @@ def build_preprocessing_cache(
                 row
                 for batch_rows in tqdm(
                     executor.map(_preprocess_worker_batch, item_batches, chunksize=1),
-                    total=len(item_batches),
-                    desc=f"BERT D3Tok {cache_path.stem}",
+                    **progress_options,
                 )
                 for row in batch_rows
             ]
@@ -1321,7 +1342,7 @@ def build_preprocessing_cache(
         rows = []
         for item_batch in tqdm(
             item_batches,
-            desc=f"BERT D3Tok {cache_path.stem}",
+            **progress_options,
         ):
             results = preprocessor.process_many([text for _, text in item_batch])
             rows.extend(

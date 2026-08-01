@@ -103,6 +103,26 @@ class MappingAndLoadingTests(unittest.TestCase):
             train.validated_integer_labels(labels, "probe", "19-level", 1, 19)
 
 
+class PreprocessingProgressTests(unittest.TestCase):
+    def test_long_cache_fingerprint_does_not_hide_batch_counter(self) -> None:
+        cache_path = Path("train-" + "a" * 64 + ".parquet")
+        options = train.d3tok_progress_options(cache_path, 215)
+        self.assertEqual(options["desc"], "BERT D3Tok train")
+        self.assertEqual(options["total"], 215)
+        self.assertEqual(options["unit"], "batch")
+        self.assertTrue(options["dynamic_ncols"])
+
+        rendered = train.tqdm.format_meter(
+            1,
+            options["total"],
+            3.0,
+            ncols=80,
+            prefix=options["desc"],
+            unit=options["unit"],
+        )
+        self.assertIn("1/215", rendered)
+
+
 class CascadedModelTests(unittest.TestCase):
     def test_shapes_and_soft_conditioning(self) -> None:
         for batch_size in (1, 4):
