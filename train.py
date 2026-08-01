@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""BAREC 2026 sentence-level Strict Track regression baseline.
+"""BAREC 2026 sentence-level Strict Track cascaded multi-task ensemble.
 
 The complete workflow lives in this file: validation, Arabic D3Tok
-preprocessing, distributed fine-tuning, model selection, inference, and
-submission validation.  Edit :class:`Config` and run ``python train.py``.
+preprocessing, distributed fine-tuning, per-seed model selection, raw-score
+averaging, inference, and submission validation. Edit :class:`Config` and run
+``python train.py``.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import gc
 import hashlib
 import importlib.metadata
 import inspect
@@ -30,7 +32,7 @@ import unicodedata
 import uuid
 import zipfile
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
@@ -55,11 +57,34 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
-PREPROCESSING_VERSION = "barec-d3tok-v1"
+PREPROCESSING_VERSION = "barec-structured-pair-v4"
 TATWEEL = "\u0640"
-ARABIC_DIACRITICS = frozenset(chr(code) for code in range(0x064B, 0x0653)) | {
-    "\u0670"
-}
+ARABIC_DIACRITICS = frozenset(
+    chr(codepoint)
+    for start, end in (
+        (0x0610, 0x061A),
+        (0x064B, 0x065F),
+        (0x0670, 0x0670),
+        (0x06D6, 0x06ED),
+        (0x08D3, 0x08FF),
+    )
+    for codepoint in range(start, end + 1)
+    if unicodedata.category(chr(codepoint)).startswith("M")
+)
+FIELD_TOKENS = (
+    "[WC]",
+    "[DC]",
+    "[WLA]",
+    "[WLS]",
+    "[DOM_AH]",
+    "[DOM_SS]",
+    "[DOM_STEM]",
+    "[DOM_UNKNOWN]",
+    "[TC_FOUNDATIONAL]",
+    "[TC_ADVANCED]",
+    "[TC_SPECIALIZED]",
+    "[TC_UNKNOWN]",
+)
 
 
 @dataclass
@@ -74,21 +99,31 @@ class Config:
     CHECKPOINT_DIR: str = "outputs/checkpoints"
     CACHE_DIR: str = "cache"
     SUBMISSION_DIR: str = "outputs"
+    SEED_RUNS_DIR: str = "outputs/seeds"
 
     # Columns.
     ID_COLUMN: str = "ID"
     TEXT_COLUMN: str = "Sentence"
     LABEL_COLUMN: str = "Readability_Level_19"
+    LABEL_3_COLUMN: str = "Readability_Level_3"
+    LABEL_5_COLUMN: str = "Readability_Level_5"
+    LABEL_7_COLUMN: str = "Readability_Level_7"
 
     # Model and Arabic preprocessing.
     MODEL_NAME: str = "CAMeL-Lab/readability-arabertv2-d3tok-CE"
-    MAX_LENGTH: int = 256
+    MODEL_MODE: str = "cascaded_hmtl"
+    MAX_LENGTH: int = 512
     DROPOUT: float = 0.1
-    D3TOK_RESOURCE: str = "calima-msa-r13"
+    AUX_CE3_WEIGHT: float = 0.5
+    AUX_CE5_WEIGHT: float = 0.5
+    AUX_CE7_WEIGHT: float = 0.5
+    CASCADE_TEMPERATURE: float = 1.0
+    D3TOK_RESOURCE: str = "msa"
     AUTO_DOWNLOAD_CAMEL_DATA: bool = True
-    CAMEL_DATA_PACKAGE: str = "light"
+    CAMEL_DATA_PACKAGE: str = "disambig-bert-unfactored-msa"
     FORCE_REPROCESS: bool = False
     PREPROCESS_NUM_WORKERS: int = 1
+    D3TOK_BATCH_SIZE: int = 256
 
     # Training.
     NUM_EPOCHS: int = 5
@@ -101,11 +136,14 @@ class Config:
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
     EARLY_STOPPING_PATIENCE: int = 2
+    ENSEMBLE_SEEDS: tuple[int, ...] = (42, 52, 62, 72, 82)
+    # Active seed for one ensemble member. The top-level pipeline overwrites
+    # this field with each value from ENSEMBLE_SEEDS.
     SEED: int = 42
     NUM_WORKERS: int = 2
     PIN_MEMORY: bool = True
     USE_FP16: bool = True
-    USE_WEIGHTED_SAMPLER: bool = False
+    USE_WEIGHTED_SAMPLER: bool = True
     SAMPLER_ALPHA: float = 0.5
     SAMPLER_REPLACEMENT: bool = True
     DDP_TIMEOUT_MINUTES: int = 180
@@ -115,8 +153,12 @@ class Config:
     # Labels and submission.
     MIN_LABEL: int = 1
     MAX_LABEL: int = 19
+    # Every submitted ZIP must contain this exact extensionless root member.
     SUBMISSION_BASENAME: str = "prediction"
-    SUBMISSION_ZIP_NAME: str = "prediction.zip"
+    SUBMISSION_ROUND_BASENAME: str = "prediction_round"
+    SUBMISSION_UP_BASENAME: str = "prediction_up"
+    SUBMISSION_ROUND_ZIP_NAME: str = "prediction_round.zip"
+    SUBMISSION_UP_ZIP_NAME: str = "prediction_up.zip"
 
     # Smoke-test limits. These do not affect a normal run.
     SMOKE_TRAIN_SAMPLES: int = 32
@@ -137,17 +179,43 @@ class Config:
         self.OUTPUT_DIR = "outputs/smoke"
         self.CHECKPOINT_DIR = "outputs/smoke/checkpoints"
         self.SUBMISSION_DIR = "outputs/smoke"
+        self.SEED_RUNS_DIR = "outputs/smoke/seeds"
         self.CACHE_DIR = "cache/smoke"
+        # Two members are sufficient to exercise aggregation while keeping the
+        # real-model smoke test reasonably short.
+        self.ENSEMBLE_SEEDS = (42, 52)
+        self.SEED = self.ENSEMBLE_SEEDS[0]
         self.NUM_EPOCHS = 1
         self.PER_DEVICE_BATCH_SIZE = 2
         self.EVAL_BATCH_SIZE = 2
         self.GRADIENT_ACCUMULATION_STEPS = 1
-        self.MAX_LENGTH = 64
+        # Keep the production sequence budget so smoke mode exercises the same
+        # no-D3Tok-truncation invariant.
+        self.MAX_LENGTH = 512
         self.NUM_WORKERS = 0
         self.PREPROCESS_NUM_WORKERS = 1
         self.EARLY_STOPPING_PATIENCE = 1
         self.LOG_EVERY_N_STEPS = 1
         self.RESUME_FROM_CHECKPOINT = None
+
+
+def config_for_seed(config: Config, seed: int) -> Config:
+    """Create isolated artifact paths for one deterministic ensemble member."""
+
+    member = replace(config)
+    member.SEED = int(seed)
+    member_root = config.resolve(config.SEED_RUNS_DIR) / f"seed_{seed}"
+    member.OUTPUT_DIR = str(member_root)
+    member.CHECKPOINT_DIR = str(member_root / "checkpoints")
+    member.SUBMISSION_DIR = str(member_root)
+    if config.RESUME_FROM_CHECKPOINT:
+        resume_template = str(config.RESUME_FROM_CHECKPOINT)
+        member.RESUME_FROM_CHECKPOINT = (
+            resume_template.format(seed=seed)
+            if "{seed}" in resume_template
+            else resume_template
+        )
+    return member
 
 
 # ---------------------------------------------------------------------------
@@ -247,11 +315,16 @@ def maybe_self_launch_ddp(args: argparse.Namespace) -> bool:
         command.append("--smoke-test")
     print("Detected at least two GPUs; launching PyTorch DDP:")
     print(" ".join(command))
+    child_environment = os.environ.copy()
+    # Rank 0 can legitimately spend several minutes building the first D3Tok
+    # cache while rank 1 waits at a collective. PyTorch's default NCCL monitor
+    # may otherwise abort the healthy worker after roughly eight minutes.
+    child_environment.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "3600")
     subprocess.run(
         command,
         check=True,
         cwd=str(SCRIPT_DIR),
-        env=os.environ.copy(),
+        env=child_environment,
     )
     return True
 
@@ -336,7 +409,27 @@ def distributed_barrier(context: DistributedContext) -> None:
 ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
+LABEL_3_ALIASES = ("Readability_Level_3", "label3", "label_3")
+LABEL_5_ALIASES = ("Readability_Level_5", "label5", "label_5")
+LABEL_7_ALIASES = ("Readability_Level_7", "label7", "label_7")
 DOCUMENT_ALIASES = ("Document", "document")
+DOMAIN_ALIASES = ("Domain", "domain")
+TEXT_CLASS_ALIASES = ("Text_Class", "Text Class", "text_class", "text class")
+
+# Index 0 is deliberately unused so a legal 19-level label can index these
+# tables directly.  These are the official BAREC nested label mappings.
+LABEL3_FROM_19 = np.asarray(
+    [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3],
+    dtype=np.int64,
+)
+LABEL5_FROM_19 = np.asarray(
+    [0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 5, 5, 5],
+    dtype=np.int64,
+)
+LABEL7_FROM_19 = np.asarray(
+    [0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 7, 7],
+    dtype=np.int64,
+)
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -381,6 +474,69 @@ def resolve_column(
     return matches[0]
 
 
+def validated_integer_labels(
+    source: pd.Series,
+    split_name: str,
+    role: str,
+    minimum: int,
+    maximum: int,
+) -> np.ndarray:
+    """Parse one complete bounded integer-label column with useful errors."""
+
+    if source.isna().any():
+        rows = source.index[source.isna()].tolist()[:10]
+        raise ValueError(f"{split_name}: missing {role} labels at rows {rows}")
+    numeric = pd.to_numeric(source, errors="coerce")
+    values = numeric.to_numpy(dtype=float)
+    # Labels are categorical IDs, so even a small fractional component is an
+    # error rather than a value to tolerate as approximate floating point.
+    invalid = ~np.isfinite(values) | (values != np.rint(values))
+    if invalid.any():
+        rows = np.flatnonzero(invalid)[:10].tolist()
+        raise ValueError(f"{split_name}: non-integer {role} labels at rows {rows}")
+    labels = np.rint(values).astype(np.int64)
+    outside = (labels < minimum) | (labels > maximum)
+    if outside.any():
+        bad = sorted(set(labels[outside].tolist()))
+        raise ValueError(
+            f"{split_name}: {role} labels outside [{minimum}, {maximum}]: {bad}"
+        )
+    return labels
+
+
+def auxiliary_labels_from_19(labels: Sequence[int]) -> dict[int, np.ndarray]:
+    """Return official 3/5/7-level labels for legal 19-level labels."""
+
+    values = np.asarray(labels, dtype=np.int64)
+    if values.ndim != 1 or ((values < 1) | (values > 19)).any():
+        raise ValueError("19-level labels must be a 1D array within [1, 19]")
+    return {
+        3: LABEL3_FROM_19[values],
+        5: LABEL5_FROM_19[values],
+        7: LABEL7_FROM_19[values],
+    }
+
+
+def run_auxiliary_mapping_check() -> None:
+    """Verify all 19 official mappings and zero-based CE ranges."""
+
+    labels19 = np.arange(1, 20, dtype=np.int64)
+    mapped = auxiliary_labels_from_19(labels19)
+    expected = {
+        3: [1] * 11 + [2] * 2 + [3] * 6,
+        5: [1] * 7 + [2] * 4 + [3] * 2 + [4] * 2 + [5] * 4,
+        7: [1] * 4 + [2] * 3 + [3] * 2 + [4] * 2 + [5] * 2 + [6] * 2 + [7] * 4,
+    }
+    for level_count, wanted in expected.items():
+        if mapped[level_count].tolist() != wanted:
+            raise AssertionError(f"Official {level_count}-level mapping check failed")
+        zero_based = mapped[level_count] - 1
+        if int(zero_based.min()) != 0 or int(zero_based.max()) != level_count - 1:
+            raise AssertionError(
+                f"Zero-based {level_count}-level CE range check failed"
+            )
+
+
 def load_split(
     path: Path,
     split_name: str,
@@ -405,8 +561,36 @@ def load_split(
         "label",
         required=require_label,
     )
+    require_auxiliary = require_label and config.MODEL_MODE == "cascaded_hmtl"
+    label_3_column = resolve_column(
+        columns,
+        config.LABEL_3_COLUMN,
+        LABEL_3_ALIASES,
+        "3-level label",
+        required=require_auxiliary,
+    )
+    label_5_column = resolve_column(
+        columns,
+        config.LABEL_5_COLUMN,
+        LABEL_5_ALIASES,
+        "5-level label",
+        required=require_auxiliary,
+    )
+    label_7_column = resolve_column(
+        columns,
+        config.LABEL_7_COLUMN,
+        LABEL_7_ALIASES,
+        "7-level label",
+        required=require_auxiliary,
+    )
     document_column = resolve_column(
         columns, "Document", DOCUMENT_ALIASES, "document", required=False
+    )
+    domain_column = resolve_column(
+        columns, "Domain", DOMAIN_ALIASES, "domain", required=False
+    )
+    text_class_column = resolve_column(
+        columns, "Text_Class", TEXT_CLASS_ALIASES, "text class", required=False
     )
     assert id_column is not None and text_column is not None
 
@@ -436,32 +620,47 @@ def load_split(
         )
 
     frame["_label"] = np.nan
+    frame["_label3"] = -1
+    frame["_label5"] = -1
+    frame["_label7"] = -1
     if label_column is not None:
         label_source = frame[label_column]
         if not require_label and label_source.isna().all():
             label_column = None
         else:
-            if label_source.isna().any():
-                rows = frame.index[label_source.isna()].tolist()[:10]
-                raise ValueError(f"{split_name}: missing labels at rows {rows}")
-            numeric = pd.to_numeric(label_source, errors="coerce")
-            invalid_numeric = numeric.isna() | ~np.isfinite(numeric.to_numpy(dtype=float))
-            non_integer = ~np.isclose(
-                numeric.to_numpy(dtype=float), np.rint(numeric.to_numpy(dtype=float))
+            labels = validated_integer_labels(
+                label_source,
+                split_name,
+                "19-level",
+                config.MIN_LABEL,
+                config.MAX_LABEL,
             )
-            invalid = invalid_numeric.to_numpy() | non_integer
-            if invalid.any():
-                rows = np.flatnonzero(invalid)[:10].tolist()
-                raise ValueError(f"{split_name}: non-integer labels at rows {rows}")
-            labels = np.rint(numeric.to_numpy(dtype=float)).astype(np.int64)
-            outside = (labels < config.MIN_LABEL) | (labels > config.MAX_LABEL)
-            if outside.any():
-                bad = sorted(set(labels[outside].tolist()))
-                raise ValueError(
-                    f"{split_name}: labels outside [{config.MIN_LABEL}, "
-                    f"{config.MAX_LABEL}]: {bad}"
-                )
             frame["_label"] = labels
+            expected_auxiliary = auxiliary_labels_from_19(labels)
+            auxiliary_columns = {
+                3: label_3_column,
+                5: label_5_column,
+                7: label_7_column,
+            }
+            for level_count, auxiliary_column in auxiliary_columns.items():
+                actual = expected_auxiliary[level_count]
+                if auxiliary_column is not None:
+                    actual = validated_integer_labels(
+                        frame[auxiliary_column],
+                        split_name,
+                        f"{level_count}-level",
+                        1,
+                        level_count,
+                    )
+                    mismatch = actual != expected_auxiliary[level_count]
+                    if mismatch.any():
+                        rows = np.flatnonzero(mismatch)[:10].tolist()
+                        raise ValueError(
+                            f"{split_name}: {level_count}-level labels do not "
+                            f"match the official 19→{level_count} mapping at rows {rows}"
+                        )
+                # CrossEntropyLoss expects zero-based class indices.
+                frame[f"_label{level_count}"] = actual - 1
 
     if document_column is not None:
         frame["_document"] = frame[document_column].map(
@@ -469,8 +668,21 @@ def load_split(
         )
     else:
         frame["_document"] = None
+    frame["_domain"] = (
+        frame[domain_column].map(lambda value: None if pd.isna(value) else str(value))
+        if domain_column is not None
+        else None
+    )
+    frame["_text_class"] = (
+        frame[text_class_column].map(
+            lambda value: None if pd.isna(value) else str(value)
+        )
+        if text_class_column is not None
+        else None
+    )
     frame["_original_index"] = np.arange(len(frame), dtype=np.int64)
     frame.attrs["has_labels"] = label_column is not None
+    frame.attrs["has_auxiliary_labels"] = label_column is not None
     frame.attrs["source_path"] = str(path)
     return frame
 
@@ -524,6 +736,20 @@ def log_split_summary(name: str, frame: pd.DataFrame, config: Config) -> None:
             for label in range(config.MIN_LABEL, config.MAX_LABEL + 1)
         }
         LOGGER.info("%s label distribution: %s", name, distribution)
+        if config.MODEL_MODE == "cascaded_hmtl":
+            for level_count in (3, 5, 7):
+                auxiliary_counts = (
+                    frame[f"_label{level_count}"].astype(int) + 1
+                ).value_counts().sort_index()
+                LOGGER.info(
+                    "%s %d-level distribution: %s",
+                    name,
+                    level_count,
+                    {
+                        label: int(auxiliary_counts.get(label, 0))
+                        for label in range(1, level_count + 1)
+                    },
+                )
 
 
 def smoke_subset(frame: pd.DataFrame, size: int) -> pd.DataFrame:
@@ -542,77 +768,295 @@ def smoke_subset(frame: pd.DataFrame, size: int) -> pd.DataFrame:
 
 @dataclass(frozen=True)
 class PreprocessResult:
-    """One preprocessed sentence and an optional fallback diagnostic."""
+    """Parallel text views, sentence statistics, and an optional diagnostic."""
 
-    text: str
+    d3tok_text: str
+    surface_text: str
+    diacritic_coverage: float
+    word_count: int
+    word_length_mean: float
+    word_length_std: float
     error: Optional[str]
 
 
 class ArabicD3TokPreprocessor:
-    """Apply Unicode normalization, Tatweel removal, D3Tok, then dediacritize."""
+    """Keep diacritics for BERT D3Tok, then build normalized model views."""
 
-    def __init__(self, resource: str) -> None:
+    def __init__(self, resource: str, *, use_gpu: Optional[bool] = None) -> None:
         try:
-            from camel_tools.disambig.mle import MLEDisambiguator
-            from camel_tools.tokenizers.morphological import MorphologicalTokenizer
+            from camel_tools.disambig.bert import BERTUnfactoredDisambiguator
             from camel_tools.tokenizers.word import simple_word_tokenize
             from camel_tools.utils.dediac import dediac_ar
             from camel_tools.utils.normalize import normalize_unicode
         except ImportError as error:
             raise RuntimeError(
-                "CAMeL Tools is required for real D3Tok. Install requirements.txt first."
+                "CAMeL Tools with the BERT unfactored disambiguator is required "
+                "for official D3Tok. Install requirements.txt first."
             ) from error
 
         self._simple_word_tokenize = simple_word_tokenize
         self._dediac_ar = dediac_ar
         self._normalize_unicode = normalize_unicode
-        disambiguator = MLEDisambiguator.pretrained(resource)
-        self._d3tok = MorphologicalTokenizer(
-            disambiguator=disambiguator,
-            scheme="d3tok",
-            split=True,
-            diac=True,
+        use_gpu = torch.cuda.is_available() if use_gpu is None else use_gpu
+        self._disambiguator = BERTUnfactoredDisambiguator.pretrained(
+            model_name=resource,
+            pretrained_cache=False,
+            top=1,
+            use_gpu=use_gpu,
         )
 
-    def normalize_and_remove_tatweel(self, text: str) -> str:
-        """Perform compatibility Unicode normalization and remove only U+0640."""
+    def normalize_keep_diacritics(self, text: str) -> str:
+        """Normalize Unicode and remove Kashida without deleting diacritics."""
 
         normalized = self._normalize_unicode(text, compatibility=True)
-        return normalized.replace(TATWEEL, "")
+        normalized = normalized.replace(TATWEEL, "")
+        return re.sub(r"(?<=\B)ى(?=\B)", "ي", normalized)
 
-    def fallback(self, normalized_text: str) -> str:
-        """Preserve normalized content when morphological tokenization fails."""
+    def surface_view(self, normalized_text: str) -> str:
+        """Remove Arabic diacritics while preserving words and punctuation."""
 
         return self._dediac_ar(normalized_text).replace(TATWEEL, "")
 
+    def sentence_statistics(
+        self,
+        normalized_text: str,
+        surface_text: str,
+    ) -> tuple[float, int, float, float]:
+        """Compute DC before dediacritization and length stats on Surface view."""
+
+        diacritic_count = sum(char in ARABIC_DIACRITICS for char in normalized_text)
+        diacritic_coverage = (
+            0.0
+            if not normalized_text
+            else float(diacritic_count / len(normalized_text))
+        )
+        surface_tokens = self._simple_word_tokenize(
+            surface_text,
+            split_digits=True,
+        )
+        lengths = np.asarray(
+            [len(token) for token in surface_tokens],
+            dtype=np.float32,
+        )
+        if not len(lengths):
+            return diacritic_coverage, 0, 0.0, 0.0
+        return (
+            diacritic_coverage,
+            int(len(lengths)),
+            float(lengths.mean()),
+            float(lengths.std()),
+        )
+
+    @staticmethod
+    def _is_diacritic_only(token: str) -> bool:
+        """Return whether a tokenizer item contains Arabic marks and no base."""
+
+        return bool(token) and all(char in ARABIC_DIACRITICS for char in token)
+
+    @staticmethod
+    def _contains_arabic_letter(token: str) -> bool:
+        """Return whether a token contains an Arabic-script letter."""
+
+        return any(
+            (
+                "\u0600" <= char <= "\u06ff"
+                or "\u0750" <= char <= "\u077f"
+                or "\u08a0" <= char <= "\u08ff"
+            )
+            and unicodedata.category(char).startswith("L")
+            for char in token
+        )
+
+    def tokenize_for_d3tok(self, normalized_text: str) -> list[str]:
+        """Repair detached marks and remove mark-only items before BERT."""
+
+        raw_tokens = self._simple_word_tokenize(
+            normalized_text,
+            split_digits=True,
+        )
+        repaired_tokens: list[str] = []
+        for token in raw_tokens:
+            if self._is_diacritic_only(token):
+                if (
+                    repaired_tokens
+                    and self._contains_arabic_letter(repaired_tokens[-1])
+                ):
+                    repaired_tokens[-1] += token
+                # A leading mark or a mark after punctuation has no lexical
+                # base for morphological analysis. DC was already computed on
+                # the untouched normalized sentence, so dropping it here does
+                # not alter the orthographic statistic.
+                continue
+            repaired_tokens.append(token)
+        if not repaired_tokens:
+            raise ValueError("D3Tok tokenization produced no lexical content")
+        if any(self._is_diacritic_only(token) for token in repaired_tokens):
+            raise AssertionError("A detached Arabic diacritic reached BERT D3Tok")
+        return repaired_tokens
+
+    def _render_d3tok_sentence(
+        self,
+        sentence_analysis: Sequence[Any],
+        input_tokens: Sequence[str],
+    ) -> tuple[str, Optional[str]]:
+        """Render D3Tok, falling back only for individual unanalyzable tokens."""
+
+        rendered_words: list[str] = []
+        fallback_positions: list[int] = []
+        if len(sentence_analysis) != len(input_tokens):
+            raise RuntimeError(
+                "BERT D3Tok token/analysis length mismatch: "
+                f"tokens={len(input_tokens)}, analyses={len(sentence_analysis)}"
+            )
+        for position, (item, input_token) in enumerate(
+            zip(sentence_analysis, input_tokens)
+        ):
+            analysis: Mapping[str, Any] = {}
+            if item.analyses:
+                scored_analysis = item.analyses[0]
+                analysis = (
+                    scored_analysis.analysis
+                    if hasattr(scored_analysis, "analysis")
+                    else scored_analysis[1]
+                )
+            d3tok = analysis.get("d3tok")
+            if d3tok is None:
+                fallback_token = self._dediac_ar(input_token).replace(TATWEEL, "")
+                if not fallback_token.strip():
+                    raise ValueError(
+                        "BERT D3Tok token fallback produced no content at "
+                        f"position {position}"
+                    )
+                rendered_words.append(fallback_token)
+                fallback_positions.append(position)
+                continue
+            rendered_words.append(
+                self._dediac_ar(str(d3tok))
+                .replace("_+", " +")
+                .replace("+_", "+ ")
+            )
+        processed = " ".join(rendered_words)
+        if not processed.strip():
+            raise ValueError("BERT D3Tok returned no content")
+        diagnostic = (
+            None
+            if not fallback_positions
+            else "TokenD3TokFallback: positions="
+            + ",".join(str(position) for position in fallback_positions)
+        )
+        return processed, diagnostic
+
+    def process_many(self, texts: Sequence[str]) -> list[PreprocessResult]:
+        """Process a batch through BERT, isolating any per-row failures."""
+
+        results: list[Optional[PreprocessResult]] = [None] * len(texts)
+        valid_indices: list[int] = []
+        surface_texts: list[str] = [""] * len(texts)
+        statistics: list[tuple[float, int, float, float]] = [
+            (0.0, 0, 0.0, 0.0)
+        ] * len(texts)
+        tokenized_sentences: list[list[str]] = []
+
+        for index, text in enumerate(texts):
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("D3Tok received an empty/non-string sentence")
+            try:
+                normalized = self.normalize_keep_diacritics(text)
+            except Exception as error:
+                normalized = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
+                surface = self.surface_view(normalized)
+                dc, wc, wla, wls = self.sentence_statistics(normalized, surface)
+                results[index] = PreprocessResult(
+                    surface,
+                    surface,
+                    dc,
+                    wc,
+                    wla,
+                    wls,
+                    f"UnicodeNormalizationError: {type(error).__name__}: {error}",
+                )
+                continue
+            surface = self.surface_view(normalized)
+            if not surface.strip():
+                raise ValueError("Surface preprocessing produced no content")
+            surface_texts[index] = surface
+            statistics[index] = self.sentence_statistics(normalized, surface)
+            valid_indices.append(index)
+            tokenized_sentences.append(self.tokenize_for_d3tok(normalized))
+
+        if tokenized_sentences:
+            try:
+                analyzed_sentences = self._disambiguator.disambiguate_sentences(
+                    tokenized_sentences
+                )
+                if len(analyzed_sentences) != len(tokenized_sentences):
+                    raise RuntimeError(
+                        "BERT D3Tok returned a different number of sentences"
+                    )
+                for index, sentence_analysis, words in zip(
+                    valid_indices,
+                    analyzed_sentences,
+                    tokenized_sentences,
+                ):
+                    dc, wc, wla, wls = statistics[index]
+                    d3tok_text, diagnostic = self._render_d3tok_sentence(
+                        sentence_analysis,
+                        words,
+                    )
+                    results[index] = PreprocessResult(
+                        d3tok_text,
+                        surface_texts[index],
+                        dc,
+                        wc,
+                        wla,
+                        wls,
+                        diagnostic,
+                    )
+            except Exception as batch_error:
+                # A malformed row should not force every row in a BERT batch to
+                # fall back. Retry individually so diagnostics remain exact.
+                for index, words in zip(valid_indices, tokenized_sentences):
+                    try:
+                        sentence_analysis = self._disambiguator.disambiguate_sentences(
+                            [words]
+                        )[0]
+                        dc, wc, wla, wls = statistics[index]
+                        d3tok_text, diagnostic = self._render_d3tok_sentence(
+                            sentence_analysis,
+                            words,
+                        )
+                        results[index] = PreprocessResult(
+                            d3tok_text,
+                            surface_texts[index],
+                            dc,
+                            wc,
+                            wla,
+                            wls,
+                            diagnostic,
+                        )
+                    except Exception as row_error:
+                        dc, wc, wla, wls = statistics[index]
+                        results[index] = PreprocessResult(
+                            surface_texts[index],
+                            surface_texts[index],
+                            dc,
+                            wc,
+                            wla,
+                            wls,
+                            "D3TokError: "
+                            f"{type(row_error).__name__}: {row_error}; "
+                            "batch_error="
+                            f"{type(batch_error).__name__}: {batch_error}",
+                        )
+
+        if any(result is None for result in results):
+            raise RuntimeError("BERT D3Tok preprocessing left an unresolved row")
+        return [result for result in results if result is not None]
+
     def process(self, text: str) -> PreprocessResult:
-        """Preprocess one sentence, using a content-preserving per-row fallback."""
+        """Preprocess one sentence using the same path as batched inference."""
 
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("D3Tok received an empty/non-string sentence")
-        try:
-            normalized = self.normalize_and_remove_tatweel(text)
-        except Exception as error:
-            normalized = unicodedata.normalize("NFKC", text).replace(TATWEEL, "")
-            fallback = self._dediac_ar(normalized)
-            return PreprocessResult(
-                fallback,
-                f"UnicodeNormalizationError: {type(error).__name__}: {error}",
-            )
-
-        try:
-            words = self._simple_word_tokenize(normalized)
-            d3_tokens = self._d3tok.tokenize(words)
-            output_tokens = [self._dediac_ar(str(token)) for token in d3_tokens]
-            processed = " ".join(token for token in output_tokens if token != "")
-            if normalized.strip() and not processed.strip():
-                raise ValueError("D3Tok returned no content")
-            return PreprocessResult(processed, None)
-        except Exception as error:
-            return PreprocessResult(
-                self.fallback(normalized),
-                f"D3TokError: {type(error).__name__}: {error}",
-            )
+        return self.process_many([text])[0]
 
 
 def camel_data_install_command(package: str) -> list[str]:
@@ -625,7 +1069,7 @@ def camel_data_install_command(package: str) -> list[str]:
 
 
 def create_preprocessor(config: Config, *, allow_download: bool) -> ArabicD3TokPreprocessor:
-    """Load D3Tok and optionally install CAMeL's light data bundle once."""
+    """Load BERT D3Tok and optionally install its CAMeL data package once."""
 
     try:
         return ArabicD3TokPreprocessor(config.D3TOK_RESOURCE)
@@ -655,19 +1099,44 @@ def create_preprocessor(config: Config, *, allow_download: bool) -> ArabicD3TokP
 
 
 _PROCESS_PREPROCESSOR: Optional[ArabicD3TokPreprocessor] = None
+PreprocessedRow = tuple[
+    str,
+    str,
+    str,
+    float,
+    int,
+    float,
+    float,
+    Optional[str],
+]
 
 
 def _preprocess_worker_init(resource: str) -> None:
     global _PROCESS_PREPROCESSOR
-    _PROCESS_PREPROCESSOR = ArabicD3TokPreprocessor(resource)
+    # Multiple spawned workers must not each allocate a full BERT tagger on
+    # the same GPU. The default single-process path still uses CUDA when present.
+    _PROCESS_PREPROCESSOR = ArabicD3TokPreprocessor(resource, use_gpu=False)
 
 
-def _preprocess_worker_item(item: tuple[str, str]) -> tuple[str, str, Optional[str]]:
+def _preprocess_worker_batch(
+    items: Sequence[tuple[str, str]],
+) -> list[PreprocessedRow]:
     if _PROCESS_PREPROCESSOR is None:
         raise RuntimeError("Preprocessing worker was not initialized")
-    row_id, text = item
-    result = _PROCESS_PREPROCESSOR.process(text)
-    return row_id, result.text, result.error
+    results = _PROCESS_PREPROCESSOR.process_many([text for _, text in items])
+    return [
+        (
+            row_id,
+            result.d3tok_text,
+            result.surface_text,
+            result.diacritic_coverage,
+            result.word_count,
+            result.word_length_mean,
+            result.word_length_std,
+            result.error,
+        )
+        for (row_id, _), result in zip(items, results)
+    ]
 
 
 def package_version(package: str) -> str:
@@ -695,9 +1164,18 @@ def preprocessing_fingerprint(
         "id_column": config.ID_COLUMN,
         "text_column": config.TEXT_COLUMN,
         "resource": config.D3TOK_RESOURCE,
-        "unicode": "CAMeL normalize_unicode compatibility=True",
-        "tatweel": "remove U+0640 before D3Tok",
-        "dediac": "CAMeL dediac_ar after D3Tok",
+        "normalization": "CAMeL normalize_unicode compatibility=True",
+        "kashida": "remove U+0640 while retaining Arabic diacritics",
+        "disambiguator": "BERTUnfactoredDisambiguator top=1 sees diacritics",
+        "detached_diacritics": (
+            "reattach mark-only tokens to the preceding Arabic word and drop "
+            "residual mark-only tokens before BERT"
+        ),
+        "segmentation": "analysis['d3tok'] with _+ and +_ boundary conversion",
+        "token_fallback": "missing d3tok falls back per-token, not per-sentence",
+        "dediac": "CAMeL dediac_ar after BERT D3Tok and on Surface view",
+        "statistics": "DC before dediac; WC/WLA/WLS on Surface tokens",
+        "punctuation": "preserved in D3Tok and Surface views",
         "camel_tools": package_version("camel-tools"),
     }
     digest.update(json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8"))
@@ -712,39 +1190,90 @@ def preprocessing_fingerprint(
 
 
 def run_arabic_preprocessing_checks(preprocessor: ArabicD3TokPreprocessor) -> None:
-    """Exercise Tatweel removal, true D3Tok, dediacritization, and fallback."""
+    """Exercise the fixed diacritics-aware preprocessing order and fallback."""
 
     sample = "الكتــــابُ مفيدٌ."
-    normalized = preprocessor.normalize_and_remove_tatweel(sample)
+    normalized = preprocessor.normalize_keep_diacritics(sample)
     if TATWEEL in normalized:
-        raise AssertionError("Tatweel removal check failed")
+        raise AssertionError("Kashida removal check failed")
+    if not any(char in ARABIC_DIACRITICS for char in normalized):
+        raise AssertionError("Diacritics must remain available to BERT D3Tok")
+    detached_probe = preprocessor.tokenize_for_d3tok("الله ُ، ِ عَلَى")
+    if not any(
+        token.startswith("الله") and "\u064f" in token
+        for token in detached_probe
+    ):
+        raise AssertionError("Detached diacritic was not reattached to its word")
+    detached_mark_probes = (
+        detached_probe,
+        preprocessor.tokenize_for_d3tok("ِ عَلَى قُوَّةِ المُؤْمِنِ."),
+        preprocessor.tokenize_for_d3tok("(حَدِيثَة)ً تَحْتَ الصّورَةِ"),
+        preprocessor.tokenize_for_d3tok("كلمة ٔ أخرى"),
+        preprocessor.tokenize_for_d3tok("لفظ ۤ آخر"),
+    )
+    if any(
+        preprocessor._is_diacritic_only(token)
+        for tokens in detached_mark_probes
+        for token in tokens
+    ):
+        raise AssertionError("A mark-only token survived D3Tok preparation")
     result = preprocessor.process(sample)
-    if not result.text.strip():
+    if not result.d3tok_text.strip() or not result.surface_text.strip():
         raise AssertionError("D3Tok content-preservation check failed")
-    if TATWEEL in result.text or any(char in ARABIC_DIACRITICS for char in result.text):
+    if TATWEEL in result.d3tok_text or any(
+        char in ARABIC_DIACRITICS for char in result.d3tok_text
+    ):
         raise AssertionError("Post-D3Tok Tatweel/diacritic check failed")
-    plus_probe = preprocessor.fallback("ال+كِتَابُ")
+    if any(char in ARABIC_DIACRITICS for char in result.surface_text):
+        raise AssertionError("Surface view must be dediacritized")
+    if "." not in result.d3tok_text or "." not in result.surface_text:
+        raise AssertionError("Punctuation must be preserved in both text views")
+    plus_probe = preprocessor.surface_view("ال+كِتَابُ")
     if "+" not in plus_probe or any(char in ARABIC_DIACRITICS for char in plus_probe):
         raise AssertionError("dediac_ar must retain D3Tok's '+' marker")
-    fallback_probe = preprocessor.fallback(normalized)
+    fallback_probe = preprocessor.surface_view(normalized)
     if not fallback_probe.strip() or TATWEEL in fallback_probe:
         raise AssertionError("Fallback content-preservation check failed")
+    if result.word_count <= 0 or result.word_length_mean <= 0.0:
+        raise AssertionError("Surface statistics must be positive for the probe")
+    expected_dc = sum(char in ARABIC_DIACRITICS for char in normalized) / len(
+        normalized
+    )
+    if not math.isclose(result.diacritic_coverage, expected_dc):
+        raise AssertionError("Diacritic coverage was not computed before dediac")
 
-    class _ForcedD3TokFailure:
-        def tokenize(self, words: Sequence[str]) -> list[str]:
-            del words
+    class _MissingD3TokItem:
+        analyses = [
+            type("_ScoredAnalysis", (), {"analysis": {"diac": "كِتاب"}})()
+        ]
+
+    token_fallback_text, token_fallback_error = preprocessor._render_d3tok_sentence(
+        [_MissingD3TokItem()],
+        ["كِتاب"],
+    )
+    if token_fallback_text != "كتاب" or not (
+        token_fallback_error
+        and token_fallback_error.startswith("TokenD3TokFallback:")
+    ):
+        raise AssertionError("Per-token missing-d3tok fallback check failed")
+
+    class _ForcedBERTD3TokFailure:
+        def disambiguate_sentences(
+            self, sentences: Sequence[Sequence[str]]
+        ) -> list[Any]:
+            del sentences
             raise RuntimeError("forced internal fallback check")
 
-    real_d3tok = preprocessor._d3tok
+    real_disambiguator = preprocessor._disambiguator
     try:
-        preprocessor._d3tok = _ForcedD3TokFailure()
+        preprocessor._disambiguator = _ForcedBERTD3TokFailure()
         forced_fallback = preprocessor.process(sample)
     finally:
-        preprocessor._d3tok = real_d3tok
+        preprocessor._disambiguator = real_disambiguator
     if not forced_fallback.error or not forced_fallback.error.startswith("D3TokError:"):
         raise AssertionError("Forced D3Tok failure was not diagnosed")
-    if not forced_fallback.text.strip() or any(
-        char in ARABIC_DIACRITICS for char in forced_fallback.text
+    if not forced_fallback.d3tok_text.strip() or any(
+        char in ARABIC_DIACRITICS for char in forced_fallback.d3tok_text
     ):
         raise AssertionError("Forced D3Tok fallback did not preserve clean content")
 
@@ -758,43 +1287,82 @@ def build_preprocessing_cache(
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     items = list(zip(frame["_id"].astype(str), frame["_text"].astype(str)))
-    rows: list[tuple[str, str, Optional[str]]]
+    item_batches = [
+        items[start : start + config.D3TOK_BATCH_SIZE]
+        for start in range(0, len(items), config.D3TOK_BATCH_SIZE)
+    ]
+    rows: list[PreprocessedRow]
 
     if config.PREPROCESS_NUM_WORKERS > 1:
         probe = create_preprocessor(config, allow_download=True)
         run_arabic_preprocessing_checks(probe)
         del probe
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         with ProcessPoolExecutor(
             max_workers=config.PREPROCESS_NUM_WORKERS,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_preprocess_worker_init,
             initargs=(config.D3TOK_RESOURCE,),
         ) as executor:
-            rows = list(
-                tqdm(
-                    executor.map(_preprocess_worker_item, items, chunksize=32),
-                    total=len(items),
-                    desc=f"D3Tok {cache_path.stem}",
+            rows = [
+                row
+                for batch_rows in tqdm(
+                    executor.map(_preprocess_worker_batch, item_batches, chunksize=1),
+                    total=len(item_batches),
+                    desc=f"BERT D3Tok {cache_path.stem}",
                 )
-            )
+                for row in batch_rows
+            ]
     else:
         preprocessor = create_preprocessor(config, allow_download=True)
         run_arabic_preprocessing_checks(preprocessor)
         rows = []
-        for row_id, text in tqdm(items, desc=f"D3Tok {cache_path.stem}"):
-            result = preprocessor.process(text)
-            rows.append((row_id, result.text, result.error))
+        for item_batch in tqdm(
+            item_batches,
+            desc=f"BERT D3Tok {cache_path.stem}",
+        ):
+            results = preprocessor.process_many([text for _, text in item_batch])
+            rows.extend(
+                (
+                    row_id,
+                    result.d3tok_text,
+                    result.surface_text,
+                    result.diacritic_coverage,
+                    result.word_count,
+                    result.word_length_mean,
+                    result.word_length_std,
+                    result.error,
+                )
+                for (row_id, _), result in zip(item_batch, results)
+            )
+        del preprocessor
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     cache_frame = pd.DataFrame(
         {
             "_id": [row[0] for row in rows],
             "_original_index": frame["_original_index"].to_numpy(dtype=np.int64),
-            "_processed_text": [row[1] for row in rows],
-            "_fallback_error": [row[2] for row in rows],
+            "_d3tok_text": [row[1] for row in rows],
+            "_surface_text": [row[2] for row in rows],
+            "_diacritic_coverage": [row[3] for row in rows],
+            "_word_count": [row[4] for row in rows],
+            "_word_length_mean": [row[5] for row in rows],
+            "_word_length_std": [row[6] for row in rows],
+            "_fallback_error": [row[7] for row in rows],
         }
     )
-    if cache_frame["_processed_text"].isna().any() or cache_frame["_processed_text"].eq("").any():
-        raise RuntimeError("Preprocessing produced an empty cached sentence")
+    for text_column in ("_d3tok_text", "_surface_text"):
+        if (
+            cache_frame[text_column].isna().any()
+            or cache_frame[text_column].astype(str).str.strip().eq("").any()
+        ):
+            raise RuntimeError(
+                f"Preprocessing produced an empty cached field: {text_column}"
+            )
     temporary_path = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         cache_frame.to_parquet(temporary_path, index=False)
@@ -815,8 +1383,52 @@ def load_cached_preprocessing(frame: pd.DataFrame, cache_path: Path) -> pd.DataF
     cached_indices = cache_frame["_original_index"].astype(int).tolist()
     if cached_indices != expected_indices:
         raise RuntimeError(f"Cache index mismatch: {cache_path}")
+    required_cache_columns = (
+        "_d3tok_text",
+        "_surface_text",
+        "_diacritic_coverage",
+        "_word_count",
+        "_word_length_mean",
+        "_word_length_std",
+        "_fallback_error",
+    )
+    missing_cache_columns = [
+        column for column in required_cache_columns if column not in cache_frame
+    ]
+    if missing_cache_columns:
+        raise RuntimeError(
+            f"Cache schema is missing {missing_cache_columns}: {cache_path}"
+        )
     output = frame.copy()
-    output["_processed_text"] = cache_frame["_processed_text"].astype(str).to_numpy()
+    output["_d3tok_text"] = cache_frame["_d3tok_text"].astype(str).to_numpy()
+    output["_surface_text"] = cache_frame["_surface_text"].astype(str).to_numpy()
+    output["_diacritic_coverage"] = pd.to_numeric(
+        cache_frame["_diacritic_coverage"],
+        errors="raise",
+    ).to_numpy(dtype=np.float64)
+    output["_word_count"] = pd.to_numeric(
+        cache_frame["_word_count"],
+        errors="raise",
+    ).to_numpy(dtype=np.int64)
+    output["_word_length_mean"] = pd.to_numeric(
+        cache_frame["_word_length_mean"],
+        errors="raise",
+    ).to_numpy(dtype=np.float64)
+    output["_word_length_std"] = pd.to_numeric(
+        cache_frame["_word_length_std"],
+        errors="raise",
+    ).to_numpy(dtype=np.float64)
+    numeric_feature_columns = (
+        "_diacritic_coverage",
+        "_word_length_mean",
+        "_word_length_std",
+    )
+    for column in numeric_feature_columns:
+        values = output[column].to_numpy(dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise RuntimeError(f"Cache contains non-finite values in {column}")
+    if (output["_word_count"].to_numpy(dtype=np.int64) <= 0).any():
+        raise RuntimeError("Cache contains non-positive Surface word counts")
     output["_fallback_error"] = cache_frame["_fallback_error"].to_numpy()
     output.attrs.update(frame.attrs)
     return output
@@ -875,35 +1487,212 @@ def preprocess_split_cached(
 # ---------------------------------------------------------------------------
 
 
+def normalized_metadata_key(value: Any) -> str:
+    """Normalize a small categorical metadata value without leaking row IDs."""
+
+    if value is None or pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip().casefold()).replace("&", "and")
+
+
+def domain_token(value: Any) -> str:
+    """Map the three stable BAREC domains to compact learned tokens."""
+
+    key = normalized_metadata_key(value)
+    mapping = {
+        "arts and humanities": "[DOM_AH]",
+        "social sciences": "[DOM_SS]",
+        "stem": "[DOM_STEM]",
+    }
+    return mapping.get(key, "[DOM_UNKNOWN]")
+
+
+def text_class_token(value: Any) -> str:
+    """Map BAREC readership groups to compact learned tokens."""
+
+    key = normalized_metadata_key(value)
+    mapping = {
+        "foundational": "[TC_FOUNDATIONAL]",
+        "advanced": "[TC_ADVANCED]",
+        "specialized": "[TC_SPECIALIZED]",
+    }
+    return mapping.get(key, "[TC_UNKNOWN]")
+
+
+def structured_feature_groups(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Serialize features as atomic groups ordered from highest to lowest priority."""
+
+    return (
+        f"[WC] {int(row['_word_count'])}",
+        f"[DC] {float(row['_diacritic_coverage']):.3f}",
+        f"[WLA] {float(row['_word_length_mean']):.3f}",
+        f"[WLS] {float(row['_word_length_std']):.3f}",
+        domain_token(row.get("_domain")),
+        text_class_token(row.get("_text_class")),
+    )
+
+
+def structured_feature_text(row: Mapping[str, Any]) -> str:
+    """Return the complete feature block for logging and diagnostics."""
+
+    return " ".join(structured_feature_groups(row))
+
+
+def validate_structured_tokenizer(tokenizer: Any) -> None:
+    """Ensure every field marker is atomic and the pair separator is available."""
+
+    if tokenizer.sep_token is None or tokenizer.sep_token_id is None:
+        raise RuntimeError("The tokenizer must define a [SEP] token for paired input")
+    for token in FIELD_TOKENS:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        encoded = tokenizer.encode(token, add_special_tokens=False)
+        if (
+            token_id is None
+            or token_id == tokenizer.unk_token_id
+            or encoded != [token_id]
+        ):
+            raise RuntimeError(
+                f"Structured field token is not encoded atomically: {token}"
+            )
+
+
+def encode_structured_pair(
+    tokenizer: Any,
+    d3tok_text: str,
+    surface_text: str,
+    feature_groups: Sequence[str],
+    max_length: int,
+) -> dict[str, Any]:
+    """Keep D3Tok/Surface first, then retain the largest priority feature prefix."""
+
+    d3tok_ids = tokenizer.encode(d3tok_text, add_special_tokens=False)
+    surface_ids = tokenizer.encode(surface_text, add_special_tokens=False)
+    feature_group_ids = [
+        tokenizer.encode(group, add_special_tokens=False)
+        for group in feature_groups
+    ]
+    if (
+        not d3tok_ids
+        or not surface_ids
+        or not feature_group_ids
+        or any(not group_ids for group_ids in feature_group_ids)
+    ):
+        raise ValueError("Structured pair contains an empty tokenized component")
+
+    pair_special_tokens = int(tokenizer.num_special_tokens_to_add(pair=True))
+    d3tok_only_length = pair_special_tokens + len(d3tok_ids)
+    if d3tok_only_length > max_length:
+        raise ValueError(
+            "D3Tok alone exceeds MAX_LENGTH. D3Tok was not truncated; this "
+            "sample requires a chunking strategy. "
+            f"d3tok_tokens={len(d3tok_ids)}, pair_special_tokens="
+            f"{pair_special_tokens}, max_length={max_length}"
+        )
+
+    # First try the complete Surface and every atomic feature group. If that
+    # overflows, remove whole groups from the lowest-priority end. Only after
+    # every feature is gone may Surface be truncated.
+    selected_group_ids = list(feature_group_ids)
+
+    def encoded_length() -> int:
+        feature_length = sum(len(group_ids) for group_ids in selected_group_ids)
+        feature_separator = 1 if selected_group_ids else 0
+        return (
+            pair_special_tokens
+            + len(d3tok_ids)
+            + len(surface_ids)
+            + feature_separator
+            + feature_length
+        )
+
+    while selected_group_ids and encoded_length() > max_length:
+        selected_group_ids.pop()
+
+    if encoded_length() > max_length:
+        surface_budget = max_length - pair_special_tokens - len(d3tok_ids)
+        surface_ids = surface_ids[: max(0, surface_budget)]
+
+    selected_feature_ids = [
+        token_id
+        for group_ids in selected_group_ids
+        for token_id in group_ids
+    ]
+    paired_ids = list(surface_ids)
+    if selected_feature_ids:
+        paired_ids.append(int(tokenizer.sep_token_id))
+        paired_ids.extend(selected_feature_ids)
+
+    encoded = dict(
+        tokenizer.prepare_for_model(
+            d3tok_ids,
+            pair_ids=paired_ids,
+            add_special_tokens=True,
+            padding=False,
+            truncation=False,
+            return_attention_mask=True,
+            return_token_type_ids=True,
+        )
+    )
+    if len(encoded["input_ids"]) > max_length:
+        raise AssertionError("Reserved structured input exceeded MAX_LENGTH")
+    encoded_d3tok_ids = encoded["input_ids"][1 : 1 + len(d3tok_ids)]
+    if encoded_d3tok_ids != d3tok_ids:
+        raise AssertionError("D3Tok was altered or truncated during pair encoding")
+    if selected_feature_ids:
+        feature_start = len(encoded["input_ids"]) - 1 - len(selected_feature_ids)
+        if encoded["input_ids"][feature_start:-1] != selected_feature_ids:
+            raise AssertionError(
+                "A selected structured feature group was altered during encoding"
+            )
+    return encoded
+
+
 class BARECDataset(Dataset[dict[str, Any]]):
-    """Tokenize cached D3Tok sentences lazily while retaining IDs and row indices."""
+    """Encode D3Tok as segment A and Surface/features as segment B."""
 
     def __init__(self, frame: pd.DataFrame, tokenizer: Any, max_length: int) -> None:
-        self.texts = frame["_processed_text"].astype(str).tolist()
+        self.d3tok_texts = frame["_d3tok_text"].astype(str).tolist()
+        rows = frame.to_dict(orient="records")
+        self.surface_texts = [str(row["_surface_text"]) for row in rows]
+        self.feature_groups = [structured_feature_groups(row) for row in rows]
         self.ids = frame["_id"].astype(str).tolist()
         self.indices = frame["_original_index"].astype(int).tolist()
         self.has_labels = bool(frame.attrs.get("has_labels", False))
         self.labels = (
             frame["_label"].astype(float).tolist() if self.has_labels else None
         )
+        self.auxiliary_labels = (
+            {
+                3: frame["_label3"].astype(int).tolist(),
+                5: frame["_label5"].astype(int).tolist(),
+                7: frame["_label7"].astype(int).tolist(),
+            }
+            if self.has_labels
+            else None
+        )
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self) -> int:
-        return len(self.texts)
+        return len(self.d3tok_texts)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        encoded = self.tokenizer(
-            self.texts[index],
-            truncation=True,
-            max_length=self.max_length,
-            padding=False,
+        encoded = encode_structured_pair(
+            self.tokenizer,
+            self.d3tok_texts[index],
+            self.surface_texts[index],
+            self.feature_groups[index],
+            self.max_length,
         )
         item: dict[str, Any] = dict(encoded)
         item["sample_id"] = self.ids[index]
         item["original_index"] = self.indices[index]
         if self.labels is not None:
             item["label"] = self.labels[index]
+            assert self.auxiliary_labels is not None
+            item["label3"] = self.auxiliary_labels[3][index]
+            item["label5"] = self.auxiliary_labels[5][index]
+            item["label7"] = self.auxiliary_labels[7][index]
         return item
 
 
@@ -918,24 +1707,41 @@ class BARECCollator:
         sample_ids: list[str] = []
         indices: list[int] = []
         labels: list[float] = []
+        auxiliary_labels: dict[int, list[int]] = {3: [], 5: [], 7: []}
         labels_present = "label" in features[0]
+        non_model_keys = {
+            "sample_id",
+            "original_index",
+            "label",
+            "label3",
+            "label5",
+            "label7",
+        }
         for feature in features:
             model_features.append(
                 {
                     key: value
                     for key, value in feature.items()
-                    if key not in {"sample_id", "original_index", "label"}
+                    if key not in non_model_keys
                 }
             )
             sample_ids.append(str(feature["sample_id"]))
             indices.append(int(feature["original_index"]))
             if labels_present:
                 labels.append(float(feature["label"]))
+                for level_count in auxiliary_labels:
+                    auxiliary_labels[level_count].append(
+                        int(feature[f"label{level_count}"])
+                    )
         batch = dict(self.tokenizer.pad(model_features, padding=True, return_tensors="pt"))
         batch["sample_ids"] = sample_ids
         batch["original_indices"] = torch.tensor(indices, dtype=torch.long)
         if labels_present:
             batch["labels"] = torch.tensor(labels, dtype=torch.float32)
+            for level_count, values in auxiliary_labels.items():
+                batch[f"labels{level_count}"] = torch.tensor(
+                    values, dtype=torch.long
+                )
         return batch
 
 
@@ -1101,11 +1907,99 @@ class ArabicReadabilityRegressor(nn.Module):
         return self.regression_head(self.dropout(cls_embedding)).squeeze(-1)
 
 
-def unwrap_model(model: nn.Module) -> ArabicReadabilityRegressor:
+class CascadedHierarchicalReadabilityRegressor(nn.Module):
+    """Joint 3→5→7→19 model with differentiable coarse predictions."""
+
+    def __init__(self, model_name: str, dropout: float, temperature: float) -> None:
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(
+            model_name,
+            add_pooling_layer=False,
+        )
+        trainable_pooler_parameters = [
+            name
+            for name, parameter in self.encoder.named_parameters()
+            if parameter.requires_grad and "pooler" in name.lower()
+        ]
+        if trainable_pooler_parameters:
+            raise RuntimeError(
+                "The cascaded CLS model must not retain trainable encoder-pooler "
+                f"parameters: {trainable_pooler_parameters}"
+            )
+        hidden_size = int(self.encoder.config.hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.temperature = float(temperature)
+        self.head3 = nn.Linear(hidden_size, 3)
+        self.head5 = nn.Linear(hidden_size + 3, 5)
+        self.head7 = nn.Linear(hidden_size + 5, 7)
+        self.head19 = nn.Linear(hidden_size + 7, 1)
+
+    @staticmethod
+    def _soft_condition(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        """Build stable differentiable probabilities without detaching logits."""
+
+        probabilities = torch.softmax(logits.float() / temperature, dim=-1)
+        return probabilities.to(dtype=logits.dtype)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        encoder_arguments: dict[str, torch.Tensor] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if token_type_ids is not None:
+            encoder_arguments["token_type_ids"] = token_type_ids
+        outputs = self.encoder(**encoder_arguments)
+        hidden = outputs.last_hidden_state[:, 0, :]
+
+        logits3 = self.head3(self.dropout(hidden))
+        probabilities3 = self._soft_condition(logits3, self.temperature)
+        logits5 = self.head5(self.dropout(torch.cat([hidden, probabilities3], dim=-1)))
+        probabilities5 = self._soft_condition(logits5, self.temperature)
+        logits7 = self.head7(self.dropout(torch.cat([hidden, probabilities5], dim=-1)))
+        probabilities7 = self._soft_condition(logits7, self.temperature)
+        score19 = self.head19(
+            self.dropout(torch.cat([hidden, probabilities7], dim=-1))
+        ).squeeze(-1)
+        return {
+            "score19": score19,
+            "logits3": logits3,
+            "logits5": logits5,
+            "logits7": logits7,
+        }
+
+
+ReadabilityModel = (
+    ArabicReadabilityRegressor | CascadedHierarchicalReadabilityRegressor
+)
+
+
+def create_model(config: Config) -> ReadabilityModel:
+    """Instantiate the selected architecture without changing its checkpoint mode."""
+
+    if config.MODEL_MODE == "baseline_mse":
+        return ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
+    if config.MODEL_MODE == "cascaded_hmtl":
+        return CascadedHierarchicalReadabilityRegressor(
+            config.MODEL_NAME,
+            config.DROPOUT,
+            config.CASCADE_TEMPERATURE,
+        )
+    raise ValueError(f"Unsupported MODEL_MODE: {config.MODEL_MODE!r}")
+
+
+def unwrap_model(model: nn.Module) -> ReadabilityModel:
     """Return the underlying model whether or not DDP wraps it."""
 
     unwrapped = model.module if isinstance(model, DDP) else model
-    if not isinstance(unwrapped, ArabicReadabilityRegressor):
+    if not isinstance(
+        unwrapped,
+        (ArabicReadabilityRegressor, CascadedHierarchicalReadabilityRegressor),
+    ):
         raise TypeError(f"Unexpected model type: {type(unwrapped)}")
     return unwrapped
 
@@ -1131,9 +2025,13 @@ def create_optimizer(model: nn.Module, config: Config) -> AdamW:
 
     base = unwrap_model(model)
     encoder_decay, encoder_no_decay = split_decay_parameters(base.encoder)
-    head_decay, head_no_decay = split_decay_parameters(
-        nn.ModuleList([base.dropout, base.regression_head])
-    )
+    if isinstance(base, ArabicReadabilityRegressor):
+        head_modules = nn.ModuleList([base.dropout, base.regression_head])
+    else:
+        head_modules = nn.ModuleList(
+            [base.dropout, base.head3, base.head5, base.head7, base.head19]
+        )
+    head_decay, head_no_decay = split_decay_parameters(head_modules)
     groups = [
         {
             "params": encoder_decay,
@@ -1194,48 +2092,109 @@ def scaled_optimizer_step(
     return optimizer_stepped, scale_before, scale_after
 
 
-def model_forward(model: nn.Module, batch: Mapping[str, Any]) -> torch.Tensor:
+def model_forward(
+    model: nn.Module, batch: Mapping[str, Any]
+) -> dict[str, torch.Tensor]:
     """Pass only encoder tensors from a collated batch into the model."""
 
-    predictions = model(
+    raw_output = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         token_type_ids=batch.get("token_type_ids"),
     )
-    if predictions.ndim != 1 or predictions.shape[0] != batch["input_ids"].shape[0]:
+    outputs = (
+        {"score19": raw_output}
+        if torch.is_tensor(raw_output)
+        else dict(raw_output)
+    )
+    score19 = outputs.get("score19")
+    if score19 is None or score19.ndim != 1 or score19.shape[0] != batch["input_ids"].shape[0]:
         raise AssertionError(
-            f"Regression output must have shape [batch_size], got {tuple(predictions.shape)}"
+            "Regression output must have shape [batch_size], got "
+            f"{None if score19 is None else tuple(score19.shape)}"
         )
-    return predictions
+    expected_logits = {"logits3": 3, "logits5": 5, "logits7": 7}
+    present_logits = {key for key in expected_logits if key in outputs}
+    if present_logits and present_logits != set(expected_logits):
+        raise AssertionError("Cascaded output must provide all 3/5/7-level logits")
+    for key, class_count in expected_logits.items():
+        if key in outputs and outputs[key].shape != torch.Size(
+            [batch["input_ids"].shape[0], class_count]
+        ):
+            raise AssertionError(
+                f"{key} must have shape [batch_size, {class_count}], "
+                f"got {tuple(outputs[key].shape)}"
+            )
+    return outputs
+
+
+def compute_training_losses(
+    outputs: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    config: Config,
+) -> dict[str, torch.Tensor]:
+    """Calculate the complete FP32 baseline or cascaded joint objective."""
+
+    mse19 = nn.functional.mse_loss(
+        outputs["score19"].float(), batch["labels"].float()
+    )
+    losses = {
+        "mse19": mse19,
+        "ce3": mse19.new_zeros(()),
+        "ce5": mse19.new_zeros(()),
+        "ce7": mse19.new_zeros(()),
+    }
+    if config.MODEL_MODE == "cascaded_hmtl":
+        for level_count in (3, 5, 7):
+            logits_key = f"logits{level_count}"
+            labels_key = f"labels{level_count}"
+            if logits_key not in outputs or labels_key not in batch:
+                raise RuntimeError(
+                    f"Cascaded training requires {logits_key} and {labels_key}"
+                )
+            losses[f"ce{level_count}"] = nn.functional.cross_entropy(
+                outputs[logits_key].float(), batch[labels_key].long()
+            )
+    losses["total"] = (
+        losses["mse19"]
+        + config.AUX_CE3_WEIGHT * losses["ce3"]
+        + config.AUX_CE5_WEIGHT * losses["ce5"]
+        + config.AUX_CE7_WEIGHT * losses["ce7"]
+    )
+    return losses
 
 
 def run_regression_shape_check(
-    model: ArabicReadabilityRegressor,
+    model: ReadabilityModel,
     tokenizer: Any,
-    text: str,
+    d3tok_text: str,
+    surface_text: str,
+    feature_groups: Sequence[str],
     device: torch.device,
     max_length: int,
 ) -> None:
     """Verify batch-one output shape and gradient connectivity before DDP."""
 
-    encoded = tokenizer(
-        text,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
+    encoded = encode_structured_pair(
+        tokenizer,
+        d3tok_text,
+        surface_text,
+        feature_groups,
+        max_length,
+    )
+    token_type_ids = encoded.get("token_type_ids")
+    if token_type_ids is None or not {0, 1}.issubset(set(token_type_ids)):
+        raise AssertionError("Paired input must contain both BERT token-type segments")
+    encoded = dict(
+        tokenizer.pad([encoded], padding=True, return_tensors="pt")
     )
     encoded = {key: value.to(device) for key, value in encoded.items()}
     was_training = model.training
     model.train()
     model.zero_grad(set_to_none=True)
     try:
-        output = model(**encoded)
-        if output.shape != torch.Size([1]):
-            raise AssertionError(
-                "Batch-size-one regression output must have shape [1], "
-                f"got {tuple(output.shape)}"
-            )
-        output.sum().backward()
+        output = model_forward(model, encoded)
+        output["score19"].sum().backward()
         disconnected = [
             name
             for name, parameter in model.named_parameters()
@@ -1264,6 +2223,7 @@ class EvaluationOutput:
     indices: np.ndarray
     raw_predictions: np.ndarray
     final_predictions: np.ndarray
+    up_predictions: np.ndarray
     labels: Optional[np.ndarray]
     metrics: Optional[dict[str, float]]
 
@@ -1272,7 +2232,35 @@ def round_and_clip(raw_predictions: Sequence[float], config: Config) -> np.ndarr
     """Convert regression scores to legal integer readability levels."""
 
     raw = np.asarray(raw_predictions, dtype=np.float64)
+    if not np.isfinite(raw).all():
+        raise ValueError("Raw predictions contain NaN or infinity")
     return np.clip(np.rint(raw), config.MIN_LABEL, config.MAX_LABEL).astype(np.int64)
+
+
+def ceil_and_clip(raw_predictions: Sequence[float], config: Config) -> np.ndarray:
+    """Round every non-integer score upward, then enforce the legal range."""
+
+    raw = np.asarray(raw_predictions, dtype=np.float64)
+    if not np.isfinite(raw).all():
+        raise ValueError("Raw predictions contain NaN or infinity")
+    return np.clip(np.ceil(raw), config.MIN_LABEL, config.MAX_LABEL).astype(np.int64)
+
+
+def run_discretization_checks(config: Config) -> None:
+    """Lock banker rounding, ceiling semantics, clipping, and finite inputs."""
+
+    raw = [0.2, 1.0, 1.5, 2.5, 3.5, 7.0, 7.0001, 18.5, 19.2]
+    if round_and_clip(raw, config).tolist() != [1, 1, 2, 2, 4, 7, 7, 18, 19]:
+        raise AssertionError("np.rint discretization check failed")
+    if ceil_and_clip(raw, config).tolist() != [1, 1, 2, 3, 4, 7, 8, 19, 19]:
+        raise AssertionError("np.ceil discretization check failed")
+    for discretizer in (round_and_clip, ceil_and_clip):
+        try:
+            discretizer([float("nan")], config)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Non-finite prediction was not rejected")
 
 
 def calculate_metrics(
@@ -1283,10 +2271,19 @@ def calculate_metrics(
     truth = np.asarray(labels, dtype=np.int64)
     raw = np.asarray(raw_predictions, dtype=np.float64)
     final = round_and_clip(raw, config)
+    up = ceil_and_clip(raw, config)
     qwk = float(
         cohen_kappa_score(
             truth,
             final,
+            weights="quadratic",
+            labels=list(range(config.MIN_LABEL, config.MAX_LABEL + 1)),
+        )
+    )
+    up_qwk = float(
+        cohen_kappa_score(
+            truth,
+            up,
             weights="quadratic",
             labels=list(range(config.MIN_LABEL, config.MAX_LABEL + 1)),
         )
@@ -1297,30 +2294,74 @@ def calculate_metrics(
         "qwk": qwk,
         "exact_accuracy": float(np.mean(final == truth)),
         "adjacent_accuracy": float(np.mean(np.abs(final - truth) <= 1)),
+        "up_mae": float(np.mean(np.abs(up - truth))),
+        "up_qwk": up_qwk,
+        "up_exact_accuracy": float(np.mean(up == truth)),
+        "up_adjacent_accuracy": float(np.mean(np.abs(up - truth) <= 1)),
     }
 
 
 def merge_evaluation_payloads(
     payloads: Sequence[Mapping[str, Any]], expected_size: int
-) -> tuple[list[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[
+    list[str],
+    np.ndarray,
+    np.ndarray,
+    Optional[np.ndarray],
+    dict[int, float],
+]:
     """Sort gathered records by original index and remove sampler padding."""
 
-    records: dict[int, tuple[str, float, Optional[float]]] = {}
+    records: dict[
+        int,
+        tuple[
+            str,
+            float,
+            Optional[float],
+            Optional[dict[int, tuple[int, int]]],
+        ],
+    ] = {}
     any_labels = False
     for payload in payloads:
         indices = payload["indices"]
         ids = payload["ids"]
         predictions = payload["predictions"]
         labels = payload.get("labels")
+        auxiliary_predictions = payload.get("auxiliary_predictions")
+        auxiliary_labels = payload.get("auxiliary_labels")
         if not (len(indices) == len(ids) == len(predictions)):
             raise RuntimeError("Malformed distributed evaluation payload")
         if labels is not None and len(labels) != len(indices):
             raise RuntimeError("Malformed distributed evaluation labels")
+        if (auxiliary_predictions is None) != (auxiliary_labels is None):
+            raise RuntimeError("Only one auxiliary evaluation payload was provided")
+        if auxiliary_predictions is not None:
+            for level_count in (3, 5, 7):
+                if not (
+                    len(auxiliary_predictions[level_count])
+                    == len(auxiliary_labels[level_count])
+                    == len(indices)
+                ):
+                    raise RuntimeError("Malformed auxiliary evaluation payload")
         any_labels = any_labels or labels is not None
         for position, index in enumerate(indices):
             integer_index = int(index)
             record_label = None if labels is None else float(labels[position])
-            candidate = (str(ids[position]), float(predictions[position]), record_label)
+            auxiliary_record = None
+            if auxiliary_predictions is not None and auxiliary_labels is not None:
+                auxiliary_record = {
+                    level_count: (
+                        int(auxiliary_predictions[level_count][position]),
+                        int(auxiliary_labels[level_count][position]),
+                    )
+                    for level_count in (3, 5, 7)
+                }
+            candidate = (
+                str(ids[position]),
+                float(predictions[position]),
+                record_label,
+                auxiliary_record,
+            )
             if integer_index in records:
                 previous = records[integer_index]
                 if previous[0] != candidate[0]:
@@ -1344,7 +2385,24 @@ def merge_evaluation_payloads(
         if any(record[2] is None for record in ordered):
             raise RuntimeError("Only part of the evaluation set has labels")
         label_array = np.asarray([record[2] for record in ordered], dtype=np.float64)
-    return ordered_ids, np.arange(expected_size), predictions, label_array
+    auxiliary_accuracies: dict[int, float] = {}
+    if any(record[3] is not None for record in ordered):
+        if any(record[3] is None for record in ordered):
+            raise RuntimeError("Only part of the evaluation set has auxiliary outputs")
+        for level_count in (3, 5, 7):
+            correct = sum(
+                int(record[3][level_count][0] == record[3][level_count][1])
+                for record in ordered
+                if record[3] is not None
+            )
+            auxiliary_accuracies[level_count] = float(correct / expected_size)
+    return (
+        ordered_ids,
+        np.arange(expected_size),
+        predictions,
+        label_array,
+        auxiliary_accuracies,
+    )
 
 
 def run_gather_order_check() -> None:
@@ -1354,10 +2412,16 @@ def run_gather_order_check() -> None:
         {"indices": [2, 0], "ids": ["c", "a"], "predictions": [3.0, 1.0]},
         {"indices": [1, 0], "ids": ["b", "a"], "predictions": [2.0, 1.0]},
     ]
-    ids, indices, predictions, labels = merge_evaluation_payloads(payloads, 3)
+    ids, indices, predictions, labels, auxiliary = merge_evaluation_payloads(
+        payloads, 3
+    )
     if ids != ["a", "b", "c"] or indices.tolist() != [0, 1, 2]:
         raise AssertionError("Evaluation gather ordering check failed")
-    if predictions.tolist() != [1.0, 2.0, 3.0] or labels is not None:
+    if (
+        predictions.tolist() != [1.0, 2.0, 3.0]
+        or labels is not None
+        or auxiliary
+    ):
         raise AssertionError("Evaluation gather padding check failed")
 
 
@@ -1387,18 +2451,32 @@ def evaluate_model(
     local_ids: list[str] = []
     local_predictions: list[float] = []
     local_labels: Optional[list[float]] = []
+    local_auxiliary_predictions: dict[int, list[int]] = {3: [], 5: [], 7: []}
+    local_auxiliary_labels: dict[int, list[int]] = {3: [], 5: [], 7: []}
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
     progress = tqdm(loader, desc=description, disable=not context.is_main, leave=False)
     for batch in progress:
         batch = move_model_batch(batch, context.device)
         with autocast_context(amp_enabled):
-            predictions = model_forward(model, batch)
+            outputs = model_forward(model, batch)
+            predictions = outputs["score19"]
         local_indices.extend(batch["original_indices"].cpu().tolist())
         local_ids.extend(batch["sample_ids"])
         local_predictions.extend(predictions.float().cpu().tolist())
         if "labels" in batch:
             assert local_labels is not None
             local_labels.extend(batch["labels"].float().cpu().tolist())
+            if all(f"logits{level}" in outputs for level in (3, 5, 7)):
+                for level_count in (3, 5, 7):
+                    auxiliary_predictions = outputs[f"logits{level_count}"].argmax(
+                        dim=-1
+                    )
+                    local_auxiliary_predictions[level_count].extend(
+                        auxiliary_predictions.cpu().tolist()
+                    )
+                    local_auxiliary_labels[level_count].extend(
+                        batch[f"labels{level_count}"].cpu().tolist()
+                    )
         else:
             local_labels = None
 
@@ -1407,6 +2485,14 @@ def evaluate_model(
         "ids": local_ids,
         "predictions": local_predictions,
         "labels": local_labels,
+        "auxiliary_predictions": (
+            local_auxiliary_predictions
+            if local_auxiliary_predictions[3]
+            else None
+        ),
+        "auxiliary_labels": (
+            local_auxiliary_labels if local_auxiliary_labels[3] else None
+        ),
     }
     if context.distributed:
         gathered: list[Optional[dict[str, Any]]] = [None] * context.world_size
@@ -1417,16 +2503,25 @@ def evaluate_model(
 
     if not context.is_main:
         return None
-    ids, indices, raw_predictions, labels = merge_evaluation_payloads(
-        payloads, expected_size
-    )
+    (
+        ids,
+        indices,
+        raw_predictions,
+        labels,
+        auxiliary_accuracies,
+    ) = merge_evaluation_payloads(payloads, expected_size)
     final_predictions = round_and_clip(raw_predictions, config)
+    up_predictions = ceil_and_clip(raw_predictions, config)
     metrics = calculate_metrics(labels, raw_predictions, config) if labels is not None else None
+    if metrics is not None:
+        for level_count, accuracy in auxiliary_accuracies.items():
+            metrics[f"aux_accuracy_{level_count}"] = accuracy
     return EvaluationOutput(
         ids,
         indices,
         raw_predictions,
         final_predictions,
+        up_predictions,
         labels,
         metrics,
     )
@@ -1596,9 +2691,79 @@ def save_training_checkpoint(
         "best_mae": best_mae,
         "bad_epochs": bad_epochs,
         "config": asdict(config),
+        "resume_signature": resume_compatibility_signature(config),
         "rng_states": list(rng_states),
     }
     atomic_torch_save(payload, path)
+
+
+def resume_compatibility_signature(config: Config) -> dict[str, Any]:
+    """Describe model/training semantics that a resume must not change."""
+
+    signature: dict[str, Any] = {
+        "MODEL_NAME": config.MODEL_NAME,
+        "MODEL_MODE": config.MODEL_MODE,
+        "MAX_LENGTH": config.MAX_LENGTH,
+        "DROPOUT": config.DROPOUT,
+        "STRUCTURED_SPECIAL_TOKENS": tuple(FIELD_TOKENS),
+        "PREPROCESSING_VERSION": PREPROCESSING_VERSION,
+    }
+    if config.MODEL_MODE == "cascaded_hmtl":
+        signature.update(
+            {
+                "CASCADE_TEMPERATURE": config.CASCADE_TEMPERATURE,
+                "AUX_CE3_WEIGHT": config.AUX_CE3_WEIGHT,
+                "AUX_CE5_WEIGHT": config.AUX_CE5_WEIGHT,
+                "AUX_CE7_WEIGHT": config.AUX_CE7_WEIGHT,
+            }
+        )
+    return signature
+
+
+def validate_resume_compatibility(
+    checkpoint: Mapping[str, Any], config: Config
+) -> None:
+    """Reject checkpoint/config combinations that silently change semantics."""
+
+    expected = resume_compatibility_signature(config)
+    saved_signature = checkpoint.get("resume_signature")
+    checkpoint_config = checkpoint.get("config", {})
+    if saved_signature is None:
+        # Older scalar-baseline checkpoints predate explicit signatures. Keep
+        # them usable in baseline mode, but compare every compatible field
+        # they do record. Cascaded checkpoints must carry the full signature.
+        saved_mode = str(checkpoint_config.get("MODEL_MODE", "baseline_mse"))
+        if config.MODEL_MODE != "baseline_mse" or saved_mode != "baseline_mse":
+            raise RuntimeError(
+                "Cascaded resume checkpoint lacks a compatibility signature"
+            )
+        saved_signature = {
+            key: checkpoint_config[key]
+            for key in ("MODEL_NAME", "MODEL_MODE", "MAX_LENGTH", "DROPOUT")
+            if key in checkpoint_config
+        }
+
+    mismatches: dict[str, tuple[Any, Any]] = {}
+    for key, saved_value in dict(saved_signature).items():
+        if key not in expected:
+            continue
+        expected_value = expected[key]
+        if key == "STRUCTURED_SPECIAL_TOKENS":
+            saved_value = tuple(saved_value)
+        if saved_value != expected_value:
+            mismatches[key] = (saved_value, expected_value)
+    missing = sorted(set(expected).difference(saved_signature))
+    if config.MODEL_MODE == "cascaded_hmtl" and missing:
+        raise RuntimeError(
+            "Cascaded resume checkpoint is missing compatibility fields: "
+            f"{missing}"
+        )
+    if mismatches:
+        details = ", ".join(
+            f"{key}: saved={saved!r}, requested={requested!r}"
+            for key, (saved, requested) in sorted(mismatches.items())
+        )
+        raise RuntimeError(f"Checkpoint/config compatibility mismatch: {details}")
 
 
 def resume_training(
@@ -1607,11 +2772,13 @@ def resume_training(
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     scaler: Any,
+    config: Config,
     context: DistributedContext,
 ) -> tuple[int, int, float, float, int]:
     """Restore a full training checkpoint and return selection state."""
 
     checkpoint = load_torch_file(checkpoint_path, context.device)
+    validate_resume_compatibility(checkpoint, config)
     unwrap_model(model).load_state_dict(checkpoint["model_state"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -1768,14 +2935,13 @@ def train_one_epoch(
     global_step: int,
     *,
     max_steps: Optional[int],
-) -> tuple[float, int]:
+) -> tuple[dict[str, float], int]:
     """Train exactly one epoch on Train; Dev/Test never call this function."""
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss_function = nn.MSELoss()
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
-    total_loss = 0.0
+    loss_totals = {"total": 0.0, "mse19": 0.0, "ce3": 0.0, "ce5": 0.0, "ce7": 0.0}
     total_examples = 0
     start = time.perf_counter()
     effective_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
@@ -1800,20 +2966,25 @@ def train_one_epoch(
         )
         with synchronization:
             with autocast_context(amp_enabled):
-                predictions = model_forward(model, batch)
-                raw_loss = loss_function(predictions, batch["labels"])
-                window_start = (
-                    step // config.GRADIENT_ACCUMULATION_STEPS
-                ) * config.GRADIENT_ACCUMULATION_STEPS
-                accumulation_window = min(
-                    config.GRADIENT_ACCUMULATION_STEPS,
-                    effective_steps - window_start,
-                )
-                scaled_loss = raw_loss / accumulation_window
+                outputs = model_forward(model, batch)
+            component_losses = compute_training_losses(outputs, batch, config)
+            raw_loss = component_losses["total"]
+            window_start = (
+                step // config.GRADIENT_ACCUMULATION_STEPS
+            ) * config.GRADIENT_ACCUMULATION_STEPS
+            accumulation_window = min(
+                config.GRADIENT_ACCUMULATION_STEPS,
+                effective_steps - window_start,
+            )
+            scaled_loss = raw_loss / accumulation_window
             scaler.scale(scaled_loss).backward()
 
         batch_size = int(batch["labels"].shape[0])
-        total_loss += float(raw_loss.detach().item()) * batch_size
+        loss_totals["total"] += float(raw_loss.detach().item()) * batch_size
+        for name, loss in component_losses.items():
+            if name == "total":
+                continue
+            loss_totals[name] += float(loss.detach().item()) * batch_size
         total_examples += batch_size
 
         if is_update_step:
@@ -1849,7 +3020,11 @@ def train_one_epoch(
             ):
                 progress.set_postfix(
                     loss=f"{raw_loss.item():.4f}",
-                    avg=f"{total_loss / max(total_examples, 1):.4f}",
+                    mse19=f"{component_losses['mse19'].item():.4f}",
+                    ce3=f"{component_losses['ce3'].item():.3f}",
+                    ce5=f"{component_losses['ce5'].item():.3f}",
+                    ce7=f"{component_losses['ce7'].item():.3f}",
+                    avg=f"{loss_totals['total'] / max(total_examples, 1):.4f}",
                     enc_lr=f"{encoder_lr:.2e}",
                     head_lr=f"{head_lr:.2e}",
                     accum=f"{(step % config.GRADIENT_ACCUMULATION_STEPS) + 1}/"
@@ -1859,13 +3034,20 @@ def train_one_epoch(
                 )
     progress.close()
 
+    loss_names = ("total", "mse19", "ce3", "ce5", "ce7")
     totals = torch.tensor(
-        [total_loss, float(total_examples)], dtype=torch.float64, device=context.device
+        [*(loss_totals[name] for name in loss_names), float(total_examples)],
+        dtype=torch.float64,
+        device=context.device,
     )
     if context.distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-    mean_loss = float(totals[0].item() / max(totals[1].item(), 1.0))
-    return mean_loss, global_step
+    denominator = max(totals[-1].item(), 1.0)
+    mean_losses = {
+        name: float(totals[index].item() / denominator)
+        for index, name in enumerate(loss_names)
+    }
+    return mean_losses, global_step
 
 
 def write_training_history(history: Sequence[Mapping[str, Any]], config: Config) -> None:
@@ -1889,13 +3071,18 @@ def validate_submission(
     zip_path: Path,
     expected_ids: Sequence[str],
     config: Config,
+    *,
+    expected_prediction_name: str,
+    expected_zip_name: str,
 ) -> None:
     """Validate exact filename, CSV schema/order/range, and one-entry ZIP layout."""
 
-    if prediction_path.name != config.SUBMISSION_BASENAME:
-        raise ValueError(f"Submission file must be named {config.SUBMISSION_BASENAME!r}")
-    if zip_path.name != config.SUBMISSION_ZIP_NAME:
-        raise ValueError(f"ZIP must be named {config.SUBMISSION_ZIP_NAME!r}")
+    if prediction_path.name != expected_prediction_name:
+        raise ValueError(
+            f"Submission source file must be named {expected_prediction_name!r}"
+        )
+    if zip_path.name != expected_zip_name:
+        raise ValueError(f"ZIP must be named {expected_zip_name!r}")
     with prediction_path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.reader(handle))
     if not rows or rows[0] != ["Sentence ID", "Prediction"]:
@@ -1946,13 +3133,20 @@ def run_submission_validator_checks(config: Config) -> None:
 
     with tempfile.TemporaryDirectory(prefix="barec-submission-check-") as directory:
         root = Path(directory)
-        prediction_path = root / config.SUBMISSION_BASENAME
-        zip_path = root / config.SUBMISSION_ZIP_NAME
+        prediction_path = root / config.SUBMISSION_ROUND_BASENAME
+        zip_path = root / config.SUBMISSION_ROUND_ZIP_NAME
         prediction_path.write_text("Wrong,Prediction\nprobe,1\n", encoding="utf-8")
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.write(prediction_path, arcname=config.SUBMISSION_BASENAME)
         try:
-            validate_submission(prediction_path, zip_path, ["probe"], config)
+            validate_submission(
+                prediction_path,
+                zip_path,
+                ["probe"],
+                config,
+                expected_prediction_name=config.SUBMISSION_ROUND_BASENAME,
+                expected_zip_name=config.SUBMISSION_ROUND_ZIP_NAME,
+            )
         except ValueError as error:
             if "header" not in str(error).lower():
                 raise AssertionError("Malformed-header check failed for the wrong reason") from error
@@ -1968,7 +3162,14 @@ def run_submission_validator_checks(config: Config) -> None:
                 arcname=f"nested/{config.SUBMISSION_BASENAME}",
             )
         try:
-            validate_submission(prediction_path, zip_path, ["probe"], config)
+            validate_submission(
+                prediction_path,
+                zip_path,
+                ["probe"],
+                config,
+                expected_prediction_name=config.SUBMISSION_ROUND_BASENAME,
+                expected_zip_name=config.SUBMISSION_ROUND_ZIP_NAME,
+            )
         except ValueError as error:
             if "zip" not in str(error).lower():
                 raise AssertionError("Nested-ZIP check failed for the wrong reason") from error
@@ -1976,17 +3177,20 @@ def run_submission_validator_checks(config: Config) -> None:
             raise AssertionError("Submission validator accepted a nested ZIP entry")
 
 
-def create_submission(
+def create_submission_variant(
     ids: Sequence[str],
     predictions: Sequence[int],
     config: Config,
+    *,
+    prediction_name: str,
+    zip_name: str,
 ) -> tuple[Path, Path]:
-    """Write extensionless UTF-8 CSV, ZIP it at root, then validate both."""
+    """Write one named source CSV while keeping the official ZIP member name."""
 
     directory = config.resolve(config.SUBMISSION_DIR)
     directory.mkdir(parents=True, exist_ok=True)
-    prediction_path = directory / config.SUBMISSION_BASENAME
-    zip_path = directory / config.SUBMISSION_ZIP_NAME
+    prediction_path = directory / prediction_name
+    zip_path = directory / zip_name
     if len(ids) != len(predictions):
         raise ValueError("ID/prediction length mismatch")
     with prediction_path.open("w", encoding="utf-8", newline="") as handle:
@@ -1998,25 +3202,72 @@ def create_submission(
         )
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.write(prediction_path, arcname=config.SUBMISSION_BASENAME)
-    validate_submission(prediction_path, zip_path, ids, config)
-    print(f"Submission created successfully:\n{zip_path.resolve()}")
+    validate_submission(
+        prediction_path,
+        zip_path,
+        ids,
+        config,
+        expected_prediction_name=prediction_name,
+        expected_zip_name=zip_name,
+    )
     return prediction_path, zip_path
 
 
-def write_diagnostics(output: EvaluationOutput, config: Config) -> Path:
-    """Write raw/final Test scores separately from the submission."""
+def create_submissions(
+    ids: Sequence[str],
+    round_predictions: Sequence[int],
+    up_predictions: Sequence[int],
+    config: Config,
+) -> dict[str, tuple[Path, Path]]:
+    """Create and validate the round and ceiling variants from one ensemble."""
+
+    directory = config.resolve(config.SUBMISSION_DIR)
+    # Avoid leaving a stale single-submission artifact from older runs next to
+    # the two explicitly named variants.
+    (directory / config.SUBMISSION_BASENAME).unlink(missing_ok=True)
+    (directory / f"{config.SUBMISSION_BASENAME}.zip").unlink(missing_ok=True)
+    round_paths = create_submission_variant(
+        ids,
+        round_predictions,
+        config,
+        prediction_name=config.SUBMISSION_ROUND_BASENAME,
+        zip_name=config.SUBMISSION_ROUND_ZIP_NAME,
+    )
+    up_paths = create_submission_variant(
+        ids,
+        up_predictions,
+        config,
+        prediction_name=config.SUBMISSION_UP_BASENAME,
+        zip_name=config.SUBMISSION_UP_ZIP_NAME,
+    )
+    print(
+        "Submissions created successfully:\n"
+        f"round: {round_paths[1].resolve()}\n"
+        f"up:    {up_paths[1].resolve()}"
+    )
+    return {"round": round_paths, "up": up_paths}
+
+
+def write_diagnostics(
+    output: EvaluationOutput,
+    config: Config,
+    *,
+    split_name: str,
+) -> Path:
+    """Write raw/final scores for one split separately from the submission."""
 
     data: dict[str, Any] = {
         "Sentence ID": output.ids,
         "raw_prediction": output.raw_predictions,
-        "Prediction": output.final_predictions,
+        "Prediction_round": output.final_predictions,
+        "Prediction_up": output.up_predictions,
     }
     if output.labels is not None:
         data["gold_label"] = output.labels.astype(np.int64)
     path = (
         config.resolve(config.OUTPUT_DIR)
         / "diagnostics"
-        / "test_predictions_with_raw_scores.csv"
+        / f"{split_name}_predictions_with_raw_scores.csv"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(data).to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
@@ -2034,9 +3285,9 @@ def prepare_output_directories(config: Config, context: DistributedContext) -> N
     if context.is_main:
         for path in (
             config.resolve(config.OUTPUT_DIR),
-            config.resolve(config.CHECKPOINT_DIR),
             config.resolve(config.CACHE_DIR),
             config.resolve(config.SUBMISSION_DIR),
+            config.resolve(config.SEED_RUNS_DIR),
         ):
             path.mkdir(parents=True, exist_ok=True)
     distributed_barrier(context)
@@ -2058,6 +3309,150 @@ def write_preprocessing_report(
     )
 
 
+@dataclass
+class SeedRunOutput:
+    """Best-checkpoint Dev/Test predictions produced by one random seed."""
+
+    seed: int
+    dev: EvaluationOutput
+    test: EvaluationOutput
+
+
+def average_evaluation_outputs(
+    outputs: Sequence[EvaluationOutput],
+    config: Config,
+) -> EvaluationOutput:
+    """Uniformly average raw scores while preserving exact row alignment."""
+
+    if not outputs:
+        raise ValueError("At least one seed output is required for ensembling")
+    reference = outputs[0]
+    for output in outputs[1:]:
+        if output.ids != reference.ids:
+            raise RuntimeError("Seed outputs contain different ID orders")
+        if not np.array_equal(output.indices, reference.indices):
+            raise RuntimeError("Seed outputs contain different original indices")
+        if (output.labels is None) != (reference.labels is None):
+            raise RuntimeError("Only part of the seed outputs contains labels")
+        if (
+            reference.labels is not None
+            and output.labels is not None
+            and not np.array_equal(output.labels, reference.labels)
+        ):
+            raise RuntimeError("Seed outputs contain different gold labels")
+
+    raw_predictions = np.mean(
+        np.stack(
+            [output.raw_predictions.astype(np.float64) for output in outputs],
+            axis=0,
+        ),
+        axis=0,
+    )
+    final_predictions = round_and_clip(raw_predictions, config)
+    up_predictions = ceil_and_clip(raw_predictions, config)
+    metrics = (
+        calculate_metrics(reference.labels, raw_predictions, config)
+        if reference.labels is not None
+        else None
+    )
+    return EvaluationOutput(
+        ids=list(reference.ids),
+        indices=reference.indices.copy(),
+        raw_predictions=raw_predictions,
+        final_predictions=final_predictions,
+        up_predictions=up_predictions,
+        labels=None if reference.labels is None else reference.labels.copy(),
+        metrics=metrics,
+    )
+
+
+def run_ensemble_averaging_check(config: Config) -> None:
+    """Verify that raw scores are averaged before rounding and clipping."""
+
+    left = EvaluationOutput(
+        ids=["a", "b"],
+        indices=np.asarray([0, 1], dtype=np.int64),
+        raw_predictions=np.asarray([1.2, 3.4], dtype=np.float64),
+        final_predictions=np.asarray([1, 3], dtype=np.int64),
+        up_predictions=np.asarray([2, 4], dtype=np.int64),
+        labels=np.asarray([1.0, 4.0], dtype=np.float64),
+        metrics=None,
+    )
+    right = EvaluationOutput(
+        ids=["a", "b"],
+        indices=np.asarray([0, 1], dtype=np.int64),
+        raw_predictions=np.asarray([2.0, 4.6], dtype=np.float64),
+        final_predictions=np.asarray([2, 5], dtype=np.int64),
+        up_predictions=np.asarray([2, 5], dtype=np.int64),
+        labels=np.asarray([1.0, 4.0], dtype=np.float64),
+        metrics=None,
+    )
+    averaged = average_evaluation_outputs([left, right], config)
+    if not np.allclose(averaged.raw_predictions, [1.6, 4.0]):
+        raise AssertionError("Multi-seed raw-score averaging check failed")
+    if averaged.final_predictions.tolist() != [2, 4]:
+        raise AssertionError("Multi-seed round-after-average check failed")
+    if averaged.up_predictions.tolist() != [2, 4]:
+        raise AssertionError("Multi-seed ceil-after-average check failed")
+
+
+def write_ensemble_report(
+    seed_runs: Sequence[SeedRunOutput],
+    ensemble_dev: EvaluationOutput,
+    ensemble_test: EvaluationOutput,
+    config: Config,
+) -> Path:
+    """Record member metrics and the fixed uniform-averaging policy."""
+
+    dev_qwks = np.asarray(
+        [
+            run.dev.metrics["qwk"]
+            for run in seed_runs
+            if run.dev.metrics is not None
+        ],
+        dtype=np.float64,
+    )
+    payload = {
+        "seeds": [run.seed for run in seed_runs],
+        "model_mode": config.MODEL_MODE,
+        "joint_loss": {
+            "mse19_weight": 1.0,
+            "ce3_weight": config.AUX_CE3_WEIGHT,
+            "ce5_weight": config.AUX_CE5_WEIGHT,
+            "ce7_weight": config.AUX_CE7_WEIGHT,
+        },
+        "aggregation": "uniform_mean_of_raw_regression_scores",
+        "discretization": {
+            "round": "numpy_rint_then_clip",
+            "up": "numpy_ceil_then_clip",
+        },
+        "checkpoint_selection": "round_qwk_then_round_mae",
+        "threshold_optimization": False,
+        "learned_ensemble_weights": False,
+        "members": [
+            {
+                "seed": run.seed,
+                "dev_metrics": run.dev.metrics,
+                # Open-Test metrics are diagnostic only and never participate
+                # in checkpoint selection or ensemble construction.
+                "open_test_metrics_diagnostic_only": run.test.metrics,
+            }
+            for run in seed_runs
+        ],
+        "member_dev_qwk_mean": (
+            float(dev_qwks.mean()) if len(dev_qwks) else None
+        ),
+        "member_dev_qwk_std": (
+            float(dev_qwks.std()) if len(dev_qwks) else None
+        ),
+        "ensemble_dev_metrics": ensemble_dev.metrics,
+        "ensemble_open_test_metrics_diagnostic_only": ensemble_test.metrics,
+    }
+    path = config.resolve(config.OUTPUT_DIR) / "logs" / "ensemble_report.json"
+    atomic_json_dump(payload, path)
+    return path
+
+
 def train_select_and_predict(
     train_frame: pd.DataFrame,
     dev_frame: pd.DataFrame,
@@ -2066,20 +3461,38 @@ def train_select_and_predict(
     context: DistributedContext,
     *,
     smoke_test: bool,
-) -> None:
-    """Fine-tune on Train, select only on Dev, then infer Test once."""
+) -> Optional[SeedRunOutput]:
+    """Train one seed, select only on Dev, and return best-model predictions."""
 
     tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, use_fast=True)
+    added_tokens = tokenizer.add_tokens(list(FIELD_TOKENS), special_tokens=False)
+    validate_structured_tokenizer(tokenizer)
+    if context.is_main:
+        LOGGER.info(
+            "Structured field tokens added to tokenizer: %d/%d",
+            added_tokens,
+            len(FIELD_TOKENS),
+        )
     train_loader, dev_loader, test_loader, train_sampler = make_data_loaders(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
-    base_model = ArabicReadabilityRegressor(config.MODEL_NAME, config.DROPOUT)
+    base_model = create_model(config)
+    embedding_count = int(
+        base_model.encoder.get_input_embeddings().num_embeddings
+    )
+    if embedding_count != len(tokenizer):
+        base_model.encoder.resize_token_embeddings(len(tokenizer))
+    if int(base_model.encoder.get_input_embeddings().num_embeddings) != len(tokenizer):
+        raise RuntimeError("Tokenizer/model vocabulary sizes remain inconsistent")
     base_model.to(context.device)
+    probe_row = train_frame.iloc[0].to_dict()
     run_regression_shape_check(
         base_model,
         tokenizer,
-        str(train_frame.iloc[0]["_processed_text"]),
+        str(probe_row["_d3tok_text"]),
+        str(probe_row["_surface_text"]),
+        structured_feature_groups(probe_row),
         context.device,
         config.MAX_LENGTH,
     )
@@ -2121,6 +3534,16 @@ def train_select_and_predict(
         LOGGER.info("Gradient accumulation steps: %d", config.GRADIENT_ACCUMULATION_STEPS)
         LOGGER.info("Effective global batch size: %d", effective_batch)
         LOGGER.info("FP16 enabled: %s", amp_enabled)
+        LOGGER.info("Model mode: %s", config.MODEL_MODE)
+        if config.MODEL_MODE == "cascaded_hmtl":
+            LOGGER.info(
+                "Joint loss: MSE19 + %.3f*CE3 + %.3f*CE5 + %.3f*CE7; "
+                "cascade temperature=%.3f",
+                config.AUX_CE3_WEIGHT,
+                config.AUX_CE5_WEIGHT,
+                config.AUX_CE7_WEIGHT,
+                config.CASCADE_TEMPERATURE,
+            )
 
     start_epoch = 0
     global_step = 0
@@ -2141,7 +3564,7 @@ def train_select_and_predict(
                 "not only checkpoints/last.pt."
             )
         start_epoch, global_step, best_qwk, best_mae, bad_epochs = resume_training(
-            resume_path, model, optimizer, scheduler, scaler, context
+            resume_path, model, optimizer, scheduler, scaler, config, context
         )
 
     history: list[dict[str, Any]] = []
@@ -2163,7 +3586,7 @@ def train_select_and_predict(
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
         epoch_start = time.perf_counter()
-        train_loss, global_step = train_one_epoch(
+        train_losses, global_step = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -2214,27 +3637,53 @@ def train_select_and_predict(
             history_row = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
-                "train_loss": train_loss,
+                "train_loss": train_losses["total"],
+                "train_mse19": train_losses["mse19"],
+                "train_ce3": train_losses["ce3"],
+                "train_ce5": train_losses["ce5"],
+                "train_ce7": train_losses["ce7"],
                 "dev_mse": metrics["mse"],
                 "dev_mae": metrics["mae"],
                 "dev_qwk": metrics["qwk"],
                 "dev_exact_accuracy": metrics["exact_accuracy"],
                 "dev_adjacent_accuracy": metrics["adjacent_accuracy"],
+                "dev_up_mae": metrics["up_mae"],
+                "dev_up_qwk": metrics["up_qwk"],
+                "dev_up_exact_accuracy": metrics["up_exact_accuracy"],
+                "dev_up_adjacent_accuracy": metrics["up_adjacent_accuracy"],
+                "dev_aux_accuracy_3": metrics.get("aux_accuracy_3"),
+                "dev_aux_accuracy_5": metrics.get("aux_accuracy_5"),
+                "dev_aux_accuracy_7": metrics.get("aux_accuracy_7"),
                 "epoch_seconds": elapsed,
                 "is_best": improved,
             }
             history.append(history_row)
             write_training_history(history, config)
             LOGGER.info(
-                "Epoch %d | train_loss=%.6f dev_mse=%.6f dev_mae=%.6f "
-                "dev_qwk=%s exact=%.4f adjacent=%.4f time=%.1fs best=%s",
+                "Epoch %d | train_total=%.6f mse19=%.6f ce3=%.4f ce5=%.4f "
+                "ce7=%.4f | Dev round_qwk=%s round_mae=%.4f up_qwk=%s "
+                "up_mae=%.4f aux_acc=(%s,%s,%s) time=%.1fs best=%s",
                 epoch + 1,
-                train_loss,
-                metrics["mse"],
-                metrics["mae"],
+                train_losses["total"],
+                train_losses["mse19"],
+                train_losses["ce3"],
+                train_losses["ce5"],
+                train_losses["ce7"],
                 f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
-                metrics["exact_accuracy"],
-                metrics["adjacent_accuracy"],
+                metrics["mae"],
+                f"{metrics['up_qwk']:.6f}"
+                if math.isfinite(metrics["up_qwk"])
+                else "nan",
+                metrics["up_mae"],
+                f"{metrics['aux_accuracy_3']:.4f}"
+                if "aux_accuracy_3" in metrics
+                else "n/a",
+                f"{metrics['aux_accuracy_5']:.4f}"
+                if "aux_accuracy_5" in metrics
+                else "n/a",
+                f"{metrics['aux_accuracy_7']:.4f}"
+                if "aux_accuracy_7" in metrics
+                else "n/a",
                 elapsed,
                 improved,
             )
@@ -2284,28 +3733,153 @@ def train_select_and_predict(
     unwrap_model(model).load_state_dict(best_state, strict=True)
     distributed_barrier(context)
 
+    best_dev_output = evaluate_model(
+        model,
+        dev_loader,
+        len(dev_frame),
+        config,
+        context,
+        description=f"Seed {config.SEED} best Dev",
+    )
     test_output = evaluate_model(
         model,
         test_loader,
         len(test_frame),
         config,
         context,
-        description="Test inference",
+        description=f"Seed {config.SEED} Test",
     )
+    seed_output: Optional[SeedRunOutput] = None
     if context.is_main:
+        if best_dev_output is None or best_dev_output.metrics is None:
+            raise RuntimeError("Rank 0 did not receive best-checkpoint Dev metrics")
         if test_output is None:
             raise RuntimeError("Rank 0 did not receive Test predictions")
+        expected_dev_ids = (
+            dev_frame.sort_values("_original_index")["_id"].astype(str).tolist()
+        )
         expected_ids = test_frame.sort_values("_original_index")["_id"].astype(str).tolist()
+        if best_dev_output.ids != expected_dev_ids:
+            raise RuntimeError("Dev predictions are not in the original ID order")
         if test_output.ids != expected_ids:
             raise RuntimeError("Test predictions are not in the original ID order")
-        diagnostics_path = write_diagnostics(test_output, config)
-        LOGGER.info("Test diagnostics: %s", diagnostics_path)
+        dev_diagnostics = write_diagnostics(
+            best_dev_output,
+            config,
+            split_name="dev",
+        )
+        test_diagnostics = write_diagnostics(
+            test_output,
+            config,
+            split_name="test",
+        )
+        LOGGER.info(
+            "Seed %d diagnostics: Dev=%s Test=%s",
+            config.SEED,
+            dev_diagnostics,
+            test_diagnostics,
+        )
+        LOGGER.info(
+            "Seed %d best-checkpoint Dev metrics: %s",
+            config.SEED,
+            best_dev_output.metrics,
+        )
         if test_output.metrics is not None:
             LOGGER.info(
-                "Open-Test metrics (diagnostic only; never used for selection): %s",
+                "Seed %d Open-Test metrics (diagnostic only; never used for "
+                "selection or weighting): %s",
+                config.SEED,
                 test_output.metrics,
             )
-        create_submission(test_output.ids, test_output.final_predictions, config)
+        seed_output = SeedRunOutput(config.SEED, best_dev_output, test_output)
+    distributed_barrier(context)
+    return seed_output
+
+
+def train_multiseed_ensemble(
+    train_frame: pd.DataFrame,
+    dev_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    config: Config,
+    context: DistributedContext,
+    *,
+    smoke_test: bool,
+) -> None:
+    """Train every configured seed and uniformly average its raw predictions."""
+
+    seed_runs: list[SeedRunOutput] = []
+    for member_index, seed in enumerate(config.ENSEMBLE_SEEDS, start=1):
+        member_config = config_for_seed(config, seed)
+        prepare_output_directories(member_config, context)
+        seed_everything(seed + context.rank)
+        if context.is_main:
+            LOGGER.info(
+                "Starting ensemble member %d/%d with seed=%d; artifacts=%s",
+                member_index,
+                len(config.ENSEMBLE_SEEDS),
+                seed,
+                member_config.resolve(member_config.OUTPUT_DIR),
+            )
+        member_output = train_select_and_predict(
+            train_frame,
+            dev_frame,
+            test_frame,
+            member_config,
+            context,
+            smoke_test=smoke_test,
+        )
+        if context.is_main:
+            if member_output is None:
+                raise RuntimeError(f"Seed {seed} produced no rank-0 output")
+            seed_runs.append(member_output)
+        distributed_barrier(context)
+        gc.collect()
+        if context.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if context.is_main:
+        if len(seed_runs) != len(config.ENSEMBLE_SEEDS):
+            raise RuntimeError("The multi-seed ensemble is missing member outputs")
+        ensemble_dev = average_evaluation_outputs(
+            [run.dev for run in seed_runs],
+            config,
+        )
+        ensemble_test = average_evaluation_outputs(
+            [run.test for run in seed_runs],
+            config,
+        )
+        dev_diagnostics = write_diagnostics(
+            ensemble_dev,
+            config,
+            split_name="ensemble_dev",
+        )
+        test_diagnostics = write_diagnostics(
+            ensemble_test,
+            config,
+            split_name="test",
+        )
+        report_path = write_ensemble_report(
+            seed_runs,
+            ensemble_dev,
+            ensemble_test,
+            config,
+        )
+        LOGGER.info("Uniform multi-seed ensemble Dev metrics: %s", ensemble_dev.metrics)
+        LOGGER.info("Ensemble Dev diagnostics: %s", dev_diagnostics)
+        LOGGER.info("Ensemble Test diagnostics: %s", test_diagnostics)
+        LOGGER.info("Ensemble report: %s", report_path)
+        if ensemble_test.metrics is not None:
+            LOGGER.info(
+                "Ensemble Open-Test metrics (diagnostic only; never used for "
+                "selection or weighting): %s",
+                ensemble_test.metrics,
+            )
+        create_submissions(
+            ensemble_test.ids,
+            ensemble_test.final_predictions,
+            ensemble_test.up_predictions,
+            config,
+        )
     distributed_barrier(context)
 
 
@@ -2314,6 +3888,8 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
 
     prepare_output_directories(config, context)
     if context.is_main:
+        run_auxiliary_mapping_check()
+        run_discretization_checks(config)
         run_submission_validator_checks(config)
     distributed_barrier(context)
     train_path = config.resolve(config.TRAIN_PATH)
@@ -2347,10 +3923,17 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
         write_preprocessing_report(
             [train_report, dev_report, test_report], config
         )
+    # The BERT D3Tok disambiguator is large and no longer needed after all
+    # cached views have been materialized. Reclaim cyclic Python objects before
+    # the AraBERT encoder and Adam states are allocated.
+    gc.collect()
+    if context.device.type == "cuda":
+        torch.cuda.empty_cache()
 
     run_sampler_checks()
     run_gather_order_check()
-    train_select_and_predict(
+    run_ensemble_averaging_check(config)
+    train_multiseed_ensemble(
         train_processed,
         dev_processed,
         test_processed,
@@ -2365,6 +3948,10 @@ def validate_config(config: Config) -> None:
 
     if config.MIN_LABEL >= config.MAX_LABEL:
         raise ValueError("MIN_LABEL must be less than MAX_LABEL")
+    if config.MODEL_MODE not in {"baseline_mse", "cascaded_hmtl"}:
+        raise ValueError(
+            "MODEL_MODE must be 'baseline_mse' or 'cascaded_hmtl'"
+        )
     positive_integer_fields = {
         "MAX_LENGTH": config.MAX_LENGTH,
         "NUM_EPOCHS": config.NUM_EPOCHS,
@@ -2374,6 +3961,7 @@ def validate_config(config: Config) -> None:
         "EARLY_STOPPING_PATIENCE": config.EARLY_STOPPING_PATIENCE,
         "DDP_TIMEOUT_MINUTES": config.DDP_TIMEOUT_MINUTES,
         "LOG_EVERY_N_STEPS": config.LOG_EVERY_N_STEPS,
+        "D3TOK_BATCH_SIZE": config.D3TOK_BATCH_SIZE,
         "SMOKE_TRAIN_SAMPLES": config.SMOKE_TRAIN_SAMPLES,
         "SMOKE_EVAL_SAMPLES": config.SMOKE_EVAL_SAMPLES,
         "SMOKE_MAX_TRAIN_STEPS": config.SMOKE_MAX_TRAIN_STEPS,
@@ -2387,12 +3975,54 @@ def validate_config(config: Config) -> None:
         raise ValueError("WARMUP_RATIO must be in [0, 1)")
     if not 0.0 <= config.DROPOUT < 1.0:
         raise ValueError("DROPOUT must be in [0, 1)")
+    auxiliary_weights = {
+        "AUX_CE3_WEIGHT": config.AUX_CE3_WEIGHT,
+        "AUX_CE5_WEIGHT": config.AUX_CE5_WEIGHT,
+        "AUX_CE7_WEIGHT": config.AUX_CE7_WEIGHT,
+    }
+    if any(
+        not math.isfinite(weight) or weight < 0.0
+        for weight in auxiliary_weights.values()
+    ):
+        raise ValueError(
+            f"Auxiliary CE weights must be finite and non-negative: {auxiliary_weights}"
+        )
+    if not math.isfinite(config.CASCADE_TEMPERATURE) or config.CASCADE_TEMPERATURE <= 0.0:
+        raise ValueError("CASCADE_TEMPERATURE must be finite and positive")
     if config.ENCODER_LR <= 0.0 or config.HEAD_LR <= 0.0:
         raise ValueError("ENCODER_LR and HEAD_LR must be positive")
     if config.WEIGHT_DECAY < 0.0 or config.MAX_GRAD_NORM <= 0.0:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
     if config.SAMPLER_ALPHA < 0.0:
         raise ValueError("SAMPLER_ALPHA cannot be negative")
+    submission_names = {
+        config.SUBMISSION_ROUND_BASENAME,
+        config.SUBMISSION_UP_BASENAME,
+        config.SUBMISSION_ROUND_ZIP_NAME,
+        config.SUBMISSION_UP_ZIP_NAME,
+    }
+    if len(submission_names) != 4:
+        raise ValueError("Round/up submission source and ZIP names must be distinct")
+    if config.SUBMISSION_BASENAME != "prediction":
+        raise ValueError("The official ZIP member must remain named 'prediction'")
+    if not config.ENSEMBLE_SEEDS:
+        raise ValueError("ENSEMBLE_SEEDS must contain at least one seed")
+    if any(
+        not isinstance(seed, int) or isinstance(seed, bool) or seed < 0
+        for seed in config.ENSEMBLE_SEEDS
+    ):
+        raise ValueError("ENSEMBLE_SEEDS must contain non-negative integers")
+    if len(set(config.ENSEMBLE_SEEDS)) != len(config.ENSEMBLE_SEEDS):
+        raise ValueError("ENSEMBLE_SEEDS must not contain duplicates")
+    if (
+        config.RESUME_FROM_CHECKPOINT
+        and len(config.ENSEMBLE_SEEDS) > 1
+        and "{seed}" not in str(config.RESUME_FROM_CHECKPOINT)
+    ):
+        raise ValueError(
+            "Multi-seed resume requires a {seed} placeholder in "
+            "RESUME_FROM_CHECKPOINT"
+        )
 
 
 def main() -> None:
@@ -2409,7 +4039,7 @@ def main() -> None:
     validate_config(config)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     context = initialize_distributed(config)
-    seed_everything(config.SEED + context.rank)
+    seed_everything(config.ENSEMBLE_SEEDS[0] + context.rank)
     try:
         run_pipeline(config, context, smoke_test=args.smoke_test)
     finally:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train the BAREC sentence baseline and predict the private 2026 Blind Test.
+"""Train the BAREC sentence ensemble and predict the private 2026 Blind Test.
 
 The Hugging Face access token is read from an environment variable, a Kaggle
 Secret, an existing Hugging Face login, or an interactive hidden prompt.  It is
@@ -78,6 +78,7 @@ import train as baseline  # noqa: E402
 
 
 BLIND_DATASET_ID = "CAMeL-Lab/BAREC-Shared-Task-2026-BlindTest-sent"
+BLIND_CACHE_SCHEMA_VERSION = 2
 LOCAL_BLIND_PATH_ENV = "BAREC_2026_BLIND_SENT_LOCAL_PATH"
 KAGGLE_SECRET_BROKER_ENV = "KAGGLE_USER_SECRETS_TOKEN"
 DEFAULT_TOKEN_ENV = "HF_TOKEN"
@@ -93,7 +94,10 @@ def private_blind_path(preferred_split: str) -> Path:
     """Key the private scratch table by dataset and requested split."""
 
     key = hashlib.sha256(
-        f"{BLIND_DATASET_ID}\0{preferred_split}".encode("utf-8")
+        (
+            f"{BLIND_DATASET_ID}\0{preferred_split}"
+            f"\0schema={BLIND_CACHE_SCHEMA_VERSION}"
+        ).encode("utf-8")
     ).hexdigest()[:16]
     return PRIVATE_DOWNLOAD_DIR / f"blind_test_{key}.parquet"
 
@@ -250,7 +254,15 @@ def select_blind_split(dataset: Any, preferred_split: str) -> tuple[Any, str]:
 def strip_blind_labels(frame: pd.DataFrame) -> pd.DataFrame:
     """Remove any label-like columns so Blind labels can never enter the pipeline."""
 
-    label_names = {name.casefold() for name in baseline.LABEL_ALIASES}
+    label_names = {
+        name.casefold()
+        for name in (
+            *baseline.LABEL_ALIASES,
+            *baseline.LABEL_3_ALIASES,
+            *baseline.LABEL_5_ALIASES,
+            *baseline.LABEL_7_ALIASES,
+        )
+    }
     label_names.update({"labels", "readability_level"})
     drop_columns = [
         column
@@ -279,6 +291,28 @@ def validate_local_blind(path: Path) -> tuple[int, list[str]]:
         for column in frame.columns
         if not str(column).startswith("_")
     ]
+    allowed_columns = {
+        config.ID_COLUMN,
+        config.TEXT_COLUMN,
+        "Document",
+        "Domain",
+        "Text_Class",
+    }
+    required_columns = {
+        config.ID_COLUMN,
+        config.TEXT_COLUMN,
+        "Document",
+        "Domain",
+        "Text_Class",
+    }
+    missing_columns = sorted(required_columns.difference(public_columns))
+    unexpected_columns = sorted(set(public_columns).difference(allowed_columns))
+    if missing_columns or unexpected_columns:
+        raise RuntimeError(
+            "Blind cache has an invalid private schema: "
+            f"missing={missing_columns}, unexpected={unexpected_columns}. "
+            "Refresh the Blind scratch cache."
+        )
     return len(frame), public_columns
 
 
@@ -359,9 +393,29 @@ def materialize_blind_dataset(
         "Document",
         baseline.DOCUMENT_ALIASES,
         "document",
-        required=False,
+        required=True,
     )
-    assert id_column is not None and text_column is not None
+    domain_column = baseline.resolve_column(
+        list(frame.columns),
+        "Domain",
+        baseline.DOMAIN_ALIASES,
+        "domain",
+        required=True,
+    )
+    text_class_column = baseline.resolve_column(
+        list(frame.columns),
+        "Text_Class",
+        baseline.TEXT_CLASS_ALIASES,
+        "text class",
+        required=True,
+    )
+    assert (
+        id_column is not None
+        and text_column is not None
+        and document_column is not None
+        and domain_column is not None
+        and text_class_column is not None
+    )
 
     # Materialize only what inference/isolation validation needs. This both
     # canonicalizes aliases and prevents labels or unrelated private metadata
@@ -369,9 +423,10 @@ def materialize_blind_dataset(
     canonical_data: dict[str, Any] = {
         config.ID_COLUMN: frame[id_column].astype("string"),
         config.TEXT_COLUMN: frame[text_column],
+        "Document": frame[document_column],
+        "Domain": frame[domain_column],
+        "Text_Class": frame[text_class_column],
     }
-    if document_column is not None:
-        canonical_data["Document"] = frame[document_column]
     frame = pd.DataFrame(canonical_data)
 
     temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp.parquet")
@@ -404,11 +459,13 @@ def make_blind_config(blind_path: Path, *, smoke_test: bool) -> baseline.Config:
         config.CHECKPOINT_DIR = "outputs/blind/smoke/checkpoints"
         config.CACHE_DIR = str(PRIVATE_DOWNLOAD_DIR / "preprocessed_smoke")
         config.SUBMISSION_DIR = "outputs/blind/smoke"
+        config.SEED_RUNS_DIR = "outputs/blind/smoke/seeds"
     else:
         config.OUTPUT_DIR = "outputs/blind"
         config.CHECKPOINT_DIR = "outputs/blind/checkpoints"
         config.CACHE_DIR = str(PRIVATE_DOWNLOAD_DIR / "preprocessed")
         config.SUBMISSION_DIR = "outputs/blind"
+        config.SEED_RUNS_DIR = "outputs/blind/seeds"
     config.TEST_PATH = str(blind_path.resolve())
     return config
 
@@ -434,6 +491,9 @@ def maybe_self_launch_ddp(args: argparse.Namespace, blind_path: Path) -> bool:
 
     child_environment = os.environ.copy()
     child_environment[LOCAL_BLIND_PATH_ENV] = str(blind_path.resolve())
+    # Rank 0 owns the potentially long D3Tok cache build while rank 1 waits.
+    # Keep the NCCL monitor from treating that expected wait as a deadlock.
+    child_environment.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "3600")
     # Workers only need the already materialized Parquet file. Do not propagate
     # the private credential unnecessarily.
     for name in dict.fromkeys((args.hf_token_env, *TOKEN_ENV_ALIASES)):
