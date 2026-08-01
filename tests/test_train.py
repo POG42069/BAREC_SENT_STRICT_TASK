@@ -256,9 +256,20 @@ class CascadedModelTests(unittest.TestCase):
 
     def test_cascaded_resume_signature_locks_behavior(self) -> None:
         config = train.Config()
+        signature = train.resume_compatibility_signature(config)
+        self.assertEqual(
+            signature["CHECKPOINT_SELECTION_POLICY"],
+            train.CHECKPOINT_SELECTION_POLICY,
+        )
+        self.assertEqual(
+            signature["FINAL_DISCRETIZATION_POLICY"],
+            train.FINAL_DISCRETIZATION_POLICY,
+        )
+        self.assertEqual(signature["MIN_LABEL"], config.MIN_LABEL)
+        self.assertEqual(signature["MAX_LABEL"], config.MAX_LABEL)
         checkpoint = {
             "config": {"MODEL_MODE": config.MODEL_MODE},
-            "resume_signature": train.resume_compatibility_signature(config),
+            "resume_signature": signature,
         }
         train.validate_resume_compatibility(checkpoint, config)
 
@@ -271,6 +282,25 @@ class CascadedModelTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "lacks a compatibility signature"):
             train.validate_resume_compatibility(unsigned, config)
 
+        legacy_signature = dict(signature)
+        legacy_signature.pop("CHECKPOINT_SELECTION_POLICY")
+        legacy_signature.pop("FINAL_DISCRETIZATION_POLICY")
+        legacy = {
+            "config": {"MODEL_MODE": config.MODEL_MODE},
+            "resume_signature": legacy_signature,
+        }
+        with self.assertRaisesRegex(RuntimeError, "floor-selection pipeline"):
+            train.validate_resume_compatibility(legacy, config)
+
+        wrong_range_signature = dict(signature)
+        wrong_range_signature["MAX_LABEL"] = 18
+        wrong_range = {
+            "config": {"MODEL_MODE": config.MODEL_MODE},
+            "resume_signature": wrong_range_signature,
+        }
+        with self.assertRaisesRegex(RuntimeError, "MAX_LABEL"):
+            train.validate_resume_compatibility(wrong_range, config)
+
 
 class EnsembleAndSubmissionTests(unittest.TestCase):
     def test_weighted_sampler_defaults_remain_locked(self) -> None:
@@ -278,7 +308,7 @@ class EnsembleAndSubmissionTests(unittest.TestCase):
         self.assertTrue(config.USE_WEIGHTED_SAMPLER)
         self.assertEqual(config.SAMPLER_ALPHA, 0.5)
 
-    def test_discretization_and_average_before_both_variants(self) -> None:
+    def test_discretization_and_average_before_floor(self) -> None:
         config = train.Config()
         train.run_discretization_checks(config)
         outputs = []
@@ -289,37 +319,93 @@ class EnsembleAndSubmissionTests(unittest.TestCase):
                     ids=["a", "b"],
                     indices=np.asarray([0, 1]),
                     raw_predictions=raw_array,
-                    final_predictions=train.round_and_clip(raw_array, config),
+                    round_predictions=train.round_and_clip(raw_array, config),
                     up_predictions=train.ceil_and_clip(raw_array, config),
+                    down_predictions=train.floor_and_clip(raw_array, config),
                     labels=None,
                     metrics=None,
                 )
             )
         ensemble = train.average_evaluation_outputs(outputs, config)
         np.testing.assert_allclose(ensemble.raw_predictions, [1.6, 7.5])
-        self.assertEqual(ensemble.final_predictions.tolist(), [2, 8])
+        self.assertEqual(ensemble.round_predictions.tolist(), [2, 8])
         self.assertEqual(ensemble.up_predictions.tolist(), [2, 8])
+        self.assertEqual(ensemble.down_predictions.tolist(), [1, 7])
 
-    def test_two_valid_zips_with_official_internal_name(self) -> None:
+    def test_down_checkpoint_selection_ignores_better_round_qwk(self) -> None:
+        first = {
+            "down_qwk": 0.80,
+            "down_mae": 1.0,
+            "round_qwk": 0.95,
+        }
+        selection_qwk, selection_mae, improved = train.down_checkpoint_decision(
+            first,
+            best_down_qwk=0.81,
+            best_down_mae=1.2,
+            has_selected_model=True,
+        )
+        self.assertEqual(selection_qwk, 0.80)
+        self.assertEqual(selection_mae, 1.0)
+        self.assertFalse(improved)
+
+        tied = {"down_qwk": 0.81, "down_mae": 1.1, "round_qwk": 0.1}
+        _, _, improved = train.down_checkpoint_decision(
+            tied,
+            best_down_qwk=0.81,
+            best_down_mae=1.2,
+            has_selected_model=True,
+        )
+        self.assertTrue(improved)
+
+    def test_calculated_floor_metrics_drive_checkpoint_selection(self) -> None:
+        config = train.Config()
+        metrics = train.calculate_metrics(
+            labels=[1, 2, 3, 4],
+            raw_predictions=[1.9, 2.9, 3.9, 4.9],
+            config=config,
+        )
+        self.assertEqual(metrics["down_qwk"], 1.0)
+        self.assertEqual(metrics["down_mae"], 0.0)
+        self.assertLess(metrics["round_qwk"], metrics["down_qwk"])
+        _, _, improved = train.down_checkpoint_decision(
+            metrics,
+            best_down_qwk=0.99,
+            best_down_mae=0.0,
+            has_selected_model=True,
+        )
+        self.assertTrue(improved)
+
+    def test_one_valid_down_zip_with_official_internal_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = train.Config()
             config.SUBMISSION_DIR = directory
-            (Path(directory) / "prediction").write_text("stale", encoding="utf-8")
-            (Path(directory) / "prediction.zip").write_text("stale", encoding="utf-8")
-            paths = train.create_submissions(
-                ["id-1", "id-2"], [1, 2], [2, 3], config
-            )
-            for variant, expected_values in {"round": ["1", "2"], "up": ["2", "3"]}.items():
-                source_path, zip_path = paths[variant]
-                with zipfile.ZipFile(zip_path) as archive:
-                    self.assertEqual(archive.namelist(), ["prediction"])
-                    rows = archive.read("prediction").decode("utf-8").splitlines()
-                self.assertEqual(rows[0], "Sentence ID,Prediction")
-                self.assertEqual([row.split(",")[1] for row in rows[1:]], expected_values)
-                self.assertEqual(archive_bytes(zip_path), source_path.read_bytes())
+            for stale_name in (
+                "prediction",
+                "prediction.zip",
+                "prediction_round",
+                "prediction_round.zip",
+                "prediction_up",
+                "prediction_up.zip",
+            ):
+                (Path(directory) / stale_name).write_text("stale", encoding="utf-8")
+            paths = train.create_submissions(["id-1", "id-2"], [1, 2], config)
+            source_path, zip_path = paths["down"]
+            with zipfile.ZipFile(zip_path) as archive:
+                self.assertEqual(archive.namelist(), ["prediction"])
+                rows = archive.read("prediction").decode("utf-8").splitlines()
+            self.assertEqual(rows[0], "Sentence ID,Prediction")
+            self.assertEqual([row.split(",")[1] for row in rows[1:]], ["1", "2"])
+            self.assertEqual(archive_bytes(zip_path), source_path.read_bytes())
             root = Path(directory)
-            self.assertFalse((root / "prediction").exists())
-            self.assertFalse((root / "prediction.zip").exists())
+            for stale_name in (
+                "prediction",
+                "prediction.zip",
+                "prediction_round",
+                "prediction_round.zip",
+                "prediction_up",
+                "prediction_up.zip",
+            ):
+                self.assertFalse((root / stale_name).exists())
 
     def test_blind_label_aliases_are_removed(self) -> None:
         frame = pd.DataFrame(

@@ -12,9 +12,10 @@ Pipeline sử dụng D3Tok thật của CAMeL Tools và ensemble năm AraBERTv2 
 trúc, được fine-tune độc lập với seed `42, 52, 62, 72, 82`. Mặc định, mỗi model
 học chung trong một forward/backward pass theo cascade
 `3 mức → 5 mức → 7 mức → regression 19 mức`. Kết quả cuối là trung bình
-đều của năm raw score và được xuất thành hai bản: `prediction_round.zip` dùng
-`np.rint` và `prediction_up.zip` dùng `np.ceil`, đều clip vào `[1, 19]`. Không
-tối ưu threshold và không học ensemble weight. Khi Kaggle cung cấp hai GPU T4,
+đều của năm raw score rồi dùng `np.floor`, clip vào `[1, 19]` và xuất thành
+`prediction_down.zip`. Mỗi seed cũng chọn best checkpoint bằng Dev QWK sau
+`floor`; hòa QWK thì Dev MAE của bản `floor` thấp hơn thắng. Không tối ưu
+threshold và không học ensemble weight. Khi Kaggle cung cấp hai GPU T4,
 script tự khởi chạy PyTorch DDP; không cần gọi `torchrun` thủ công.
 
 > [!IMPORTANT]
@@ -168,12 +169,10 @@ dùng `%run train_blind.py` trong chính notebook kernel.
 
 Khi có hai T4, script tự launch hai DDP worker giống `train.py`. Dữ liệu Blind
 thô và cache D3Tok được đặt trong `/kaggle/temp` (hoặc thư mục temp của hệ điều
-hành), không nằm trong repository hay `/kaggle/working`. Hai kết quả cần tải về
-là:
+hành), không nằm trong repository hay `/kaggle/working`. Kết quả cần tải về là:
 
 ```text
-outputs/blind/prediction_round.zip
-outputs/blind/prediction_up.zip
+outputs/blind/prediction_down.zip
 ```
 
 Nếu ban tổ chức cập nhật dataset trong cùng phiên, dùng
@@ -435,21 +434,23 @@ Progress/log ghi riêng `total_loss`, `mse19`, `ce3`, `ce5`, `ce7`, average loss
 encoder LR và head LR. Auxiliary metric chỉ để chẩn đoán. Với mỗi seed trong
 `ENSEMBLE_SEEDS`, script khởi tạo lại toàn bộ bốn head, thứ tự DataLoader,
 dropout và weighted sampler; cả năm member vẫn chỉ backpropagate trên cùng Train.
-Checkpoint được chọn riêng bằng Dev QWK của `score19` sau `np.rint`; nếu QWK hòa,
-MAE thấp hơn thắng. Early stopping không nhìn Test và không dùng auxiliary
-accuracy.
+Checkpoint được chọn riêng bằng Dev `down_qwk` của `score19` sau `np.floor`; nếu
+QWK hòa, Dev `down_mae` thấp hơn thắng. Early stopping dùng cùng policy floor,
+không nhìn Test và không dùng auxiliary accuracy. Round/up QWK vẫn được ghi để
+chẩn đoán nhưng không tham gia lựa chọn.
 
 Sau khi có năm best checkpoint, script chạy lại từng member trên Dev/Test, kiểm
 tra ID và thứ tự hoàn toàn trùng nhau, rồi lấy trung bình đều của **raw regression
-score** trước mọi phép làm tròn. Từ cùng một ensemble raw score, script tạo bản
-`round` bằng `np.rint` và bản `up` bằng `np.ceil`, rồi clip cả hai vào `[1, 19]`
-và chuyển sang integer. Báo cáo Dev có metric của cả hai bản, nhưng checkpoint
-selection luôn dùng bản `round`. Không threshold optimization, không
-QWK-weighting và không chọn/bỏ seed theo Open Test.
+score** trước mọi phép rời rạc hóa. Sau khi lấy mean, script dùng `np.floor`,
+clip vào `[1, 19]` và chuyển sang integer để tạo submission `down`. Báo cáo và
+diagnostics vẫn chứa metric/prediction round/up để so sánh, nhưng chỉ bản down
+là policy chính. Không threshold optimization, không QWK-weighting và không
+chọn/bỏ seed theo Open Test.
 
 Checkpoint resume của mỗi seed lưu model mode, encoder, toàn bộ auxiliary và
-regression heads, optimizer, scheduler, scaler, epoch/global step, best QWK/MAE,
-config và RNG state. Để resume ensemble, đặt:
+regression heads, optimizer, scheduler, scaler, epoch/global step,
+`best_down_qwk/best_down_mae`, config, selection policy và RNG state. Để resume
+ensemble, đặt:
 
 ```python
 RESUME_FROM_CHECKPOINT = "outputs/seeds/seed_{seed}/checkpoints/last.pt"
@@ -458,7 +459,9 @@ RESUME_FROM_CHECKPOINT = "outputs/seeds/seed_{seed}/checkpoints/last.pt"
 Phải giữ best state tương ứng tại
 `outputs/seeds/seed_<N>/best_model/model_state.pt`; script fail fast nếu cặp
 artifact không đầy đủ. Model state được lưu sau khi unwrap DDP nên dùng được ở
-một hoặc nhiều GPU.
+một hoặc nhiều GPU. Checkpoint resume tạo trước policy floor không tương thích;
+script yêu cầu bắt đầu lại seed đó từ epoch 1 thay vì dùng nhầm best model được
+chọn theo round.
 
 ## 14. Smoke test và kiểm tra tối thiểu
 
@@ -478,7 +481,7 @@ Smoke mode dùng hai seed `42, 52` để kiểm tra cả phép ensemble mà khô
 đủ năm member. Nó kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi
 dấu phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
 sampler, forward/backward, metric, checkpoint/reload, inference, raw-score
-averaging và cả hai submission ZIP. Nó không phải một lần huấn luyện hợp lệ để
+averaging và submission down ZIP. Nó không phải một lần huấn luyện hợp lệ để
 báo cáo QWK.
 
 Các invariant cần đạt:
@@ -495,10 +498,10 @@ Các invariant cần đạt:
 - loss dùng đúng hệ số `0.5`, finite, và MSE19 tạo gradient cho toàn bộ cascade;
 - sampler chia đều hai rank và deterministic theo seed/epoch;
 - gather trả đúng số mẫu theo thứ tự gốc;
-- ensemble luôn trung bình raw score trước `np.rint`/`np.ceil`;
-- `np.rint` dùng quy tắc làm tròn số chẵn tại `.5`, còn `np.ceil` giữ nguyên số
-  nguyên và làm tròn lên mọi raw score còn phần thập phân;
-- validator kiểm tra độc lập và từ chối header/ID/range/ZIP sai ở cả hai bản.
+- ensemble luôn trung bình raw score trước `np.floor`;
+- `np.floor` giữ nguyên số nguyên và đưa mọi raw score còn phần thập phân xuống
+  số nguyên thấp hơn; round/up chỉ là diagnostics;
+- validator từ chối header/ID/range/ZIP sai của submission down.
 
 ## 15. Output và định dạng nộp bài
 
@@ -523,23 +526,19 @@ outputs/
 ├── diagnostics/
 │   ├── ensemble_dev_predictions_with_raw_scores.csv
 │   └── test_predictions_with_raw_scores.csv
-├── prediction_round
-├── prediction_round.zip
-├── prediction_up
-└── prediction_up.zip
+├── prediction_down
+└── prediction_down.zip
 ```
 
-`train_blind.py` tạo cùng bốn artifact tại:
+`train_blind.py` tạo cùng hai artifact tại:
 
 ```text
-outputs/blind/prediction_round
-outputs/blind/prediction_round.zip
-outputs/blind/prediction_up
-outputs/blind/prediction_up.zip
+outputs/blind/prediction_down
+outputs/blind/prediction_down.zip
 ```
 
-Hai file nộp gốc `prediction_round` và `prediction_up` là CSV UTF-8 không BOM và
-**không có phần mở rộng**. Header phải chính xác:
+File nộp gốc `prediction_down` là CSV UTF-8 không BOM và **không có phần mở
+rộng**. Header phải chính xác:
 
 ```csv
 Sentence ID,Prediction
@@ -560,8 +559,9 @@ và xác minh filename, nội dung byte, header, số dòng, ID/order,
 duplicate/missing ID và prediction range trước khi báo thành công. Không tạo
 thêm `prediction`/`prediction.zip` theo tên cũ.
 
-Diagnostics ghi `raw_prediction`, `Prediction_round`, `Prediction_up` và gold
-label nếu đang chạy Open Test; các trường này không xuất hiện trong submission.
+Diagnostics ghi `raw_prediction`, `Prediction_down`, `Prediction_round`,
+`Prediction_up` và gold label nếu đang chạy Open Test; các trường diagnostics
+không xuất hiện trong submission.
 
 ## 16. Troubleshooting
 
@@ -622,17 +622,16 @@ seed. Nếu không cần resume, đặt `RESUME_FROM_CHECKPOINT=None`.
 
 ### ZIP bị hệ thống chấm từ chối
 
-Không tự đổi tên thành `prediction.csv`. Mở riêng `prediction_round.zip` và
-`prediction_up.zip`, rồi xác nhận mỗi ZIP chỉ chứa `prediction` tại root với
-header `Sentence ID,Prediction`.
+Không tự đổi tên thành `prediction.csv`. Mở `prediction_down.zip`, rồi xác nhận
+ZIP chỉ chứa `prediction` tại root với header `Sentence ID,Prediction`.
 
 ## 17. Reproducibility và báo cáo kết quả
 
 Năm seed cố định được đặt cho Python, NumPy, PyTorch CPU/CUDA, DataLoader và
-sampler. `ensemble_report.json` ghi metric từng member, mean/std Dev QWK, metric
-ensemble cho cả round/up và xác nhận policy là uniform raw-score mean. Tuy vậy, khác biệt
-CUDA/library vẫn có thể gây sai khác nhỏ. Hãy lưu config, commit hash, log và
-best metrics đi kèm mỗi run.
+sampler. `ensemble_report.json` ghi Dev down QWK của từng member, mean/std của
+metric này, metric ensemble cho down/round/up và xác nhận policy là uniform
+raw-score mean rồi mới `floor`. Tuy vậy, khác biệt CUDA/library vẫn có thể gây
+sai khác nhỏ. Hãy lưu config, commit hash, log và best metrics đi kèm mỗi run.
 
 Repository không ghi QWK hoặc runtime chưa đo, không tuyên bố NCCL/T4 x2 đã đạt
 nếu chưa chạy trên Kaggle, và không dùng metric smoke test như kết quả cuộc thi.

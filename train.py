@@ -58,6 +58,8 @@ from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warm
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("barec")
 PREPROCESSING_VERSION = "barec-structured-pair-v4"
+CHECKPOINT_SELECTION_POLICY = "dev_floor_qwk_then_floor_mae_v1"
+FINAL_DISCRETIZATION_POLICY = "floor_after_uniform_raw_mean_v1"
 TATWEEL = "\u0640"
 ARABIC_DIACRITICS = frozenset(
     chr(codepoint)
@@ -155,10 +157,8 @@ class Config:
     MAX_LABEL: int = 19
     # Every submitted ZIP must contain this exact extensionless root member.
     SUBMISSION_BASENAME: str = "prediction"
-    SUBMISSION_ROUND_BASENAME: str = "prediction_round"
-    SUBMISSION_UP_BASENAME: str = "prediction_up"
-    SUBMISSION_ROUND_ZIP_NAME: str = "prediction_round.zip"
-    SUBMISSION_UP_ZIP_NAME: str = "prediction_up.zip"
+    SUBMISSION_DOWN_BASENAME: str = "prediction_down"
+    SUBMISSION_DOWN_ZIP_NAME: str = "prediction_down.zip"
 
     # Smoke-test limits. These do not affect a normal run.
     SMOKE_TRAIN_SAMPLES: int = 32
@@ -2243,8 +2243,9 @@ class EvaluationOutput:
     ids: list[str]
     indices: np.ndarray
     raw_predictions: np.ndarray
-    final_predictions: np.ndarray
+    round_predictions: np.ndarray
     up_predictions: np.ndarray
+    down_predictions: np.ndarray
     labels: Optional[np.ndarray]
     metrics: Optional[dict[str, float]]
 
@@ -2267,15 +2268,26 @@ def ceil_and_clip(raw_predictions: Sequence[float], config: Config) -> np.ndarra
     return np.clip(np.ceil(raw), config.MIN_LABEL, config.MAX_LABEL).astype(np.int64)
 
 
+def floor_and_clip(raw_predictions: Sequence[float], config: Config) -> np.ndarray:
+    """Round every score downward, then enforce the legal label range."""
+
+    raw = np.asarray(raw_predictions, dtype=np.float64)
+    if not np.isfinite(raw).all():
+        raise ValueError("Raw predictions contain NaN or infinity")
+    return np.clip(np.floor(raw), config.MIN_LABEL, config.MAX_LABEL).astype(np.int64)
+
+
 def run_discretization_checks(config: Config) -> None:
-    """Lock banker rounding, ceiling semantics, clipping, and finite inputs."""
+    """Lock round/ceil/floor semantics, clipping, and finite-input rejection."""
 
     raw = [0.2, 1.0, 1.5, 2.5, 3.5, 7.0, 7.0001, 18.5, 19.2]
     if round_and_clip(raw, config).tolist() != [1, 1, 2, 2, 4, 7, 7, 18, 19]:
         raise AssertionError("np.rint discretization check failed")
     if ceil_and_clip(raw, config).tolist() != [1, 1, 2, 3, 4, 7, 8, 19, 19]:
         raise AssertionError("np.ceil discretization check failed")
-    for discretizer in (round_and_clip, ceil_and_clip):
+    if floor_and_clip(raw, config).tolist() != [1, 1, 1, 2, 3, 7, 7, 18, 19]:
+        raise AssertionError("np.floor discretization check failed")
+    for discretizer in (round_and_clip, ceil_and_clip, floor_and_clip):
         try:
             discretizer([float("nan")], config)
         except ValueError:
@@ -2291,12 +2303,13 @@ def calculate_metrics(
 
     truth = np.asarray(labels, dtype=np.int64)
     raw = np.asarray(raw_predictions, dtype=np.float64)
-    final = round_and_clip(raw, config)
+    rounded = round_and_clip(raw, config)
     up = ceil_and_clip(raw, config)
-    qwk = float(
+    down = floor_and_clip(raw, config)
+    round_qwk = float(
         cohen_kappa_score(
             truth,
-            final,
+            rounded,
             weights="quadratic",
             labels=list(range(config.MIN_LABEL, config.MAX_LABEL + 1)),
         )
@@ -2309,17 +2322,56 @@ def calculate_metrics(
             labels=list(range(config.MIN_LABEL, config.MAX_LABEL + 1)),
         )
     )
+    down_qwk = float(
+        cohen_kappa_score(
+            truth,
+            down,
+            weights="quadratic",
+            labels=list(range(config.MIN_LABEL, config.MAX_LABEL + 1)),
+        )
+    )
     return {
         "mse": float(np.mean(np.square(raw - truth))),
-        "mae": float(np.mean(np.abs(final - truth))),
-        "qwk": qwk,
-        "exact_accuracy": float(np.mean(final == truth)),
-        "adjacent_accuracy": float(np.mean(np.abs(final - truth) <= 1)),
+        "round_mae": float(np.mean(np.abs(rounded - truth))),
+        "round_qwk": round_qwk,
+        "round_exact_accuracy": float(np.mean(rounded == truth)),
+        "round_adjacent_accuracy": float(np.mean(np.abs(rounded - truth) <= 1)),
         "up_mae": float(np.mean(np.abs(up - truth))),
         "up_qwk": up_qwk,
         "up_exact_accuracy": float(np.mean(up == truth)),
         "up_adjacent_accuracy": float(np.mean(np.abs(up - truth) <= 1)),
+        "down_mae": float(np.mean(np.abs(down - truth))),
+        "down_qwk": down_qwk,
+        "down_exact_accuracy": float(np.mean(down == truth)),
+        "down_adjacent_accuracy": float(np.mean(np.abs(down - truth) <= 1)),
     }
+
+
+def down_checkpoint_decision(
+    metrics: Mapping[str, float],
+    *,
+    best_down_qwk: float,
+    best_down_mae: float,
+    has_selected_model: bool,
+) -> tuple[float, float, bool]:
+    """Apply the fixed Dev floor-QWK/floor-MAE checkpoint ordering."""
+
+    down_qwk = float(metrics["down_qwk"])
+    down_mae = float(metrics["down_mae"])
+    if not math.isfinite(down_mae):
+        raise ValueError("Dev down_mae must be finite for checkpoint selection")
+    selection_qwk = down_qwk if math.isfinite(down_qwk) else -math.inf
+    qwk_tied = (
+        abs(selection_qwk - best_down_qwk) <= 1e-12
+        if math.isfinite(selection_qwk) and math.isfinite(best_down_qwk)
+        else selection_qwk == best_down_qwk
+    )
+    improved = (
+        not has_selected_model
+        or selection_qwk > best_down_qwk + 1e-12
+        or (qwk_tied and down_mae < best_down_mae)
+    )
+    return selection_qwk, down_mae, improved
 
 
 def merge_evaluation_payloads(
@@ -2531,8 +2583,9 @@ def evaluate_model(
         labels,
         auxiliary_accuracies,
     ) = merge_evaluation_payloads(payloads, expected_size)
-    final_predictions = round_and_clip(raw_predictions, config)
+    round_predictions = round_and_clip(raw_predictions, config)
     up_predictions = ceil_and_clip(raw_predictions, config)
+    down_predictions = floor_and_clip(raw_predictions, config)
     metrics = calculate_metrics(labels, raw_predictions, config) if labels is not None else None
     if metrics is not None:
         for level_count, accuracy in auxiliary_accuracies.items():
@@ -2541,8 +2594,9 @@ def evaluate_model(
         ids,
         indices,
         raw_predictions,
-        final_predictions,
+        round_predictions,
         up_predictions,
+        down_predictions,
         labels,
         metrics,
     )
@@ -2693,8 +2747,8 @@ def save_training_checkpoint(
     *,
     epoch: int,
     global_step: int,
-    best_qwk: float,
-    best_mae: float,
+    best_down_qwk: float,
+    best_down_mae: float,
     bad_epochs: int,
     config: Config,
     rng_states: Sequence[Mapping[str, Any]],
@@ -2708,8 +2762,8 @@ def save_training_checkpoint(
         "scaler_state": scaler.state_dict(),
         "epoch": epoch,
         "global_step": global_step,
-        "best_qwk": best_qwk,
-        "best_mae": best_mae,
+        "best_down_qwk": best_down_qwk,
+        "best_down_mae": best_down_mae,
         "bad_epochs": bad_epochs,
         "config": asdict(config),
         "resume_signature": resume_compatibility_signature(config),
@@ -2725,9 +2779,13 @@ def resume_compatibility_signature(config: Config) -> dict[str, Any]:
         "MODEL_NAME": config.MODEL_NAME,
         "MODEL_MODE": config.MODEL_MODE,
         "MAX_LENGTH": config.MAX_LENGTH,
+        "MIN_LABEL": config.MIN_LABEL,
+        "MAX_LABEL": config.MAX_LABEL,
         "DROPOUT": config.DROPOUT,
         "STRUCTURED_SPECIAL_TOKENS": tuple(FIELD_TOKENS),
         "PREPROCESSING_VERSION": PREPROCESSING_VERSION,
+        "CHECKPOINT_SELECTION_POLICY": CHECKPOINT_SELECTION_POLICY,
+        "FINAL_DISCRETIZATION_POLICY": FINAL_DISCRETIZATION_POLICY,
     }
     if config.MODEL_MODE == "cascaded_hmtl":
         signature.update(
@@ -2750,9 +2808,10 @@ def validate_resume_compatibility(
     saved_signature = checkpoint.get("resume_signature")
     checkpoint_config = checkpoint.get("config", {})
     if saved_signature is None:
-        # Older scalar-baseline checkpoints predate explicit signatures. Keep
-        # them usable in baseline mode, but compare every compatible field
-        # they do record. Cascaded checkpoints must carry the full signature.
+        # Older scalar-baseline checkpoints predate explicit signatures. Read
+        # their compatible fields so the error is informative, but the floor
+        # policy fields below deliberately make unsigned checkpoints invalid.
+        # Reusing them could silently preserve a round-selected best model.
         saved_mode = str(checkpoint_config.get("MODEL_MODE", "baseline_mse"))
         if config.MODEL_MODE != "baseline_mse" or saved_mode != "baseline_mse":
             raise RuntimeError(
@@ -2774,9 +2833,16 @@ def validate_resume_compatibility(
         if saved_value != expected_value:
             mismatches[key] = (saved_value, expected_value)
     missing = sorted(set(expected).difference(saved_signature))
-    if config.MODEL_MODE == "cascaded_hmtl" and missing:
+    policy_fields = {
+        "CHECKPOINT_SELECTION_POLICY",
+        "FINAL_DISCRETIZATION_POLICY",
+    }
+    if missing and (
+        config.MODEL_MODE == "cascaded_hmtl" or policy_fields.intersection(missing)
+    ):
         raise RuntimeError(
-            "Cascaded resume checkpoint is missing compatibility fields: "
+            "Resume checkpoint is missing compatibility fields required by the "
+            "floor-selection pipeline: "
             f"{missing}"
         )
     if mismatches:
@@ -2800,6 +2866,14 @@ def resume_training(
 
     checkpoint = load_torch_file(checkpoint_path, context.device)
     validate_resume_compatibility(checkpoint, config)
+    missing_selection_state = sorted(
+        {"best_down_qwk", "best_down_mae"}.difference(checkpoint)
+    )
+    if missing_selection_state:
+        raise RuntimeError(
+            "Resume checkpoint lacks floor-selection state: "
+            f"{missing_selection_state}. Restart this seed from epoch 1."
+        )
     unwrap_model(model).load_state_dict(checkpoint["model_state"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -2812,8 +2886,8 @@ def resume_training(
     return (
         start_epoch,
         int(checkpoint.get("global_step", 0)),
-        float(checkpoint.get("best_qwk", -math.inf)),
-        float(checkpoint.get("best_mae", math.inf)),
+        float(checkpoint["best_down_qwk"]),
+        float(checkpoint["best_down_mae"]),
         int(checkpoint.get("bad_epochs", 0)),
     )
 
@@ -3154,8 +3228,8 @@ def run_submission_validator_checks(config: Config) -> None:
 
     with tempfile.TemporaryDirectory(prefix="barec-submission-check-") as directory:
         root = Path(directory)
-        prediction_path = root / config.SUBMISSION_ROUND_BASENAME
-        zip_path = root / config.SUBMISSION_ROUND_ZIP_NAME
+        prediction_path = root / config.SUBMISSION_DOWN_BASENAME
+        zip_path = root / config.SUBMISSION_DOWN_ZIP_NAME
         prediction_path.write_text("Wrong,Prediction\nprobe,1\n", encoding="utf-8")
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.write(prediction_path, arcname=config.SUBMISSION_BASENAME)
@@ -3165,8 +3239,8 @@ def run_submission_validator_checks(config: Config) -> None:
                 zip_path,
                 ["probe"],
                 config,
-                expected_prediction_name=config.SUBMISSION_ROUND_BASENAME,
-                expected_zip_name=config.SUBMISSION_ROUND_ZIP_NAME,
+                expected_prediction_name=config.SUBMISSION_DOWN_BASENAME,
+                expected_zip_name=config.SUBMISSION_DOWN_ZIP_NAME,
             )
         except ValueError as error:
             if "header" not in str(error).lower():
@@ -3188,8 +3262,8 @@ def run_submission_validator_checks(config: Config) -> None:
                 zip_path,
                 ["probe"],
                 config,
-                expected_prediction_name=config.SUBMISSION_ROUND_BASENAME,
-                expected_zip_name=config.SUBMISSION_ROUND_ZIP_NAME,
+                expected_prediction_name=config.SUBMISSION_DOWN_BASENAME,
+                expected_zip_name=config.SUBMISSION_DOWN_ZIP_NAME,
             )
         except ValueError as error:
             if "zip" not in str(error).lower():
@@ -3236,37 +3310,35 @@ def create_submission_variant(
 
 def create_submissions(
     ids: Sequence[str],
-    round_predictions: Sequence[int],
-    up_predictions: Sequence[int],
+    down_predictions: Sequence[int],
     config: Config,
 ) -> dict[str, tuple[Path, Path]]:
-    """Create and validate the round and ceiling variants from one ensemble."""
+    """Create the one floor-discretized submission from the raw-score ensemble."""
 
     directory = config.resolve(config.SUBMISSION_DIR)
-    # Avoid leaving a stale single-submission artifact from older runs next to
-    # the two explicitly named variants.
-    (directory / config.SUBMISSION_BASENAME).unlink(missing_ok=True)
-    (directory / f"{config.SUBMISSION_BASENAME}.zip").unlink(missing_ok=True)
-    round_paths = create_submission_variant(
+    # Remove stale artifacts from the previous generic/round/up output policy
+    # so a rerun cannot leave a misleading ZIP beside the floor-selected one.
+    for stale_name in (
+        config.SUBMISSION_BASENAME,
+        f"{config.SUBMISSION_BASENAME}.zip",
+        "prediction_round",
+        "prediction_round.zip",
+        "prediction_up",
+        "prediction_up.zip",
+    ):
+        (directory / stale_name).unlink(missing_ok=True)
+    down_paths = create_submission_variant(
         ids,
-        round_predictions,
+        down_predictions,
         config,
-        prediction_name=config.SUBMISSION_ROUND_BASENAME,
-        zip_name=config.SUBMISSION_ROUND_ZIP_NAME,
-    )
-    up_paths = create_submission_variant(
-        ids,
-        up_predictions,
-        config,
-        prediction_name=config.SUBMISSION_UP_BASENAME,
-        zip_name=config.SUBMISSION_UP_ZIP_NAME,
+        prediction_name=config.SUBMISSION_DOWN_BASENAME,
+        zip_name=config.SUBMISSION_DOWN_ZIP_NAME,
     )
     print(
-        "Submissions created successfully:\n"
-        f"round: {round_paths[1].resolve()}\n"
-        f"up:    {up_paths[1].resolve()}"
+        "Floor-discretized submission created successfully:\n"
+        f"down: {down_paths[1].resolve()}"
     )
-    return {"round": round_paths, "up": up_paths}
+    return {"down": down_paths}
 
 
 def write_diagnostics(
@@ -3280,7 +3352,8 @@ def write_diagnostics(
     data: dict[str, Any] = {
         "Sentence ID": output.ids,
         "raw_prediction": output.raw_predictions,
-        "Prediction_round": output.final_predictions,
+        "Prediction_down": output.down_predictions,
+        "Prediction_round": output.round_predictions,
         "Prediction_up": output.up_predictions,
     }
     if output.labels is not None:
@@ -3369,8 +3442,9 @@ def average_evaluation_outputs(
         ),
         axis=0,
     )
-    final_predictions = round_and_clip(raw_predictions, config)
+    round_predictions = round_and_clip(raw_predictions, config)
     up_predictions = ceil_and_clip(raw_predictions, config)
+    down_predictions = floor_and_clip(raw_predictions, config)
     metrics = (
         calculate_metrics(reference.labels, raw_predictions, config)
         if reference.labels is not None
@@ -3380,8 +3454,9 @@ def average_evaluation_outputs(
         ids=list(reference.ids),
         indices=reference.indices.copy(),
         raw_predictions=raw_predictions,
-        final_predictions=final_predictions,
+        round_predictions=round_predictions,
         up_predictions=up_predictions,
+        down_predictions=down_predictions,
         labels=None if reference.labels is None else reference.labels.copy(),
         metrics=metrics,
     )
@@ -3394,8 +3469,9 @@ def run_ensemble_averaging_check(config: Config) -> None:
         ids=["a", "b"],
         indices=np.asarray([0, 1], dtype=np.int64),
         raw_predictions=np.asarray([1.2, 3.4], dtype=np.float64),
-        final_predictions=np.asarray([1, 3], dtype=np.int64),
+        round_predictions=np.asarray([1, 3], dtype=np.int64),
         up_predictions=np.asarray([2, 4], dtype=np.int64),
+        down_predictions=np.asarray([1, 3], dtype=np.int64),
         labels=np.asarray([1.0, 4.0], dtype=np.float64),
         metrics=None,
     )
@@ -3403,18 +3479,21 @@ def run_ensemble_averaging_check(config: Config) -> None:
         ids=["a", "b"],
         indices=np.asarray([0, 1], dtype=np.int64),
         raw_predictions=np.asarray([2.0, 4.6], dtype=np.float64),
-        final_predictions=np.asarray([2, 5], dtype=np.int64),
+        round_predictions=np.asarray([2, 5], dtype=np.int64),
         up_predictions=np.asarray([2, 5], dtype=np.int64),
+        down_predictions=np.asarray([2, 4], dtype=np.int64),
         labels=np.asarray([1.0, 4.0], dtype=np.float64),
         metrics=None,
     )
     averaged = average_evaluation_outputs([left, right], config)
     if not np.allclose(averaged.raw_predictions, [1.6, 4.0]):
         raise AssertionError("Multi-seed raw-score averaging check failed")
-    if averaged.final_predictions.tolist() != [2, 4]:
+    if averaged.round_predictions.tolist() != [2, 4]:
         raise AssertionError("Multi-seed round-after-average check failed")
     if averaged.up_predictions.tolist() != [2, 4]:
         raise AssertionError("Multi-seed ceil-after-average check failed")
+    if averaged.down_predictions.tolist() != [1, 4]:
+        raise AssertionError("Multi-seed floor-after-average check failed")
 
 
 def write_ensemble_report(
@@ -3425,9 +3504,9 @@ def write_ensemble_report(
 ) -> Path:
     """Record member metrics and the fixed uniform-averaging policy."""
 
-    dev_qwks = np.asarray(
+    dev_down_qwks = np.asarray(
         [
-            run.dev.metrics["qwk"]
+            run.dev.metrics["down_qwk"]
             for run in seed_runs
             if run.dev.metrics is not None
         ],
@@ -3443,11 +3522,13 @@ def write_ensemble_report(
             "ce7_weight": config.AUX_CE7_WEIGHT,
         },
         "aggregation": "uniform_mean_of_raw_regression_scores",
+        "final_discretization_policy": FINAL_DISCRETIZATION_POLICY,
         "discretization": {
-            "round": "numpy_rint_then_clip",
-            "up": "numpy_ceil_then_clip",
+            "down_primary": "numpy_floor_then_clip",
+            "round_diagnostic_only": "numpy_rint_then_clip",
+            "up_diagnostic_only": "numpy_ceil_then_clip",
         },
-        "checkpoint_selection": "round_qwk_then_round_mae",
+        "checkpoint_selection": CHECKPOINT_SELECTION_POLICY,
         "threshold_optimization": False,
         "learned_ensemble_weights": False,
         "members": [
@@ -3460,11 +3541,11 @@ def write_ensemble_report(
             }
             for run in seed_runs
         ],
-        "member_dev_qwk_mean": (
-            float(dev_qwks.mean()) if len(dev_qwks) else None
+        "member_dev_down_qwk_mean": (
+            float(dev_down_qwks.mean()) if len(dev_down_qwks) else None
         ),
-        "member_dev_qwk_std": (
-            float(dev_qwks.std()) if len(dev_qwks) else None
+        "member_dev_down_qwk_std": (
+            float(dev_down_qwks.std()) if len(dev_down_qwks) else None
         ),
         "ensemble_dev_metrics": ensemble_dev.metrics,
         "ensemble_open_test_metrics_diagnostic_only": ensemble_test.metrics,
@@ -3556,6 +3637,10 @@ def train_select_and_predict(
         LOGGER.info("Effective global batch size: %d", effective_batch)
         LOGGER.info("FP16 enabled: %s", amp_enabled)
         LOGGER.info("Model mode: %s", config.MODEL_MODE)
+        LOGGER.info(
+            "Checkpoint selection: Dev floor QWK, tie-break Dev floor MAE; "
+            "final ensemble discretization: floor after raw-score averaging."
+        )
         if config.MODEL_MODE == "cascaded_hmtl":
             LOGGER.info(
                 "Joint loss: MSE19 + %.3f*CE3 + %.3f*CE5 + %.3f*CE7; "
@@ -3568,8 +3653,8 @@ def train_select_and_predict(
 
     start_epoch = 0
     global_step = 0
-    best_qwk = -math.inf
-    best_mae = math.inf
+    best_down_qwk = -math.inf
+    best_down_mae = math.inf
     bad_epochs = 0
     best_model_path = config.resolve(config.OUTPUT_DIR) / "best_model" / "model_state.pt"
     checkpoint_path = config.resolve(config.CHECKPOINT_DIR) / "last.pt"
@@ -3584,7 +3669,13 @@ def train_select_and_predict(
                 f"{best_model_path}. Preserve the complete outputs directory, "
                 "not only checkpoints/last.pt."
             )
-        start_epoch, global_step, best_qwk, best_mae, bad_epochs = resume_training(
+        (
+            start_epoch,
+            global_step,
+            best_down_qwk,
+            best_down_mae,
+            bad_epochs,
+        ) = resume_training(
             resume_path, model, optimizer, scheduler, scaler, config, context
         )
 
@@ -3633,22 +3724,15 @@ def train_select_and_predict(
             if dev_output is None or dev_output.metrics is None:
                 raise RuntimeError("Dev labels/metrics are required for model selection")
             metrics = dev_output.metrics
-            qwk = metrics["qwk"]
-            mae = metrics["mae"]
-            selection_qwk = qwk if math.isfinite(qwk) else -math.inf
-            qwk_tied = (
-                abs(selection_qwk - best_qwk) <= 1e-12
-                if math.isfinite(selection_qwk) and math.isfinite(best_qwk)
-                else selection_qwk == best_qwk
-            )
-            improved = (
-                not has_selected_model
-                or selection_qwk > best_qwk + 1e-12
-                or (qwk_tied and mae < best_mae)
+            selection_qwk, down_mae, improved = down_checkpoint_decision(
+                metrics,
+                best_down_qwk=best_down_qwk,
+                best_down_mae=best_down_mae,
+                has_selected_model=has_selected_model,
             )
             if improved:
-                best_qwk = selection_qwk
-                best_mae = mae
+                best_down_qwk = selection_qwk
+                best_down_mae = down_mae
                 bad_epochs = 0
                 save_best_model(model, tokenizer, config, metrics)
                 has_selected_model = True
@@ -3664,10 +3748,16 @@ def train_select_and_predict(
                 "train_ce5": train_losses["ce5"],
                 "train_ce7": train_losses["ce7"],
                 "dev_mse": metrics["mse"],
-                "dev_mae": metrics["mae"],
-                "dev_qwk": metrics["qwk"],
-                "dev_exact_accuracy": metrics["exact_accuracy"],
-                "dev_adjacent_accuracy": metrics["adjacent_accuracy"],
+                "dev_down_mae": metrics["down_mae"],
+                "dev_down_qwk": metrics["down_qwk"],
+                "dev_down_exact_accuracy": metrics["down_exact_accuracy"],
+                "dev_down_adjacent_accuracy": metrics["down_adjacent_accuracy"],
+                "dev_round_mae": metrics["round_mae"],
+                "dev_round_qwk": metrics["round_qwk"],
+                "dev_round_exact_accuracy": metrics["round_exact_accuracy"],
+                "dev_round_adjacent_accuracy": metrics[
+                    "round_adjacent_accuracy"
+                ],
                 "dev_up_mae": metrics["up_mae"],
                 "dev_up_qwk": metrics["up_qwk"],
                 "dev_up_exact_accuracy": metrics["up_exact_accuracy"],
@@ -3682,16 +3772,23 @@ def train_select_and_predict(
             write_training_history(history, config)
             LOGGER.info(
                 "Epoch %d | train_total=%.6f mse19=%.6f ce3=%.4f ce5=%.4f "
-                "ce7=%.4f | Dev round_qwk=%s round_mae=%.4f up_qwk=%s "
-                "up_mae=%.4f aux_acc=(%s,%s,%s) time=%.1fs best=%s",
+                "ce7=%.4f | Dev down_qwk=%s down_mae=%.4f "
+                "round_qwk=%s round_mae=%.4f up_qwk=%s up_mae=%.4f "
+                "aux_acc=(%s,%s,%s) time=%.1fs down_best=%s",
                 epoch + 1,
                 train_losses["total"],
                 train_losses["mse19"],
                 train_losses["ce3"],
                 train_losses["ce5"],
                 train_losses["ce7"],
-                f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
-                metrics["mae"],
+                f"{metrics['down_qwk']:.6f}"
+                if math.isfinite(metrics["down_qwk"])
+                else "nan",
+                metrics["down_mae"],
+                f"{metrics['round_qwk']:.6f}"
+                if math.isfinite(metrics["round_qwk"])
+                else "nan",
+                metrics["round_mae"],
                 f"{metrics['up_qwk']:.6f}"
                 if math.isfinite(metrics["up_qwk"])
                 else "nan",
@@ -3709,8 +3806,8 @@ def train_select_and_predict(
                 improved,
             )
             decision = {
-                "best_qwk": best_qwk,
-                "best_mae": best_mae,
+                "best_down_qwk": best_down_qwk,
+                "best_down_mae": best_down_mae,
                 "bad_epochs": bad_epochs,
                 "has_selected_model": has_selected_model,
                 "stop": bad_epochs >= config.EARLY_STOPPING_PATIENCE,
@@ -3719,8 +3816,8 @@ def train_select_and_predict(
         decision = broadcast_object(decision, context)
         if not isinstance(decision, dict):
             raise RuntimeError("Failed to broadcast model-selection decision")
-        best_qwk = float(decision["best_qwk"])
-        best_mae = float(decision["best_mae"])
+        best_down_qwk = float(decision["best_down_qwk"])
+        best_down_mae = float(decision["best_down_mae"])
         bad_epochs = int(decision["bad_epochs"])
         has_selected_model = bool(decision["has_selected_model"])
         rng_states = gather_rng_states(context)
@@ -3733,8 +3830,8 @@ def train_select_and_predict(
                 scaler,
                 epoch=epoch,
                 global_step=global_step,
-                best_qwk=best_qwk,
-                best_mae=best_mae,
+                best_down_qwk=best_down_qwk,
+                best_down_mae=best_down_mae,
                 bad_epochs=bad_epochs,
                 config=config,
                 rng_states=rng_states,
@@ -3897,8 +3994,7 @@ def train_multiseed_ensemble(
             )
         create_submissions(
             ensemble_test.ids,
-            ensemble_test.final_predictions,
-            ensemble_test.up_predictions,
+            ensemble_test.down_predictions,
             config,
         )
     distributed_barrier(context)
@@ -4016,14 +4112,8 @@ def validate_config(config: Config) -> None:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
     if config.SAMPLER_ALPHA < 0.0:
         raise ValueError("SAMPLER_ALPHA cannot be negative")
-    submission_names = {
-        config.SUBMISSION_ROUND_BASENAME,
-        config.SUBMISSION_UP_BASENAME,
-        config.SUBMISSION_ROUND_ZIP_NAME,
-        config.SUBMISSION_UP_ZIP_NAME,
-    }
-    if len(submission_names) != 4:
-        raise ValueError("Round/up submission source and ZIP names must be distinct")
+    if config.SUBMISSION_DOWN_BASENAME == config.SUBMISSION_DOWN_ZIP_NAME:
+        raise ValueError("Down submission source and ZIP names must be distinct")
     if config.SUBMISSION_BASENAME != "prediction":
         raise ValueError("The official ZIP member must remain named 'prediction'")
     if not config.ENSEMBLE_SEEDS:
