@@ -8,12 +8,12 @@ pipeline nằm trong `train.py` và có thể chạy bằng một lệnh:
 python train.py
 ```
 
-Pipeline sử dụng D3Tok thật của CAMeL Tools và ensemble năm mô hình AraBERTv2
-curriculum cùng kiến trúc, được fine-tune độc lập với seed `42, 52, 62, 72, 82`.
+Pipeline sử dụng D3Tok thật của CAMeL Tools và ensemble ba mô hình AraBERTv2
+curriculum cùng kiến trúc, được fine-tune độc lập với seed `42, 52, 62`.
 Mỗi mô hình học tuần tự bốn stage `3 → 5 → 7 → 19`: ba stage đầu dùng
 cross-entropy, stage cuối dùng regression MSE. Encoder tốt nhất được chuyển sang
 stage kế tiếp và mỗi stage khởi tạo một head mới. Kết quả
-cuối là trung bình đều của năm raw score, sau đó `np.rint` và clip vào `[1, 19]`;
+cuối là trung bình đều của ba raw score, sau đó `np.rint` và clip vào `[1, 19]`;
 không tối ưu threshold và không học ensemble weight. Khi Kaggle cung cấp hai GPU
 T4, script tự khởi chạy PyTorch DDP; không cần gọi `torchrun` thủ công.
 
@@ -215,7 +215,7 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
 | Optimizer | `ENCODER_LR=2e-5`, `TRANSFER_ENCODER_LR=1e-5`, `HEAD_LR=1e-4` | Stage 3 dùng encoder LR ban đầu; stage 5/7/19 dùng transfer LR |
 | Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
-| Ensemble | `ENSEMBLE_SEEDS=(42, 52, 62, 72, 82)` | Năm lần fine-tune độc lập trên cùng Train |
+| Ensemble | `ENSEMBLE_SEEDS=(42, 52, 62)` | Ba lần fine-tune độc lập trên cùng Train |
 | Seed artifacts | `SEED_RUNS_DIR="outputs/seeds"` | Best model/checkpoint/log riêng của từng seed |
 | DDP | `DDP_TIMEOUT_MINUTES=180` | Cho phép rank 0 hoàn tất cache D3Tok đầu tiên |
 | Cache | `FORCE_REPROCESS=False` | Bỏ cache và D3Tok lại khi bật |
@@ -409,7 +409,7 @@ hòa; chỉ encoder của checkpoint đó được chuyển sang stage kế ti�
 Dev QWK vẫn là tiêu chí chính và MAE thấp hơn dùng để phá hòa. Early stopping
 được áp dụng riêng cho từng stage và không nhìn Test.
 
-Sau khi có năm best checkpoint, script chạy lại từng member trên Dev/Test, kiểm
+Sau khi có ba best checkpoint, script chạy lại từng member trên Dev/Test, kiểm
 tra ID và thứ tự hoàn toàn trùng nhau, rồi lấy trung bình đều của **raw regression
 score**. Chỉ raw score trung bình mới được `np.rint`, clip vào `[1, 19]` và
 chuyển sang integer. Không threshold optimization, không QWK-weighting và không
@@ -446,7 +446,7 @@ python train.py --smoke-test
 ```
 
 Smoke mode dùng hai seed `42, 52` để kiểm tra cả phép ensemble mà không phải chạy
-đủ năm member. Nó kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi
+đủ ba member. Nó kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi
 dấu phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
 sampler, forward/backward tuần tự của đủ bốn curriculum stage, metric,
 checkpoint/reload,
@@ -488,9 +488,7 @@ outputs/
 │   │   ├── diagnostics/
 │   │   └── logs/
 │   ├── seed_52/
-│   ├── seed_62/
-│   ├── seed_72/
-│   └── seed_82/
+│   └── seed_62/
 ├── logs/
 │   ├── curriculum.json
 │   ├── preprocessing_report.json
@@ -586,7 +584,7 @@ Không tự đổi tên thành `prediction.csv`. Mở ZIP và xác nhận nó ch
 
 ## 17. Reproducibility và báo cáo kết quả
 
-Năm seed cố định được đặt cho Python, NumPy, PyTorch CPU/CUDA, DataLoader và
+Ba seed cố định được đặt cho Python, NumPy, PyTorch CPU/CUDA, DataLoader và
 sampler. `ensemble_report.json` ghi metric từng member, mean/std Dev QWK, metric
 ensemble và xác nhận policy là uniform raw-score mean. Tuy vậy, khác biệt
 CUDA/library vẫn có thể gây sai khác nhỏ. Hãy lưu config, commit hash, log và

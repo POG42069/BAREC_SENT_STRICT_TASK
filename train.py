@@ -135,7 +135,7 @@ class Config:
     WARMUP_RATIO: float = 0.1
     MAX_GRAD_NORM: float = 1.0
     EARLY_STOPPING_PATIENCE: int = 2
-    ENSEMBLE_SEEDS: tuple[int, ...] = (42, 52, 62, 72, 82)
+    ENSEMBLE_SEEDS: tuple[int, ...] = (42, 52, 62)
     # Active seed for one ensemble member. The top-level pipeline overwrites
     # this field with each value from ENSEMBLE_SEEDS.
     SEED: int = 42
