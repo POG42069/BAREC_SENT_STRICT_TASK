@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BAREC 2026 sentence-level Strict Track HMTL regression ensemble.
+"""BAREC 2026 sentence-level Strict Track curriculum regression ensemble.
 
 The complete workflow lives in this file: validation, Arabic D3Tok
 preprocessing, distributed fine-tuning, per-seed model selection, raw-score
@@ -85,6 +85,8 @@ FIELD_TOKENS = (
     "[TC_SPECIALIZED]",
     "[TC_UNKNOWN]",
 )
+CURRICULUM_CLASSIFICATION_STAGES = (3, 5, 7)
+CURRICULUM_STAGES = (*CURRICULUM_CLASSIFICATION_STAGES, 19)
 
 
 @dataclass
@@ -121,11 +123,13 @@ class Config:
     D3TOK_BATCH_SIZE: int = 256
 
     # Training.
+    # Maximum epochs for each curriculum stage (3, 5, 7, and 19 levels).
     NUM_EPOCHS: int = 5
     PER_DEVICE_BATCH_SIZE: int = 8
     EVAL_BATCH_SIZE: int = 16
     GRADIENT_ACCUMULATION_STEPS: int = 2
     ENCODER_LR: float = 2e-5
+    TRANSFER_ENCODER_LR: float = 1e-5
     HEAD_LR: float = 1e-4
     WEIGHT_DECAY: float = 0.01
     WARMUP_RATIO: float = 0.1
@@ -141,11 +145,12 @@ class Config:
     USE_WEIGHTED_SAMPLER: bool = True
     SAMPLER_ALPHA: float = 0.5
     SAMPLER_REPLACEMENT: bool = True
-    # Auxiliary CE weights for the 3-, 5-, and 7-level HMTL heads. The
-    # 19-level scalar regression remains the main task with MSE weight 1.0.
-    HMTL_AUX_LOSS_WEIGHTS: tuple[float, float, float] = (0.4, 0.5, 0.6)
     DDP_TIMEOUT_MINUTES: int = 180
-    LOG_EVERY_N_STEPS: int = 50
+    # Kaggle Save Version captures carriage-return progress bars as many noisy
+    # log fragments. Keep them off by default and emit one normal log record at
+    # this interval instead. Set SHOW_PROGRESS_BARS=True for an interactive run.
+    SHOW_PROGRESS_BARS: bool = False
+    LOG_EVERY_N_STEPS: int = 250
     RESUME_FROM_CHECKPOINT: Optional[str] = None
 
     # Labels and submission.
@@ -237,9 +242,14 @@ def configure_logging(rank: int) -> None:
     """Configure concise rank-aware logging."""
 
     level = logging.INFO if rank == 0 else logging.WARNING
+    log_format = (
+        "%(asctime)s | %(levelname)s | %(message)s"
+        if rank == 0
+        else f"%(asctime)s | rank={rank} | %(levelname)s | %(message)s"
+    )
     logging.basicConfig(
         level=level,
-        format=f"%(asctime)s | rank={rank} | %(levelname)s | %(message)s",
+        format=log_format,
         datefmt="%H:%M:%S",
         force=True,
     )
@@ -403,8 +413,7 @@ def distributed_barrier(context: DistributedContext) -> None:
 ID_ALIASES = ("ID", "Sentence ID", "Sentence_ID")
 TEXT_ALIASES = ("Sentence", "sentence", "text")
 LABEL_ALIASES = ("Readability_Level_19", "Prediction", "label")
-HMTL_LEVELS = (3, 5, 7)
-HMTL_LABEL_ALIASES = {
+CURRICULUM_LABEL_ALIASES = {
     3: ("Readability_Level_3", "label_3", "level_3"),
     5: ("Readability_Level_5", "label_5", "level_5"),
     7: ("Readability_Level_7", "label_7", "level_7"),
@@ -456,8 +465,8 @@ def resolve_column(
     return matches[0]
 
 
-def hmtl_label_column(config: Config, level: int) -> str:
-    """Return the configured source column for one auxiliary HMTL task."""
+def curriculum_label_column(config: Config, level: int) -> str:
+    """Return the configured source column for one coarse curriculum stage."""
 
     configured = {
         3: config.LABEL_COLUMN_3,
@@ -467,30 +476,30 @@ def hmtl_label_column(config: Config, level: int) -> str:
     try:
         return configured[level]
     except KeyError as error:
-        raise ValueError(f"Unsupported HMTL level: {level}") from error
+        raise ValueError(f"Unsupported curriculum level: {level}") from error
 
 
-def parse_hmtl_labels(
+def parse_curriculum_labels(
     frame: pd.DataFrame,
     column: str,
     *,
     level: int,
     split_name: str,
 ) -> np.ndarray:
-    """Validate an auxiliary label column as integers in ``[1, level]``."""
+    """Validate a curriculum label column as integers in ``[1, level]``."""
 
     source = frame[column]
     if source.isna().any():
         rows = frame.index[source.isna()].tolist()[:10]
         raise ValueError(
-            f"{split_name}: missing level-{level} HMTL labels at rows {rows}"
+            f"{split_name}: missing level-{level} curriculum labels at rows {rows}"
         )
     numeric = pd.to_numeric(source, errors="coerce").to_numpy(dtype=np.float64)
     invalid = ~np.isfinite(numeric) | ~np.isclose(numeric, np.rint(numeric))
     if invalid.any():
         rows = np.flatnonzero(invalid)[:10].tolist()
         raise ValueError(
-            f"{split_name}: invalid level-{level} HMTL labels at rows {rows}"
+            f"{split_name}: invalid level-{level} curriculum labels at rows {rows}"
         )
     labels = np.rint(numeric).astype(np.int64)
     outside = (labels < 1) | (labels > level)
@@ -526,24 +535,26 @@ def load_split(
         "label",
         required=require_label,
     )
-    hmtl_columns = {
+    curriculum_columns = {
         level: resolve_column(
             columns,
-            hmtl_label_column(config, level),
-            HMTL_LABEL_ALIASES[level],
-            f"level-{level} HMTL label",
+            curriculum_label_column(config, level),
+            CURRICULUM_LABEL_ALIASES[level],
+            f"level-{level} curriculum label",
             required=require_label,
         )
-        for level in HMTL_LEVELS
+        for level in CURRICULUM_CLASSIFICATION_STAGES
     }
-    present_hmtl_columns = {
+    present_curriculum_columns = {
         level: column
-        for level, column in hmtl_columns.items()
+        for level, column in curriculum_columns.items()
         if column is not None
     }
-    if present_hmtl_columns and len(present_hmtl_columns) != len(HMTL_LEVELS):
+    if present_curriculum_columns and len(present_curriculum_columns) != len(
+        CURRICULUM_CLASSIFICATION_STAGES
+    ):
         raise ValueError(
-            f"{split_name}: HMTL label columns for levels 3, 5 and 7 must "
+            f"{split_name}: curriculum label columns for levels 3, 5 and 7 must "
             "be provided together"
         )
     document_column = resolve_column(
@@ -610,12 +621,12 @@ def load_split(
                 )
             frame["_label"] = labels
 
-    for level in HMTL_LEVELS:
+    for level in CURRICULUM_CLASSIFICATION_STAGES:
         output_column = f"_label_{level}"
-        source_column = hmtl_columns[level]
+        source_column = curriculum_columns[level]
         frame[output_column] = np.nan
         if source_column is not None:
-            frame[output_column] = parse_hmtl_labels(
+            frame[output_column] = parse_curriculum_labels(
                 frame,
                 source_column,
                 level=level,
@@ -642,12 +653,14 @@ def load_split(
     )
     frame["_original_index"] = np.arange(len(frame), dtype=np.int64)
     frame.attrs["has_labels"] = label_column is not None
-    frame.attrs["has_hmtl_labels"] = len(present_hmtl_columns) == len(HMTL_LEVELS)
+    frame.attrs["has_curriculum_labels"] = len(present_curriculum_columns) == len(
+        CURRICULUM_CLASSIFICATION_STAGES
+    )
     frame.attrs["source_path"] = str(path)
     return frame
 
 
-def validate_hmtl_hierarchy(
+def validate_curriculum_hierarchy(
     train_frame: pd.DataFrame,
     dev_frame: pd.DataFrame,
     test_frame: pd.DataFrame,
@@ -655,8 +668,10 @@ def validate_hmtl_hierarchy(
 ) -> dict[int, tuple[int, int, int]]:
     """Validate the deterministic 19 -> 7 -> 5 -> 3 label relationships."""
 
-    if not bool(train_frame.attrs.get("has_hmtl_labels", False)):
-        raise ValueError("Train must contain level-3, level-5 and level-7 HMTL labels")
+    if not bool(train_frame.attrs.get("has_curriculum_labels", False)):
+        raise ValueError(
+            "Train must contain level-3, level-5 and level-7 curriculum labels"
+        )
     paths_by_leaf: dict[int, tuple[int, int, int]] = {}
     for row in train_frame[["_label", "_label_3", "_label_5", "_label_7"]].itertuples(
         index=False,
@@ -667,14 +682,16 @@ def validate_hmtl_hierarchy(
         previous = paths_by_leaf.setdefault(leaf, path)
         if previous != path:
             raise ValueError(
-                f"Train leaf {leaf} maps to multiple HMTL paths: {previous} and {path}"
+                f"Train leaf {leaf} maps to multiple curriculum paths: "
+                f"{previous} and {path}"
             )
     expected_leaves = set(range(config.MIN_LABEL, config.MAX_LABEL + 1))
     if set(paths_by_leaf) != expected_leaves:
         missing = sorted(expected_leaves - set(paths_by_leaf))
         extra = sorted(set(paths_by_leaf) - expected_leaves)
         raise ValueError(
-            f"Train HMTL mapping must cover all 19 leaves; missing={missing}, extra={extra}"
+            f"Train curriculum mapping must cover all 19 leaves; "
+            f"missing={missing}, extra={extra}"
         )
 
     observed_by_level = {
@@ -686,7 +703,7 @@ def validate_hmtl_hierarchy(
         expected = set(range(1, level + 1))
         if observed != expected:
             raise ValueError(
-                f"Train HMTL level {level} must cover every class; "
+                f"Train curriculum level {level} must cover every class; "
                 f"missing={sorted(expected - observed)}, extra={sorted(observed - expected)}"
             )
 
@@ -702,7 +719,7 @@ def validate_hmtl_hierarchy(
             previous = child_to_parent.setdefault(child, parent)
             if previous != parent:
                 raise ValueError(
-                    f"Train HMTL {relationship} is not deterministic: child "
+                    f"Train curriculum {relationship} is not deterministic: child "
                     f"{child} maps to both {previous} and {parent}"
                 )
 
@@ -711,11 +728,11 @@ def validate_hmtl_hierarchy(
         ("dev", dev_frame),
         ("test", test_frame),
     ):
-        if not bool(frame.attrs.get("has_hmtl_labels", False)):
+        if not bool(frame.attrs.get("has_curriculum_labels", False)):
             continue
         if not bool(frame.attrs.get("has_labels", False)):
             raise ValueError(
-                f"{split_name}: auxiliary HMTL labels exist without level-19 labels"
+                f"{split_name}: curriculum labels exist without level-19 labels"
             )
         for row_index, row in enumerate(
             frame[["_label", "_label_3", "_label_5", "_label_7"]].itertuples(
@@ -728,7 +745,7 @@ def validate_hmtl_hierarchy(
             expected = paths_by_leaf[leaf]
             if observed != expected:
                 raise ValueError(
-                    f"{split_name}: HMTL path mismatch at row {row_index}: "
+                    f"{split_name}: curriculum path mismatch at row {row_index}: "
                     f"leaf={leaf}, observed={observed}, expected={expected}"
                 )
     return paths_by_leaf
@@ -783,11 +800,11 @@ def log_split_summary(name: str, frame: pd.DataFrame, config: Config) -> None:
             for label in range(config.MIN_LABEL, config.MAX_LABEL + 1)
         }
         LOGGER.info("%s label distribution: %s", name, distribution)
-    if frame.attrs.get("has_hmtl_labels", False):
-        for level in HMTL_LEVELS:
+    if frame.attrs.get("has_curriculum_labels", False):
+        for level in CURRICULUM_CLASSIFICATION_STAGES:
             counts = frame[f"_label_{level}"].astype(int).value_counts().sort_index()
             LOGGER.info(
-                "%s level-%d HMTL distribution: %s",
+                "%s level-%d curriculum distribution: %s",
                 name,
                 level,
                 {label: int(counts.get(label, 0)) for label in range(1, level + 1)},
@@ -1353,6 +1370,7 @@ def build_preprocessing_cache(
                     executor.map(_preprocess_worker_batch, item_batches, chunksize=1),
                     total=len(item_batches),
                     desc=f"BERT D3Tok {cache_path.stem}",
+                    disable=not config.SHOW_PROGRESS_BARS,
                 )
                 for row in batch_rows
             ]
@@ -1363,6 +1381,7 @@ def build_preprocessing_cache(
         for item_batch in tqdm(
             item_batches,
             desc=f"BERT D3Tok {cache_path.stem}",
+            disable=not config.SHOW_PROGRESS_BARS,
         ):
             results = preprocessor.process_many([text for _, text in item_batch])
             rows.extend(
@@ -1701,13 +1720,15 @@ class BARECDataset(Dataset[dict[str, Any]]):
         self.labels = (
             frame["_label"].astype(float).tolist() if self.has_labels else None
         )
-        self.has_hmtl_labels = bool(frame.attrs.get("has_hmtl_labels", False))
-        self.hmtl_labels = (
+        self.has_curriculum_labels = bool(
+            frame.attrs.get("has_curriculum_labels", False)
+        )
+        self.curriculum_labels = (
             {
                 level: frame[f"_label_{level}"].astype(int).tolist()
-                for level in HMTL_LEVELS
+                for level in CURRICULUM_CLASSIFICATION_STAGES
             }
-            if self.has_hmtl_labels
+            if self.has_curriculum_labels
             else None
         )
         self.tokenizer = tokenizer
@@ -1729,9 +1750,9 @@ class BARECDataset(Dataset[dict[str, Any]]):
         item["original_index"] = self.indices[index]
         if self.labels is not None:
             item["label"] = self.labels[index]
-        if self.hmtl_labels is not None:
-            for level in HMTL_LEVELS:
-                item[f"label_{level}"] = self.hmtl_labels[level][index]
+        if self.curriculum_labels is not None:
+            for level in CURRICULUM_CLASSIFICATION_STAGES:
+                item[f"label_{level}"] = self.curriculum_labels[level][index]
         return item
 
 
@@ -1747,10 +1768,13 @@ class BARECCollator:
         indices: list[int] = []
         labels: list[float] = []
         labels_present = "label" in features[0]
-        hmtl_labels_present = all(
-            f"label_{level}" in features[0] for level in HMTL_LEVELS
+        curriculum_labels_present = all(
+            f"label_{level}" in features[0]
+            for level in CURRICULUM_CLASSIFICATION_STAGES
         )
-        hmtl_labels = {level: [] for level in HMTL_LEVELS}
+        curriculum_labels = {
+            level: [] for level in CURRICULUM_CLASSIFICATION_STAGES
+        }
         for feature in features:
             model_features.append(
                 {
@@ -1761,7 +1785,10 @@ class BARECCollator:
                         "sample_id",
                         "original_index",
                         "label",
-                        *(f"label_{level}" for level in HMTL_LEVELS),
+                        *(
+                            f"label_{level}"
+                            for level in CURRICULUM_CLASSIFICATION_STAGES
+                        ),
                     }
                 }
             )
@@ -1769,18 +1796,18 @@ class BARECCollator:
             indices.append(int(feature["original_index"]))
             if labels_present:
                 labels.append(float(feature["label"]))
-            if hmtl_labels_present:
-                for level in HMTL_LEVELS:
-                    hmtl_labels[level].append(int(feature[f"label_{level}"]))
+            if curriculum_labels_present:
+                for level in CURRICULUM_CLASSIFICATION_STAGES:
+                    curriculum_labels[level].append(int(feature[f"label_{level}"]))
         batch = dict(self.tokenizer.pad(model_features, padding=True, return_tensors="pt"))
         batch["sample_ids"] = sample_ids
         batch["original_indices"] = torch.tensor(indices, dtype=torch.long)
         if labels_present:
             batch["labels"] = torch.tensor(labels, dtype=torch.float32)
-        if hmtl_labels_present:
-            for level in HMTL_LEVELS:
+        if curriculum_labels_present:
+            for level in CURRICULUM_CLASSIFICATION_STAGES:
                 batch[f"labels_{level}"] = torch.tensor(
-                    hmtl_labels[level],
+                    curriculum_labels[level],
                     dtype=torch.long,
                 )
         return batch
@@ -1897,16 +1924,16 @@ def run_sampler_checks() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Hierarchical multi-task model and optimization
+# 6. Progressive curriculum model and optimization
 # ---------------------------------------------------------------------------
 
 
-class ArabicReadabilityHMTL(nn.Module):
-    """Shared AraBERT with a main regressor and three coarse auxiliary heads."""
+class ArabicReadabilityCurriculum(nn.Module):
+    """Shared AraBERT trained through one active readability stage at a time."""
 
     def __init__(self, model_name: str, dropout: float) -> None:
         super().__init__()
-        # Every HMTL head consumes raw CLS from last_hidden_state. A
+        # Every curriculum head consumes raw CLS from last_hidden_state. A
         # BertModel pooler would therefore be trainable but disconnected from
         # the loss, which makes DDP fail on the following iteration when
         # find_unused_parameters=False.  Do not instantiate those two unused
@@ -1922,18 +1949,48 @@ class ArabicReadabilityHMTL(nn.Module):
         ]
         if trainable_pooler_parameters:
             raise RuntimeError(
-                "The CLS HMTL model must not retain trainable encoder-pooler "
+                "The CLS curriculum model must not retain trainable encoder-pooler "
                 f"parameters: {trainable_pooler_parameters}"
             )
         hidden_size = int(self.encoder.config.hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.regression_head = nn.Linear(hidden_size, 1)
-        self.auxiliary_heads = nn.ModuleDict(
+        self.classification_heads = nn.ModuleDict(
             {
                 str(level): nn.Linear(hidden_size, level)
-                for level in HMTL_LEVELS
+                for level in CURRICULUM_CLASSIFICATION_STAGES
             }
         )
+        self.active_stage = CURRICULUM_STAGES[0]
+        self.activate_stage(self.active_stage, reset_head=False)
+
+    def stage_head(self, stage: int) -> nn.Linear:
+        """Return the head used by one curriculum stage."""
+
+        if stage == 19:
+            return self.regression_head
+        if stage in CURRICULUM_CLASSIFICATION_STAGES:
+            return self.classification_heads[str(stage)]
+        raise ValueError(f"Unsupported curriculum stage: {stage}")
+
+    def activate_stage(self, stage: int, *, reset_head: bool) -> None:
+        """Activate one fresh head while keeping the shared encoder trainable."""
+
+        if stage not in CURRICULUM_STAGES:
+            raise ValueError(f"Unsupported curriculum stage: {stage}")
+        for parameter in self.regression_head.parameters():
+            parameter.requires_grad_(False)
+        for head in self.classification_heads.values():
+            for parameter in head.parameters():
+                parameter.requires_grad_(False)
+        active_head = self.stage_head(stage)
+        if reset_head:
+            active_head.reset_parameters()
+        for parameter in active_head.parameters():
+            parameter.requires_grad_(True)
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad_(True)
+        self.active_stage = stage
 
     def forward(
         self,
@@ -1941,7 +1998,7 @@ class ArabicReadabilityHMTL(nn.Module):
         attention_mask: torch.Tensor,
         token_type_ids: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        """Return the ordinal score and logits for all coarse HMTL tasks."""
+        """Return only the output belonging to the active curriculum stage."""
 
         encoder_arguments: dict[str, torch.Tensor] = {
             "input_ids": input_ids,
@@ -1952,25 +2009,22 @@ class ArabicReadabilityHMTL(nn.Module):
         outputs = self.encoder(**encoder_arguments)
         cls_embedding = outputs.last_hidden_state[:, 0, :]
         shared_representation = self.dropout(cls_embedding)
-        output = {
-            "score": self.regression_head(shared_representation).squeeze(-1)
-        }
-        output.update(
-            {
-                f"logits_{level}": self.auxiliary_heads[str(level)](
-                    shared_representation
-                )
-                for level in HMTL_LEVELS
+        if self.active_stage == 19:
+            return {
+                "score": self.regression_head(shared_representation).squeeze(-1)
             }
-        )
-        return output
+        return {
+            "logits": self.classification_heads[str(self.active_stage)](
+                shared_representation
+            )
+        }
 
 
-def unwrap_model(model: nn.Module) -> ArabicReadabilityHMTL:
+def unwrap_model(model: nn.Module) -> ArabicReadabilityCurriculum:
     """Return the underlying model whether or not DDP wraps it."""
 
     unwrapped = model.module if isinstance(model, DDP) else model
-    if not isinstance(unwrapped, ArabicReadabilityHMTL):
+    if not isinstance(unwrapped, ArabicReadabilityCurriculum):
         raise TypeError(f"Unexpected model type: {type(unwrapped)}")
     return unwrapped
 
@@ -1991,24 +2045,33 @@ def split_decay_parameters(module: nn.Module) -> tuple[list[nn.Parameter], list[
     return decay, no_decay
 
 
-def create_optimizer(model: nn.Module, config: Config) -> AdamW:
-    """Create AdamW groups with independent encoder/head learning rates."""
+def curriculum_encoder_lr(config: Config, stage: int) -> float:
+    """Use the LIS initial learning rate, then its lower transfer-stage rate."""
+
+    return config.ENCODER_LR if stage == CURRICULUM_STAGES[0] else config.TRANSFER_ENCODER_LR
+
+
+def create_optimizer(model: nn.Module, config: Config, stage: int) -> AdamW:
+    """Create AdamW groups for the shared encoder and active stage head."""
 
     base = unwrap_model(model)
+    if base.active_stage != stage:
+        raise ValueError(
+            f"Optimizer stage mismatch: model={base.active_stage}, requested={stage}"
+        )
     encoder_decay, encoder_no_decay = split_decay_parameters(base.encoder)
-    head_decay, head_no_decay = split_decay_parameters(
-        nn.ModuleList([base.dropout, base.regression_head, base.auxiliary_heads])
-    )
+    head_decay, head_no_decay = split_decay_parameters(base.stage_head(stage))
+    encoder_lr = curriculum_encoder_lr(config, stage)
     groups = [
         {
             "params": encoder_decay,
-            "lr": config.ENCODER_LR,
+            "lr": encoder_lr,
             "weight_decay": config.WEIGHT_DECAY,
             "group_name": "encoder_decay",
         },
         {
             "params": encoder_no_decay,
-            "lr": config.ENCODER_LR,
+            "lr": encoder_lr,
             "weight_decay": 0.0,
             "group_name": "encoder_no_decay",
         },
@@ -2062,8 +2125,15 @@ def scaled_optimizer_step(
 def model_forward(
     model: nn.Module,
     batch: Mapping[str, Any],
+    stage: int,
 ) -> dict[str, torch.Tensor]:
-    """Pass encoder tensors into HMTL and validate every output shape."""
+    """Run and validate the output for one active curriculum stage."""
+
+    active_stage = unwrap_model(model).active_stage
+    if active_stage != stage:
+        raise ValueError(
+            f"Forward stage mismatch: model={active_stage}, requested={stage}"
+        )
 
     outputs = model(
         input_ids=batch["input_ids"],
@@ -2071,61 +2141,55 @@ def model_forward(
         token_type_ids=batch.get("token_type_ids"),
     )
     if not isinstance(outputs, Mapping):
-        raise AssertionError("HMTL model must return a mapping")
+        raise AssertionError("Curriculum model must return a mapping")
     batch_size = batch["input_ids"].shape[0]
-    expected_keys = {"score", *(f"logits_{level}" for level in HMTL_LEVELS)}
+    expected_keys = {"score"} if stage == 19 else {"logits"}
     if set(outputs) != expected_keys:
         raise AssertionError(
-            f"HMTL output keys differ: expected={sorted(expected_keys)}, "
+            f"Curriculum output keys differ: expected={sorted(expected_keys)}, "
             f"actual={sorted(outputs)}"
         )
-    if outputs["score"].ndim != 1 or outputs["score"].shape[0] != batch_size:
-        raise AssertionError(
-            "Regression output must have shape [batch_size], got "
-            f"{tuple(outputs['score'].shape)}"
-        )
-    validated = {"score": outputs["score"]}
-    for level in HMTL_LEVELS:
-        logits = outputs[f"logits_{level}"]
-        if tuple(logits.shape) != (batch_size, level):
+    if stage == 19:
+        score = outputs["score"]
+        if score.ndim != 1 or score.shape[0] != batch_size:
             raise AssertionError(
-                f"Level-{level} HMTL logits must have shape "
-                f"({batch_size}, {level}), got {tuple(logits.shape)}"
+                "Regression output must have shape [batch_size], got "
+                f"{tuple(score.shape)}"
             )
-        validated[f"logits_{level}"] = logits
-    return validated
+        return {"score": score}
+    logits = outputs["logits"]
+    if tuple(logits.shape) != (batch_size, stage):
+        raise AssertionError(
+            f"Stage-{stage} logits must have shape ({batch_size}, {stage}), "
+            f"got {tuple(logits.shape)}"
+        )
+    return {"logits": logits}
 
 
-def calculate_hmtl_loss(
+def calculate_curriculum_loss(
     outputs: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
-    config: Config,
+    stage: int,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Combine main 19-level MSE with coarse 3/5/7 cross-entropies."""
+    """Calculate only the objective belonging to the active curriculum stage."""
 
-    required = {"labels", *(f"labels_{level}" for level in HMTL_LEVELS)}
-    missing = sorted(required - set(batch))
-    if missing:
-        raise ValueError(f"HMTL training batch is missing labels: {missing}")
-    components: dict[str, torch.Tensor] = {
-        "mse_19": nn.functional.mse_loss(outputs["score"], batch["labels"])
-    }
-    for level in HMTL_LEVELS:
-        targets = batch[f"labels_{level}"].to(dtype=torch.long) - 1
-        if ((targets < 0) | (targets >= level)).any():
-            raise ValueError(f"Level-{level} HMTL target is outside [1, {level}]")
-        components[f"ce_{level}"] = nn.functional.cross_entropy(
-            outputs[f"logits_{level}"],
-            targets,
-        )
-    total = components["mse_19"]
-    for level, weight in zip(HMTL_LEVELS, config.HMTL_AUX_LOSS_WEIGHTS):
-        total = total + float(weight) * components[f"ce_{level}"]
-    return total, components
+    if stage == 19:
+        if "labels" not in batch:
+            raise ValueError("Stage-19 training batch is missing regression labels")
+        loss = nn.functional.mse_loss(outputs["score"], batch["labels"])
+        return loss, {"mse_19": loss}
+    label_key = f"labels_{stage}"
+    if label_key not in batch:
+        raise ValueError(f"Stage-{stage} training batch is missing {label_key}")
+    targets = batch[label_key].to(dtype=torch.long) - 1
+    if ((targets < 0) | (targets >= stage)).any():
+        raise ValueError(f"Stage-{stage} target is outside [1, {stage}]")
+    loss = nn.functional.cross_entropy(outputs["logits"], targets)
+    return loss, {f"ce_{stage}": loss}
 
 
-def run_hmtl_shape_check(
-    model: ArabicReadabilityHMTL,
+def run_curriculum_shape_check(
+    model: ArabicReadabilityCurriculum,
     tokenizer: Any,
     d3tok_text: str,
     surface_text: str,
@@ -2133,9 +2197,8 @@ def run_hmtl_shape_check(
     device: torch.device,
     max_length: int,
     labels_by_level: Mapping[int, int],
-    config: Config,
 ) -> None:
-    """Verify batch-one HMTL shapes, objective, and gradient connectivity."""
+    """Verify every stage's shape, objective, and gradient connectivity."""
 
     encoded = encode_structured_pair(
         tokenizer,
@@ -2156,7 +2219,7 @@ def run_hmtl_shape_check(
         dtype=torch.float32,
         device=device,
     )
-    for level in HMTL_LEVELS:
+    for level in CURRICULUM_CLASSIFICATION_STAGES:
         encoded[f"labels_{level}"] = torch.tensor(
             [int(labels_by_level[level])],
             dtype=torch.long,
@@ -2164,25 +2227,41 @@ def run_hmtl_shape_check(
         )
     was_training = model.training
     model.train()
-    model.zero_grad(set_to_none=True)
     try:
-        outputs = model_forward(model, encoded)
-        loss, components = calculate_hmtl_loss(outputs, encoded, config)
-        if set(components) != {"mse_19", "ce_3", "ce_5", "ce_7"}:
-            raise AssertionError("HMTL objective did not include every task")
-        loss.backward()
-        disconnected = [
-            name
-            for name, parameter in model.named_parameters()
-            if parameter.requires_grad and parameter.grad is None
-        ]
-        if disconnected:
-            raise AssertionError(
-                "Trainable model parameters are disconnected from the HMTL "
-                f"loss: {disconnected}"
-            )
+        for stage in CURRICULUM_STAGES:
+            model.activate_stage(stage, reset_head=False)
+            for candidate_stage in CURRICULUM_STAGES:
+                expected_trainable = candidate_stage == stage
+                if any(
+                    parameter.requires_grad != expected_trainable
+                    for parameter in model.stage_head(candidate_stage).parameters()
+                ):
+                    raise AssertionError(
+                        f"Stage-{stage} head trainability is incorrect for "
+                        f"head {candidate_stage}"
+                    )
+            model.zero_grad(set_to_none=True)
+            outputs = model_forward(model, encoded, stage)
+            loss, components = calculate_curriculum_loss(outputs, encoded, stage)
+            expected_component = "mse_19" if stage == 19 else f"ce_{stage}"
+            if set(components) != {expected_component}:
+                raise AssertionError(
+                    f"Stage-{stage} objective differs: {sorted(components)}"
+                )
+            loss.backward()
+            disconnected = [
+                name
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad and parameter.grad is None
+            ]
+            if disconnected:
+                raise AssertionError(
+                    f"Trainable parameters are disconnected at stage {stage}: "
+                    f"{disconnected}"
+                )
     finally:
         model.zero_grad(set_to_none=True)
+        model.activate_stage(CURRICULUM_STAGES[0], reset_head=False)
         model.train(was_training)
 
 
@@ -2232,6 +2311,33 @@ def calculate_metrics(
         "qwk": qwk,
         "exact_accuracy": float(np.mean(final == truth)),
         "adjacent_accuracy": float(np.mean(np.abs(final - truth) <= 1)),
+    }
+
+
+def calculate_classification_stage_metrics(
+    labels: Sequence[float], predictions: Sequence[float], stage: int
+) -> dict[str, float]:
+    """Calculate ordinal metrics for a coarse curriculum classification stage."""
+
+    if stage not in CURRICULUM_CLASSIFICATION_STAGES:
+        raise ValueError(f"Unsupported classification stage: {stage}")
+    truth = np.asarray(labels, dtype=np.int64)
+    predicted = np.asarray(predictions, dtype=np.int64)
+    qwk = float(
+        cohen_kappa_score(
+            truth,
+            predicted,
+            weights="quadratic",
+            labels=list(range(1, stage + 1)),
+        )
+    )
+    distance = np.abs(predicted - truth)
+    return {
+        "mse": float(np.mean(np.square(distance))),
+        "mae": float(np.mean(distance)),
+        "qwk": qwk,
+        "exact_accuracy": float(np.mean(predicted == truth)),
+        "adjacent_accuracy": float(np.mean(distance <= 1)),
     }
 
 
@@ -2313,9 +2419,10 @@ def evaluate_model(
     config: Config,
     context: DistributedContext,
     *,
+    stage: int,
     description: str,
 ) -> Optional[EvaluationOutput]:
-    """Run distributed inference and return ordered results on rank 0 only."""
+    """Evaluate one curriculum stage and return ordered results on rank 0."""
 
     model.eval()
     local_indices: list[int] = []
@@ -2323,17 +2430,28 @@ def evaluate_model(
     local_predictions: list[float] = []
     local_labels: Optional[list[float]] = []
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
-    progress = tqdm(loader, desc=description, disable=not context.is_main, leave=False)
+    progress = tqdm(
+        loader,
+        desc=description,
+        disable=not (context.is_main and config.SHOW_PROGRESS_BARS),
+        leave=False,
+    )
     for batch in progress:
         batch = move_model_batch(batch, context.device)
         with autocast_context(amp_enabled):
-            predictions = model_forward(model, batch)["score"]
+            outputs = model_forward(model, batch, stage)
+            predictions = (
+                outputs["score"]
+                if stage == 19
+                else torch.argmax(outputs["logits"], dim=1) + 1
+            )
         local_indices.extend(batch["original_indices"].cpu().tolist())
         local_ids.extend(batch["sample_ids"])
         local_predictions.extend(predictions.float().cpu().tolist())
-        if "labels" in batch:
+        label_key = "labels" if stage == 19 else f"labels_{stage}"
+        if label_key in batch:
             assert local_labels is not None
-            local_labels.extend(batch["labels"].float().cpu().tolist())
+            local_labels.extend(batch[label_key].float().cpu().tolist())
         else:
             local_labels = None
 
@@ -2355,8 +2473,18 @@ def evaluate_model(
     ids, indices, raw_predictions, labels = merge_evaluation_payloads(
         payloads, expected_size
     )
-    final_predictions = round_and_clip(raw_predictions, config)
-    metrics = calculate_metrics(labels, raw_predictions, config) if labels is not None else None
+    final_predictions = (
+        round_and_clip(raw_predictions, config)
+        if stage == 19
+        else np.asarray(raw_predictions, dtype=np.int64)
+    )
+    metrics: Optional[dict[str, float]] = None
+    if labels is not None:
+        metrics = (
+            calculate_metrics(labels, raw_predictions, config)
+            if stage == 19
+            else calculate_classification_stage_metrics(labels, raw_predictions, stage)
+        )
     return EvaluationOutput(
         ids,
         indices,
@@ -2485,21 +2613,53 @@ def restore_rng_state(states: Sequence[Mapping[str, Any]], rank: int) -> None:
         )
 
 
+def stage_best_model_directory(config: Config, stage: int) -> Path:
+    """Return the isolated best-model directory for a curriculum stage."""
+
+    if stage == 19:
+        return config.resolve(config.OUTPUT_DIR) / "best_model"
+    return (
+        config.resolve(config.OUTPUT_DIR)
+        / "curriculum"
+        / f"stage_{stage}"
+        / "best_model"
+    )
+
+
+def stage_checkpoint_path(config: Config, stage: int) -> Path:
+    """Return the resumable last-checkpoint path for a curriculum stage."""
+
+    filename = "last.pt" if stage == 19 else f"stage_{stage}_last.pt"
+    return config.resolve(config.CHECKPOINT_DIR) / filename
+
+
+def stage_history_path(config: Config, stage: int) -> Path:
+    """Return the CSV history path for a curriculum stage."""
+
+    filename = "training_history.csv" if stage == 19 else f"stage_{stage}_history.csv"
+    return config.resolve(config.OUTPUT_DIR) / "logs" / filename
+
+
 def save_best_model(
     model: nn.Module,
     tokenizer: Any,
     config: Config,
     metrics: Mapping[str, float],
+    *,
+    stage: int,
 ) -> Path:
-    """Save the task model, tokenizer, config, and best Dev metrics."""
+    """Save the best model and metadata for one curriculum stage."""
 
-    directory = config.resolve(config.OUTPUT_DIR) / "best_model"
+    directory = stage_best_model_directory(config, stage)
     directory.mkdir(parents=True, exist_ok=True)
     model_path = directory / "model_state.pt"
     atomic_torch_save(cpu_model_state(model), model_path)
     tokenizer.save_pretrained(directory / "tokenizer")
     atomic_json_dump(asdict(config), directory / "training_config.json")
-    atomic_json_dump(dict(metrics), directory / "metrics.json")
+    atomic_json_dump(
+        {"stage": stage, "metrics": dict(metrics)},
+        directory / "metrics.json",
+    )
     return model_path
 
 
@@ -2510,10 +2670,11 @@ def save_training_checkpoint(
     scheduler: Any,
     scaler: Any,
     *,
+    stage: int,
     epoch: int,
     global_step: int,
     best_qwk: float,
-    best_mae: float,
+    best_tiebreak: float,
     bad_epochs: int,
     config: Config,
     rng_states: Sequence[Mapping[str, Any]],
@@ -2525,10 +2686,11 @@ def save_training_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
+        "stage": stage,
         "epoch": epoch,
         "global_step": global_step,
         "best_qwk": best_qwk,
-        "best_mae": best_mae,
+        "best_tiebreak": best_tiebreak,
         "bad_epochs": bad_epochs,
         "config": asdict(config),
         "rng_states": list(rng_states),
@@ -2543,10 +2705,18 @@ def resume_training(
     scheduler: Any,
     scaler: Any,
     context: DistributedContext,
+    *,
+    expected_stage: int,
 ) -> tuple[int, int, float, float, int]:
     """Restore a full training checkpoint and return selection state."""
 
     checkpoint = load_torch_file(checkpoint_path, context.device)
+    checkpoint_stage = int(checkpoint.get("stage", -1))
+    if checkpoint_stage != expected_stage:
+        raise ValueError(
+            f"Resume checkpoint stage mismatch: expected={expected_stage}, "
+            f"actual={checkpoint_stage}"
+        )
     unwrap_model(model).load_state_dict(checkpoint["model_state"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -2560,7 +2730,7 @@ def resume_training(
         start_epoch,
         int(checkpoint.get("global_step", 0)),
         float(checkpoint.get("best_qwk", -math.inf)),
-        float(checkpoint.get("best_mae", math.inf)),
+        float(checkpoint.get("best_tiebreak", -math.inf)),
         int(checkpoint.get("bad_epochs", 0)),
     )
 
@@ -2694,12 +2864,13 @@ def train_one_epoch(
     scaler: Any,
     config: Config,
     context: DistributedContext,
+    stage: int,
     epoch: int,
     global_step: int,
     *,
     max_steps: Optional[int],
 ) -> tuple[float, int]:
-    """Train exactly one epoch on Train; Dev/Test never call this function."""
+    """Train exactly one epoch for one curriculum stage on Train only."""
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -2708,11 +2879,15 @@ def train_one_epoch(
     total_examples = 0
     start = time.perf_counter()
     effective_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
+    progress_enabled = context.is_main and config.SHOW_PROGRESS_BARS
     progress = tqdm(
         total=effective_steps,
-        desc=f"Epoch {epoch + 1}/{config.NUM_EPOCHS}",
-        disable=not context.is_main,
+        desc=f"Stage {stage} Epoch {epoch + 1}/{config.NUM_EPOCHS}",
+        disable=not progress_enabled,
     )
+    amp_overflow_count = 0
+    first_overflow_scale: Optional[float] = None
+    latest_overflow_scale: Optional[float] = None
 
     for step, batch in enumerate(loader):
         if step >= effective_steps:
@@ -2729,11 +2904,11 @@ def train_one_epoch(
         )
         with synchronization:
             with autocast_context(amp_enabled):
-                outputs = model_forward(model, batch)
-                raw_loss, loss_components = calculate_hmtl_loss(
+                outputs = model_forward(model, batch, stage)
+                raw_loss, loss_components = calculate_curriculum_loss(
                     outputs,
                     batch,
-                    config,
+                    stage,
                 )
                 window_start = (
                     step // config.GRADIENT_ACCUMULATION_STEPS
@@ -2745,7 +2920,8 @@ def train_one_epoch(
                 scaled_loss = raw_loss / accumulation_window
             scaler.scale(scaled_loss).backward()
 
-        batch_size = int(batch["labels"].shape[0])
+        label_key = "labels" if stage == 19 else f"labels_{stage}"
+        batch_size = int(batch[label_key].shape[0])
         total_loss += float(raw_loss.detach().item()) * batch_size
         total_examples += batch_size
 
@@ -2759,12 +2935,10 @@ def train_one_epoch(
                 scheduler.step()
                 global_step += 1
             elif context.is_main:
-                LOGGER.warning(
-                    "AMP overflow: optimizer and scheduler update skipped; "
-                    "GradScaler %.0f -> %.0f.",
-                    scale_before,
-                    scale_after,
-                )
+                amp_overflow_count += 1
+                if first_overflow_scale is None:
+                    first_overflow_scale = scale_before
+                latest_overflow_scale = scale_after
             optimizer.zero_grad(set_to_none=True)
 
         if context.is_main:
@@ -2780,12 +2954,10 @@ def train_one_epoch(
                 (step + 1) % config.LOG_EVERY_N_STEPS == 0
                 or step + 1 == effective_steps
             ):
-                progress.set_postfix(
+                objective_name = "mse_19" if stage == 19 else f"ce_{stage}"
+                log_values = dict(
                     loss=f"{raw_loss.item():.4f}",
-                    mse=f"{loss_components['mse_19'].item():.4f}",
-                    ce3=f"{loss_components['ce_3'].item():.3f}",
-                    ce5=f"{loss_components['ce_5'].item():.3f}",
-                    ce7=f"{loss_components['ce_7'].item():.3f}",
+                    objective=f"{loss_components[objective_name].item():.4f}",
                     avg=f"{total_loss / max(total_examples, 1):.4f}",
                     enc_lr=f"{encoder_lr:.2e}",
                     head_lr=f"{head_lr:.2e}",
@@ -2794,7 +2966,40 @@ def train_one_epoch(
                     elapsed=f"{elapsed:.0f}s",
                     mem=memory,
                 )
+                if progress_enabled:
+                    progress.set_postfix(**log_values)
+                else:
+                    LOGGER.info(
+                        "Train | stage=%d epoch=%d/%d step=%d/%d (%.0f%%) "
+                        "loss=%s avg=%s objective=%s:%s "
+                        "lr=%s/%s mem=%s elapsed=%s",
+                        stage,
+                        epoch + 1,
+                        config.NUM_EPOCHS,
+                        step + 1,
+                        effective_steps,
+                        100.0 * (step + 1) / max(effective_steps, 1),
+                        log_values["loss"],
+                        log_values["avg"],
+                        objective_name,
+                        log_values["objective"],
+                        log_values["enc_lr"],
+                        log_values["head_lr"],
+                        log_values["mem"],
+                        log_values["elapsed"],
+                    )
     progress.close()
+
+    if context.is_main and amp_overflow_count:
+        LOGGER.warning(
+            "Stage %d epoch %d AMP summary | skipped_updates=%d "
+            "GradScaler=%.0f->%.0f",
+            stage,
+            epoch + 1,
+            amp_overflow_count,
+            first_overflow_scale,
+            latest_overflow_scale,
+        )
 
     totals = torch.tensor(
         [total_loss, float(total_examples)], dtype=torch.float64, device=context.device
@@ -2805,10 +3010,12 @@ def train_one_epoch(
     return mean_loss, global_step
 
 
-def write_training_history(history: Sequence[Mapping[str, Any]], config: Config) -> None:
-    """Persist one row of real metrics per completed epoch."""
+def write_training_history(
+    history: Sequence[Mapping[str, Any]], config: Config, stage: int
+) -> None:
+    """Persist one row of real metrics per completed epoch and stage."""
 
-    path = config.resolve(config.OUTPUT_DIR) / "logs" / "training_history.csv"
+    path = stage_history_path(config, stage)
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(history).to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
 
@@ -3000,30 +3207,34 @@ def write_preprocessing_report(
     )
 
 
-def write_hmtl_hierarchy_report(
+def write_curriculum_report(
     paths_by_leaf: Mapping[int, tuple[int, int, int]],
     config: Config,
 ) -> Path:
-    """Persist the validated deterministic mapping used by the HMTL tasks."""
+    """Persist the validated labels and progressive training schedule."""
 
     payload = {
-        "main_task": {
-            "type": "scalar_regression",
-            "levels": config.MAX_LABEL - config.MIN_LABEL + 1,
-            "loss": "mse",
-        },
-        "auxiliary_tasks": [
-            {"levels": level, "loss": "cross_entropy", "weight": float(weight)}
-            for level, weight in zip(HMTL_LEVELS, config.HMTL_AUX_LOSS_WEIGHTS)
+        "strategy": "progressive_fine_tuning",
+        "stages": [
+            {
+                "levels": stage,
+                "loss": "mse" if stage == 19 else "cross_entropy",
+                "max_epochs": config.NUM_EPOCHS,
+                "encoder_learning_rate": curriculum_encoder_lr(config, stage),
+                "head_learning_rate": config.HEAD_LR,
+                "fresh_head": True,
+            }
+            for stage in CURRICULUM_STAGES
         ],
-        "leaf_to_auxiliary_path": {
+        "transfer": "best_dev_encoder_to_next_stage",
+        "leaf_to_curriculum_path": {
             str(leaf): {"level_3": path[0], "level_5": path[1], "level_7": path[2]}
             for leaf, path in sorted(paths_by_leaf.items())
         },
         "inference": "regression_score_only",
         "ensemble": "uniform_mean_of_raw_seed_scores_then_round_and_clip",
     }
-    path = config.resolve(config.OUTPUT_DIR) / "logs" / "hmtl_hierarchy.json"
+    path = config.resolve(config.OUTPUT_DIR) / "logs" / "curriculum.json"
     atomic_json_dump(payload, path)
     return path
 
@@ -3164,7 +3375,7 @@ def train_select_and_predict(
     *,
     smoke_test: bool,
 ) -> Optional[SeedRunOutput]:
-    """Train one seed, select only on Dev, and return best-model predictions."""
+    """Train one seed through 3->5->7->19 and return final-stage predictions."""
 
     tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, use_fast=True)
     added_tokens = tokenizer.add_tokens(list(FIELD_TOKENS), special_tokens=False)
@@ -3179,7 +3390,7 @@ def train_select_and_predict(
         train_frame, dev_frame, test_frame, tokenizer, config, context
     )
 
-    base_model = ArabicReadabilityHMTL(config.MODEL_NAME, config.DROPOUT)
+    base_model = ArabicReadabilityCurriculum(config.MODEL_NAME, config.DROPOUT)
     embedding_count = int(
         base_model.encoder.get_input_embeddings().num_embeddings
     )
@@ -3189,7 +3400,7 @@ def train_select_and_predict(
         raise RuntimeError("Tokenizer/model vocabulary sizes remain inconsistent")
     base_model.to(context.device)
     probe_row = train_frame.iloc[0].to_dict()
-    run_hmtl_shape_check(
+    run_curriculum_shape_check(
         base_model,
         tokenizer,
         str(probe_row["_d3tok_text"]),
@@ -3203,34 +3414,14 @@ def train_select_and_predict(
             5: int(probe_row["_label_5"]),
             7: int(probe_row["_label_7"]),
         },
-        config,
     )
-    model: nn.Module = base_model
-    if context.distributed:
-        model = DDP(
-            model,
-            device_ids=[context.local_rank] if context.device.type == "cuda" else None,
-            output_device=context.local_rank if context.device.type == "cuda" else None,
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-        )
-
-    optimizer = create_optimizer(model, config)
     epoch_loader_steps = len(train_loader)
     if smoke_test:
         epoch_loader_steps = min(epoch_loader_steps, config.SMOKE_MAX_TRAIN_STEPS)
     updates_per_epoch = math.ceil(
         epoch_loader_steps / config.GRADIENT_ACCUMULATION_STEPS
     )
-    total_updates = max(1, updates_per_epoch * config.NUM_EPOCHS)
-    warmup_steps = int(total_updates * config.WARMUP_RATIO)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_updates,
-    )
     amp_enabled = config.USE_FP16 and context.device.type == "cuda"
-    scaler = make_grad_scaler(amp_enabled)
 
     if context.is_main:
         effective_batch = (
@@ -3243,168 +3434,290 @@ def train_select_and_predict(
         LOGGER.info("Gradient accumulation steps: %d", config.GRADIENT_ACCUMULATION_STEPS)
         LOGGER.info("Effective global batch size: %d", effective_batch)
         LOGGER.info("FP16 enabled: %s", amp_enabled)
+        LOGGER.info(
+            "Curriculum stages: %s; max epochs per stage: %d",
+            " -> ".join(str(stage) for stage in CURRICULUM_STAGES),
+            config.NUM_EPOCHS,
+        )
 
-    start_epoch = 0
-    global_step = 0
-    best_qwk = -math.inf
-    best_mae = math.inf
-    bad_epochs = 0
-    best_model_path = config.resolve(config.OUTPUT_DIR) / "best_model" / "model_state.pt"
-    checkpoint_path = config.resolve(config.CHECKPOINT_DIR) / "last.pt"
-    history_path = config.resolve(config.OUTPUT_DIR) / "logs" / "training_history.csv"
+    resume_path: Optional[Path] = None
+    resume_stage: Optional[int] = None
     if config.RESUME_FROM_CHECKPOINT:
         resume_path = config.resolve(config.RESUME_FROM_CHECKPOINT)
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
-        if not best_model_path.is_file():
-            raise FileNotFoundError(
-                "Resume requires the matching best-model state at "
-                f"{best_model_path}. Preserve the complete outputs directory, "
-                "not only checkpoints/last.pt."
+        resume_payload = load_torch_file(resume_path, torch.device("cpu"))
+        resume_stage = int(resume_payload.get("stage", -1))
+        if resume_stage not in CURRICULUM_STAGES:
+            raise ValueError(
+                f"Resume checkpoint has invalid curriculum stage: {resume_stage}"
             )
-        start_epoch, global_step, best_qwk, best_mae, bad_epochs = resume_training(
-            resume_path, model, optimizer, scheduler, scaler, context
-        )
+        del resume_payload
 
-    history: list[dict[str, Any]] = []
-    if context.is_main and config.RESUME_FROM_CHECKPOINT and history_path.is_file():
-        history = pd.read_csv(history_path).to_dict(orient="records")
-    has_selected_model = bool(
-        config.RESUME_FROM_CHECKPOINT and best_model_path.is_file()
+    first_stage_index = (
+        CURRICULUM_STAGES.index(resume_stage) if resume_stage is not None else 0
     )
-    epoch_range: Iterable[int] = range(start_epoch, config.NUM_EPOCHS)
-    if config.RESUME_FROM_CHECKPOINT and bad_epochs >= config.EARLY_STOPPING_PATIENCE:
-        if context.is_main:
-            LOGGER.info(
-                "Resume checkpoint had already reached early stopping; "
-                "skipping further training and using its best model."
-            )
-        epoch_range = ()
+    global_step = 0
+    final_model: Optional[nn.Module] = None
+    for stage_index in range(first_stage_index, len(CURRICULUM_STAGES)):
+        stage = CURRICULUM_STAGES[stage_index]
+        resuming_this_stage = resume_stage == stage and resume_path is not None
+        base_model.activate_stage(stage, reset_head=not resuming_this_stage)
+        distributed_barrier(context)
 
-    for epoch in epoch_range:
-        if hasattr(train_sampler, "set_epoch"):
-            train_sampler.set_epoch(epoch)  # type: ignore[attr-defined]
-        epoch_start = time.perf_counter()
-        train_loss, global_step = train_one_epoch(
-            model,
-            train_loader,
+        model: nn.Module = base_model
+        if context.distributed:
+            model = DDP(
+                model,
+                device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+                output_device=context.local_rank if context.device.type == "cuda" else None,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+
+        optimizer = create_optimizer(model, config, stage)
+        total_updates = max(1, updates_per_epoch * config.NUM_EPOCHS)
+        warmup_steps = int(total_updates * config.WARMUP_RATIO)
+        scheduler = get_linear_schedule_with_warmup(
             optimizer,
-            scheduler,
-            scaler,
-            config,
-            context,
-            epoch,
-            global_step,
-            max_steps=config.SMOKE_MAX_TRAIN_STEPS if smoke_test else None,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_updates,
         )
-        dev_output = evaluate_model(
-            model,
-            dev_loader,
-            len(dev_frame),
-            config,
-            context,
-            description="Dev",
-        )
+        scaler = make_grad_scaler(amp_enabled)
+        start_epoch = 0
+        best_qwk = -math.inf
+        best_tiebreak = -math.inf
+        bad_epochs = 0
+        best_model_path = stage_best_model_directory(config, stage) / "model_state.pt"
+        checkpoint_path = stage_checkpoint_path(config, stage)
+        history_path = stage_history_path(config, stage)
 
-        decision: Optional[dict[str, Any]] = None
         if context.is_main:
-            if dev_output is None or dev_output.metrics is None:
-                raise RuntimeError("Dev labels/metrics are required for model selection")
-            metrics = dev_output.metrics
-            qwk = metrics["qwk"]
-            mae = metrics["mae"]
-            selection_qwk = qwk if math.isfinite(qwk) else -math.inf
-            qwk_tied = (
-                abs(selection_qwk - best_qwk) <= 1e-12
-                if math.isfinite(selection_qwk) and math.isfinite(best_qwk)
-                else selection_qwk == best_qwk
-            )
-            improved = (
-                not has_selected_model
-                or selection_qwk > best_qwk + 1e-12
-                or (qwk_tied and mae < best_mae)
-            )
-            if improved:
-                best_qwk = selection_qwk
-                best_mae = mae
-                bad_epochs = 0
-                save_best_model(model, tokenizer, config, metrics)
-                has_selected_model = True
-            else:
-                bad_epochs += 1
-            elapsed = time.perf_counter() - epoch_start
-            history_row = {
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "train_loss": train_loss,
-                "dev_mse": metrics["mse"],
-                "dev_mae": metrics["mae"],
-                "dev_qwk": metrics["qwk"],
-                "dev_exact_accuracy": metrics["exact_accuracy"],
-                "dev_adjacent_accuracy": metrics["adjacent_accuracy"],
-                "epoch_seconds": elapsed,
-                "is_best": improved,
-            }
-            history.append(history_row)
-            write_training_history(history, config)
             LOGGER.info(
-                "Epoch %d | train_loss=%.6f dev_mse=%.6f dev_mae=%.6f "
-                "dev_qwk=%s exact=%.4f adjacent=%.4f time=%.1fs best=%s",
-                epoch + 1,
-                train_loss,
-                metrics["mse"],
-                metrics["mae"],
-                f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
-                metrics["exact_accuracy"],
-                metrics["adjacent_accuracy"],
-                elapsed,
-                improved,
+                "Starting curriculum stage %d/19 | encoder_lr=%.2e head_lr=%.2e",
+                stage,
+                curriculum_encoder_lr(config, stage),
+                config.HEAD_LR,
             )
-            decision = {
-                "best_qwk": best_qwk,
-                "best_mae": best_mae,
-                "bad_epochs": bad_epochs,
-                "has_selected_model": has_selected_model,
-                "stop": bad_epochs >= config.EARLY_STOPPING_PATIENCE,
-            }
 
-        decision = broadcast_object(decision, context)
-        if not isinstance(decision, dict):
-            raise RuntimeError("Failed to broadcast model-selection decision")
-        best_qwk = float(decision["best_qwk"])
-        best_mae = float(decision["best_mae"])
-        bad_epochs = int(decision["bad_epochs"])
-        has_selected_model = bool(decision["has_selected_model"])
-        rng_states = gather_rng_states(context)
-        if context.is_main:
-            save_training_checkpoint(
-                checkpoint_path,
+        if resuming_this_stage:
+            if not best_model_path.is_file():
+                raise FileNotFoundError(
+                    "Resume requires the matching stage best-model state at "
+                    f"{best_model_path}. Preserve the complete seed output directory."
+                )
+            assert resume_path is not None
+            (
+                start_epoch,
+                global_step,
+                best_qwk,
+                best_tiebreak,
+                bad_epochs,
+            ) = resume_training(
+                resume_path,
                 model,
                 optimizer,
                 scheduler,
                 scaler,
-                epoch=epoch,
-                global_step=global_step,
-                best_qwk=best_qwk,
-                best_mae=best_mae,
-                bad_epochs=bad_epochs,
-                config=config,
-                rng_states=rng_states,
+                context,
+                expected_stage=stage,
             )
-        distributed_barrier(context)
-        if bool(decision["stop"]):
-            if context.is_main:
-                LOGGER.info("Early stopping after %d non-improving epoch(s).", bad_epochs)
-            break
 
-    distributed_barrier(context)
-    if not best_model_path.is_file():
-        raise RuntimeError(
-            "No best model exists. Ensure NUM_EPOCHS permits at least one completed epoch."
-        )
-    best_state = load_torch_file(best_model_path, context.device)
-    unwrap_model(model).load_state_dict(best_state, strict=True)
-    distributed_barrier(context)
+        history: list[dict[str, Any]] = []
+        if context.is_main and resuming_this_stage and history_path.is_file():
+            history = pd.read_csv(history_path).to_dict(orient="records")
+        has_selected_model = bool(resuming_this_stage and best_model_path.is_file())
+        epoch_range: Iterable[int] = range(start_epoch, config.NUM_EPOCHS)
+        if resuming_this_stage and bad_epochs >= config.EARLY_STOPPING_PATIENCE:
+            if context.is_main:
+                LOGGER.info(
+                    "Stage %d resume checkpoint already reached early stopping; "
+                    "using its best encoder and continuing the curriculum.",
+                    stage,
+                )
+            epoch_range = ()
+
+        for epoch in epoch_range:
+            if hasattr(train_sampler, "set_epoch"):
+                sampler_epoch = stage_index * config.NUM_EPOCHS + epoch
+                train_sampler.set_epoch(sampler_epoch)  # type: ignore[attr-defined]
+            epoch_start = time.perf_counter()
+            train_loss, global_step = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                context,
+                stage,
+                epoch,
+                global_step,
+                max_steps=config.SMOKE_MAX_TRAIN_STEPS if smoke_test else None,
+            )
+            dev_output = evaluate_model(
+                model,
+                dev_loader,
+                len(dev_frame),
+                config,
+                context,
+                stage=stage,
+                description=f"Stage {stage} Dev",
+            )
+
+            decision: Optional[dict[str, Any]] = None
+            if context.is_main:
+                if dev_output is None or dev_output.metrics is None:
+                    raise RuntimeError(
+                        f"Stage-{stage} Dev labels/metrics are required for selection"
+                    )
+                metrics = dev_output.metrics
+                qwk = metrics["qwk"]
+                selection_qwk = qwk if math.isfinite(qwk) else -math.inf
+                tiebreak = (
+                    -float(metrics["mae"])
+                    if stage == 19
+                    else float(metrics["exact_accuracy"])
+                )
+                qwk_tied = (
+                    abs(selection_qwk - best_qwk) <= 1e-12
+                    if math.isfinite(selection_qwk) and math.isfinite(best_qwk)
+                    else selection_qwk == best_qwk
+                )
+                improved = (
+                    not has_selected_model
+                    or selection_qwk > best_qwk + 1e-12
+                    or (qwk_tied and tiebreak > best_tiebreak + 1e-12)
+                )
+                if improved:
+                    best_qwk = selection_qwk
+                    best_tiebreak = tiebreak
+                    bad_epochs = 0
+                    save_best_model(
+                        model,
+                        tokenizer,
+                        config,
+                        metrics,
+                        stage=stage,
+                    )
+                    has_selected_model = True
+                else:
+                    bad_epochs += 1
+                elapsed = time.perf_counter() - epoch_start
+                history_row = {
+                    "stage": stage,
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "train_loss": train_loss,
+                    "dev_mse": metrics["mse"],
+                    "dev_mae": metrics["mae"],
+                    "dev_qwk": metrics["qwk"],
+                    "dev_exact_accuracy": metrics["exact_accuracy"],
+                    "dev_adjacent_accuracy": metrics["adjacent_accuracy"],
+                    "epoch_seconds": elapsed,
+                    "is_best": improved,
+                }
+                history.append(history_row)
+                write_training_history(history, config, stage)
+                LOGGER.info(
+                    "Stage %d epoch %d | train_loss=%.6f dev_mse=%.6f "
+                    "dev_mae=%.6f dev_qwk=%s exact=%.4f adjacent=%.4f "
+                    "time=%.1fs best=%s",
+                    stage,
+                    epoch + 1,
+                    train_loss,
+                    metrics["mse"],
+                    metrics["mae"],
+                    f"{metrics['qwk']:.6f}" if math.isfinite(metrics["qwk"]) else "nan",
+                    metrics["exact_accuracy"],
+                    metrics["adjacent_accuracy"],
+                    elapsed,
+                    improved,
+                )
+                decision = {
+                    "best_qwk": best_qwk,
+                    "best_tiebreak": best_tiebreak,
+                    "bad_epochs": bad_epochs,
+                    "has_selected_model": has_selected_model,
+                    "stop": bad_epochs >= config.EARLY_STOPPING_PATIENCE,
+                }
+
+            decision = broadcast_object(decision, context)
+            if not isinstance(decision, dict):
+                raise RuntimeError("Failed to broadcast model-selection decision")
+            best_qwk = float(decision["best_qwk"])
+            best_tiebreak = float(decision["best_tiebreak"])
+            bad_epochs = int(decision["bad_epochs"])
+            has_selected_model = bool(decision["has_selected_model"])
+            rng_states = gather_rng_states(context)
+            if context.is_main:
+                save_training_checkpoint(
+                    checkpoint_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    stage=stage,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_qwk=best_qwk,
+                    best_tiebreak=best_tiebreak,
+                    bad_epochs=bad_epochs,
+                    config=config,
+                    rng_states=rng_states,
+                )
+            distributed_barrier(context)
+            if bool(decision["stop"]):
+                if context.is_main:
+                    LOGGER.info(
+                        "Stage %d early stopping after %d non-improving epoch(s).",
+                        stage,
+                        bad_epochs,
+                    )
+                break
+
+        distributed_barrier(context)
+        if not best_model_path.is_file():
+            raise RuntimeError(
+                f"No best model exists for stage {stage}. Ensure NUM_EPOCHS "
+                "permits at least one completed epoch."
+            )
+        best_state = load_torch_file(best_model_path, torch.device("cpu"))
+        unwrap_model(model).load_state_dict(best_state, strict=True)
+        del best_state
+        distributed_barrier(context)
+        resume_path = None
+        resume_stage = None
+
+        if stage == 19:
+            final_model = model
+        else:
+            transferred_encoder_state = {
+                name: tensor.detach().cpu()
+                for name, tensor in unwrap_model(model).encoder.state_dict().items()
+            }
+            del model, base_model, optimizer, scheduler, scaler
+            gc.collect()
+            if context.device.type == "cuda":
+                torch.cuda.empty_cache()
+            base_model = ArabicReadabilityCurriculum(
+                config.MODEL_NAME,
+                config.DROPOUT,
+            )
+            if int(base_model.encoder.get_input_embeddings().num_embeddings) != len(
+                tokenizer
+            ):
+                base_model.encoder.resize_token_embeddings(len(tokenizer))
+            base_model.encoder.load_state_dict(
+                transferred_encoder_state,
+                strict=True,
+            )
+            del transferred_encoder_state
+            base_model.to(context.device)
+
+    if final_model is None:
+        raise RuntimeError("Curriculum did not reach the final 19-level stage")
+    model = final_model
 
     best_dev_output = evaluate_model(
         model,
@@ -3412,6 +3725,7 @@ def train_select_and_predict(
         len(dev_frame),
         config,
         context,
+        stage=19,
         description=f"Seed {config.SEED} best Dev",
     )
     test_output = evaluate_model(
@@ -3420,6 +3734,7 @@ def train_select_and_predict(
         len(test_frame),
         config,
         context,
+        stage=19,
         description=f"Seed {config.SEED} Test",
     )
     seed_output: Optional[SeedRunOutput] = None
@@ -3569,15 +3884,15 @@ def run_pipeline(config: Config, context: DistributedContext, *, smoke_test: boo
     dev_frame = load_split(dev_path, "dev", config, require_label=True)
     test_frame = load_split(test_path, "test", config, require_label=False)
     validate_split_isolation(train_frame, dev_frame, test_frame)
-    hmtl_paths = validate_hmtl_hierarchy(
+    curriculum_paths = validate_curriculum_hierarchy(
         train_frame,
         dev_frame,
         test_frame,
         config,
     )
     if context.is_main:
-        hierarchy_report_path = write_hmtl_hierarchy_report(hmtl_paths, config)
-        LOGGER.info("Validated HMTL hierarchy: %s", hierarchy_report_path)
+        hierarchy_report_path = write_curriculum_report(curriculum_paths, config)
+        LOGGER.info("Validated curriculum label hierarchy: %s", hierarchy_report_path)
 
     if smoke_test:
         train_frame = smoke_subset(train_frame, config.SMOKE_TRAIN_SAMPLES)
@@ -3622,14 +3937,7 @@ def validate_config(config: Config) -> None:
     if config.MIN_LABEL >= config.MAX_LABEL:
         raise ValueError("MIN_LABEL must be less than MAX_LABEL")
     if (config.MIN_LABEL, config.MAX_LABEL) != (1, 19):
-        raise ValueError("BAREC HMTL requires MIN_LABEL=1 and MAX_LABEL=19")
-    if len(config.HMTL_AUX_LOSS_WEIGHTS) != len(HMTL_LEVELS):
-        raise ValueError("HMTL_AUX_LOSS_WEIGHTS must contain weights for levels 3, 5, 7")
-    if any(
-        not math.isfinite(float(weight)) or float(weight) <= 0.0
-        for weight in config.HMTL_AUX_LOSS_WEIGHTS
-    ):
-        raise ValueError("Every HMTL auxiliary loss weight must be finite and positive")
+        raise ValueError("BAREC curriculum requires MIN_LABEL=1 and MAX_LABEL=19")
     positive_integer_fields = {
         "MAX_LENGTH": config.MAX_LENGTH,
         "NUM_EPOCHS": config.NUM_EPOCHS,
@@ -3653,8 +3961,14 @@ def validate_config(config: Config) -> None:
         raise ValueError("WARMUP_RATIO must be in [0, 1)")
     if not 0.0 <= config.DROPOUT < 1.0:
         raise ValueError("DROPOUT must be in [0, 1)")
-    if config.ENCODER_LR <= 0.0 or config.HEAD_LR <= 0.0:
-        raise ValueError("ENCODER_LR and HEAD_LR must be positive")
+    if (
+        config.ENCODER_LR <= 0.0
+        or config.TRANSFER_ENCODER_LR <= 0.0
+        or config.HEAD_LR <= 0.0
+    ):
+        raise ValueError(
+            "ENCODER_LR, TRANSFER_ENCODER_LR and HEAD_LR must be positive"
+        )
     if config.WEIGHT_DECAY < 0.0 or config.MAX_GRAD_NORM <= 0.0:
         raise ValueError("WEIGHT_DECAY must be non-negative and MAX_GRAD_NORM positive")
     if config.SAMPLER_ALPHA < 0.0:

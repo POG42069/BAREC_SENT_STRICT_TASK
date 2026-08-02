@@ -9,9 +9,10 @@ python train.py
 ```
 
 Pipeline sử dụng D3Tok thật của CAMeL Tools và ensemble năm mô hình AraBERTv2
-HMTL cùng kiến trúc, được fine-tune độc lập với seed `42, 52, 62, 72, 82`. Mỗi
-mô hình giữ regression 19 mức làm nhiệm vụ chính và học thêm ba nhiệm vụ phụ
-3/5/7 mức trên cùng biểu diễn CLS. Kết quả
+curriculum cùng kiến trúc, được fine-tune độc lập với seed `42, 52, 62, 72, 82`.
+Mỗi mô hình học tuần tự bốn stage `3 → 5 → 7 → 19`: ba stage đầu dùng
+cross-entropy, stage cuối dùng regression MSE. Encoder tốt nhất được chuyển sang
+stage kế tiếp và mỗi stage khởi tạo một head mới. Kết quả
 cuối là trung bình đều của năm raw score, sau đó `np.rint` và clip vào `[1, 19]`;
 không tối ưu threshold và không học ensemble weight. Khi Kaggle cung cấp hai GPU
 T4, script tự khởi chạy PyTorch DDP; không cần gọi `torchrun` thủ công.
@@ -204,15 +205,15 @@ Người dùng chỉ cần chỉnh `Config` ở đầu `train.py`. Các giá tr�
 | Data | `TRAIN_PATH`, `DEV_PATH`, `TEST_PATH` | Đường dẫn tương đối với thư mục chứa `train.py` |
 | Columns | `ID_COLUMN="ID"`, `TEXT_COLUMN="Sentence"` | ID và câu gốc |
 | Label | `LABEL_COLUMN="Readability_Level_19"` | Nhãn 19 mức |
-| HMTL labels | `LABEL_COLUMN_3`, `LABEL_COLUMN_5`, `LABEL_COLUMN_7` | Ba nhãn phân cấp phụ, bắt buộc trên Train/Dev |
-| HMTL loss | `HMTL_AUX_LOSS_WEIGHTS=(0.4, 0.5, 0.6)` | Trọng số CE tăng dần theo độ chi tiết của nhiệm vụ 3/5/7 mức |
+| Curriculum labels | `LABEL_COLUMN_3`, `LABEL_COLUMN_5`, `LABEL_COLUMN_7` | Nhãn chính thức cho ba stage CE, bắt buộc trên Train/Dev |
+| Epoch | `NUM_EPOCHS=5` | Số epoch tối đa cho **mỗi** stage 3/5/7/19 |
 | Model | `MODEL_NAME` | Checkpoint encoder/tokenizer |
 | Preprocess | `D3TOK_RESOURCE="msa"` | BERT unfactored disambiguator cho D3Tok |
 | D3Tok batch | `D3TOK_BATCH_SIZE=256` | Số câu đưa qua BERT disambiguator mỗi lượt |
 | Length | `MAX_LENGTH=512` | Giới hạn đầy đủ của BERT; D3Tok không bị truncate âm thầm |
 | Batch | `PER_DEVICE_BATCH_SIZE=8` | Batch trên mỗi GPU |
 | Accumulation | `GRADIENT_ACCUMULATION_STEPS=2` | Số micro-batch mỗi optimizer step |
-| Optimizer | `ENCODER_LR=2e-5`, `HEAD_LR=1e-4` | Learning rate riêng |
+| Optimizer | `ENCODER_LR=2e-5`, `TRANSFER_ENCODER_LR=1e-5`, `HEAD_LR=1e-4` | Stage 3 dùng encoder LR ban đầu; stage 5/7/19 dùng transfer LR |
 | Sampling | `SAMPLER_ALPHA=0.5` | Mức cân bằng lớp |
 | Ensemble | `ENSEMBLE_SEEDS=(42, 52, 62, 72, 82)` | Năm lần fine-tune độc lập trên cùng Train |
 | Seed artifacts | `SEED_RUNS_DIR="outputs/seeds"` | Best model/checkpoint/log riêng của từng seed |
@@ -318,8 +319,8 @@ sang hai text view cùng feature mới làm toàn bộ cache cũ tự động m�
 Trong DDP, chỉ rank 0 tạo cache bằng file tạm rồi atomic replace; các rank còn
 lại chờ barrier trước khi đọc. Bật `FORCE_REPROCESS=True` khi muốn bỏ cache.
 
-Checkpoint cũ có kích thước embedding trước khi thêm field token hoặc chỉ có một
-regression head không tương thích để resume HMTL. Hãy bắt đầu một
+Checkpoint HMTL cũ hoặc checkpoint có kích thước embedding trước khi thêm field
+token không tương thích để resume curriculum. Hãy bắt đầu một
 output/checkpoint mới cho pipeline này.
 
 ## 10. Kiến trúc và objective
@@ -328,20 +329,24 @@ output/checkpoint mới cho pipeline này.
 AutoModel AraBERTv2 encoder
 → last_hidden_state[:, 0, :] (CLS)
 → Dropout
-├── Linear(hidden_size, 1) → raw readability score 19 mức (MSE)
-├── Linear(hidden_size, 3) → logits 3 mức (cross-entropy)
-├── Linear(hidden_size, 5) → logits 5 mức (cross-entropy)
-└── Linear(hidden_size, 7) → logits 7 mức (cross-entropy)
+→ Stage 3:  Linear(hidden_size, 3) → CE
+→ chuyển best encoder, khởi tạo head mới
+→ Stage 5:  Linear(hidden_size, 5) → CE
+→ chuyển best encoder, khởi tạo head mới
+→ Stage 7:  Linear(hidden_size, 7) → CE
+→ chuyển best encoder, khởi tạo head mới
+→ Stage 19: Linear(hidden_size, 1) → raw readability score (MSE)
 ```
 
-Objective huấn luyện là:
+Mỗi thời điểm chỉ có một objective hoạt động:
 
 ```text
-L = MSE_19 + 0.4 × CE_3 + 0.5 × CE_5 + 0.6 × CE_7
+CE_3 → CE_5 → CE_7 → MSE_19
 ```
 
 Classification head 19 lớp của checkpoint không được sử dụng. Regression head
-trả tensor `[batch_size]`; ba head phân loại chỉ regularize encoder khi train.
+trả tensor `[batch_size]`; các head phân loại thô không được joint-train mà chỉ
+được dùng trong stage tương ứng.
 Inference, metric QWK và ensemble chỉ dùng raw score của regression head, nên
 thứ tự 1..19 và cách dự đoán cuối của baseline cũ được giữ nguyên. Raw score
 không được round trong loss. BERT pooler cũng không được khởi tạo vì pipeline lấy
@@ -387,8 +392,10 @@ full training.
 
 ## 13. Training, evaluation và best checkpoint
 
-Chỉ Train DataLoader thực hiện backward. Sau mỗi epoch, Dev được gather theo
-`original_index`, sắp lại và loại padding/duplicate do phân phối trước khi tính:
+Chỉ Train DataLoader thực hiện backward. Sau mỗi epoch của từng stage, Dev được
+gather theo `original_index`, sắp lại và loại padding/duplicate do phân phối.
+Stage 3/5/7 tính QWK, MAE, exact và adjacent accuracy trên thang tương ứng;
+stage 19 giữ nguyên bộ metric cuối:
 
 - raw MSE;
 - MAE;
@@ -396,11 +403,11 @@ Chỉ Train DataLoader thực hiện backward. Sau mỗi epoch, Dev được gat
 - adjacent accuracy (sai lệch tối đa 1 mức);
 - Quadratic Weighted Kappa (QWK) với label cố định `1..19`.
 
-Với mỗi seed trong `ENSEMBLE_SEEDS`, script khởi tạo lại regression head, ba
-auxiliary head, thứ tự DataLoader, dropout và weighted sampler bằng seed đó;
-toàn bộ năm member vẫn chỉ backpropagate trên cùng Train. Checkpoint có Dev QWK
-cao nhất được chọn riêng cho từng seed; nếu QWK hòa, MAE thấp hơn thắng. Early
-stopping chỉ dựa trên Dev, không nhìn Test.
+Với mỗi seed trong `ENSEMBLE_SEEDS`, script chạy tuần tự bốn stage. Ở stage
+3/5/7, checkpoint có Dev QWK cao nhất được chọn và exact accuracy dùng để phá
+hòa; chỉ encoder của checkpoint đó được chuyển sang stage kế tiếp. Ở stage 19,
+Dev QWK vẫn là tiêu chí chính và MAE thấp hơn dùng để phá hòa. Early stopping
+được áp dụng riêng cho từng stage và không nhìn Test.
 
 Sau khi có năm best checkpoint, script chạy lại từng member trên Dev/Test, kiểm
 tra ID và thứ tự hoàn toàn trùng nhau, rồi lấy trung bình đều của **raw regression
@@ -408,8 +415,9 @@ score**. Chỉ raw score trung bình mới được `np.rint`, clip vào `[1, 19
 chuyển sang integer. Không threshold optimization, không QWK-weighting và không
 chọn/bỏ seed theo Open Test.
 
-Checkpoint resume của mỗi seed lưu model hiện tại, optimizer, scheduler, scaler,
-epoch/global step, best QWK/MAE, config và RNG state. Để resume ensemble, đặt:
+Checkpoint resume của mỗi seed lưu stage hiện tại, model, optimizer, scheduler,
+scaler, epoch/global step, tiêu chí chọn best, config và RNG state. Để resume
+stage 19 của ensemble, đặt:
 
 ```python
 RESUME_FROM_CHECKPOINT = "outputs/seeds/seed_{seed}/checkpoints/last.pt"
@@ -419,6 +427,9 @@ Phải giữ best state tương ứng tại
 `outputs/seeds/seed_<N>/best_model/model_state.pt`; script fail fast nếu cặp
 artifact không đầy đủ. Model state được lưu sau khi unwrap DDP nên dùng được ở
 một hoặc nhiều GPU.
+
+Để resume stage 3/5/7, trỏ template đến `stage_<N>_last.pt` và giữ best state
+tương ứng trong `curriculum/stage_<N>/best_model/`.
 
 ## 14. Smoke test và kiểm tra tối thiểu
 
@@ -437,7 +448,8 @@ python train.py --smoke-test
 Smoke mode dùng hai seed `42, 52` để kiểm tra cả phép ensemble mà không phải chạy
 đủ năm member. Nó kiểm tra pipeline đọc dữ liệu, Unicode/Kashida, BERT D3Tok khi
 dấu phụ vẫn còn, D3Tok/Surface view, feature block, sentence-pair tokenization,
-sampler, forward/backward của đủ bốn HMTL head, metric, checkpoint/reload,
+sampler, forward/backward tuần tự của đủ bốn curriculum stage, metric,
+checkpoint/reload,
 inference, raw-score averaging và submission ZIP. Nó không phải một lần huấn
 luyện hợp lệ để báo cáo QWK.
 
@@ -464,7 +476,14 @@ outputs/
 ├── seeds/
 │   ├── seed_42/
 │   │   ├── best_model/
+│   │   ├── curriculum/
+│   │   │   ├── stage_3/best_model/
+│   │   │   ├── stage_5/best_model/
+│   │   │   └── stage_7/best_model/
 │   │   ├── checkpoints/
+│   │   │   ├── stage_3_last.pt
+│   │   │   ├── stage_5_last.pt
+│   │   │   ├── stage_7_last.pt
 │   │   │   └── last.pt
 │   │   ├── diagnostics/
 │   │   └── logs/
@@ -473,7 +492,7 @@ outputs/
 │   ├── seed_72/
 │   └── seed_82/
 ├── logs/
-│   ├── hmtl_hierarchy.json
+│   ├── curriculum.json
 │   ├── preprocessing_report.json
 │   └── ensemble_report.json
 ├── diagnostics/
