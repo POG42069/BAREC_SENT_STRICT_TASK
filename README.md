@@ -31,7 +31,7 @@ The system fine-tunes an Arabic Transformer regressor using D3Tok, the normalize
 
    The final file is saved as `outputs/prediction.zip`.
 
-4. For the private Blind Test, add the Hugging Face token as a private `HF_TOKEN` environment variable or Kaggle Secret, then run:
+4. For the private Blind Test, add the Hugging Face token and run:
 
    ```bash
    python train_blind.py --download-only
